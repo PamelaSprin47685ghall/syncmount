@@ -39,6 +39,11 @@ pub struct SeedReport {
     pub chunks: u64,
 }
 
+/// `meta` key: server events skipped because the local tree had already
+/// applied a later deletion. A growing counter is a divergence signal, not
+/// an error: the server's order stays authoritative.
+const META_REPLAY_SKIPPED: &str = "replay_skipped";
+
 impl ClientDb {
     /// Apply one server event.
     ///
@@ -110,7 +115,7 @@ impl ClientDb {
             } => {
                 Self::apply_write(
                     &snapshot, &tx, seq, *ino, *offset, *size, *file_root, *mtime_ns, chunks,
-                    data,
+                    data, path,
                 )?;
             }
             EventPayload::Truncate {
@@ -119,7 +124,9 @@ impl ClientDb {
                 file_root,
                 mtime_ns,
             } => {
-                Self::apply_truncate(&snapshot, &tx, seq, *ino, *size, *file_root, *mtime_ns)?;
+                Self::apply_truncate(
+                    &snapshot, &tx, seq, *ino, *size, *file_root, *mtime_ns, path,
+                )?;
             }
             EventPayload::Setattr {
                 ino,
@@ -128,22 +135,27 @@ impl ClientDb {
                 gid,
                 mtime_ns,
             } => {
-                let mut object =
-                    Self::object_in(&tx, *ino)?.ok_or(DbError::Errno(Errno::ENOENT))?;
-                if let Some(mode) = mode {
-                    object.mode = *mode;
+                match Self::object_in(&tx, *ino)? {
+                    Some(mut object) if !object.deleted => {
+                        if let Some(mode) = mode {
+                            object.mode = *mode;
+                        }
+                        if let Some(uid) = uid {
+                            object.uid = *uid;
+                        }
+                        if let Some(gid) = gid {
+                            object.gid = *gid;
+                        }
+                        if let Some(mtime_ns) = mtime_ns {
+                            object.mtime_ns = *mtime_ns;
+                        }
+                        object.updated_seq = seq;
+                        tx.put_object(&object)?;
+                    }
+                    _ => {
+                        Self::note_skip(&tx, seq, "setattr", *ino, path, "object is gone")?;
+                    }
                 }
-                if let Some(uid) = uid {
-                    object.uid = *uid;
-                }
-                if let Some(gid) = gid {
-                    object.gid = *gid;
-                }
-                if let Some(mtime_ns) = mtime_ns {
-                    object.mtime_ns = *mtime_ns;
-                }
-                object.updated_seq = seq;
-                tx.put_object(&object)?;
             }
             EventPayload::Rename { ino } => {
                 let old_path = path.ok_or(DbError::Corrupt("rename event without a path"))?;
@@ -269,7 +281,6 @@ impl ClientDb {
         let (parent_path, name) =
             split_path(path).ok_or(DbError::Corrupt("create event at the root"))?;
         let _ = validate_name(std::ffi::OsStr::new(name))?;
-        let parent = Self::ino_by_path_in(tx, parent_path)?;
         let (ino, kind, mode, uid, gid, mtime_ns, file_root, target) = match payload {
             EventPayload::CreateFile {
                 ino,
@@ -306,6 +317,13 @@ impl ClientDb {
                 Some(target.clone()),
             ),
             _ => return Err(DbError::Corrupt("not a create payload")),
+        };
+        // The parent may be gone when the client applied a later deletion of
+        // the whole subtree first. There is nowhere to attach the name, so
+        // skip; the server's own later events settle the object.
+        let Some(parent) = Self::live_dir_in(tx, parent_path)? else {
+            Self::note_skip(tx, seq, "create", ino, Some(path), "parent directory is gone")?;
+            return Ok(());
         };
 
         let existing = Self::name_in_read(snapshot, parent, name)?;
@@ -379,11 +397,14 @@ impl ClientDb {
         mtime_ns: i64,
         chunks: &[ChunkRef],
         data: Option<&[u8]>,
+        path: Option<&str>,
     ) -> Result<(), DbError> {
-        let mut object = Self::object_in(tx, ino)?.ok_or(DbError::Errno(Errno::ENOENT))?;
-        if object.deleted {
-            return Err(DbError::Errno(Errno::ENOENT));
-        }
+        // A missing or tombstoned object means the client already applied a
+        // later deletion of this inode. The write has no home; skip it.
+        let Some(mut object) = Self::object_in(tx, ino)?.filter(|object| !object.deleted) else {
+            Self::note_skip(tx, seq, "write", ino, path, "object is gone")?;
+            return Ok(());
+        };
         let existing = Self::object_chunks_in(tx, ino)?;
         let mut by_no: BTreeMap<u32, ChunkRef> =
             existing.iter().map(|chunk| (chunk.chunk_no, chunk.clone())).collect();
@@ -485,8 +506,12 @@ impl ClientDb {
         size: u64,
         file_root: [u8; 32],
         mtime_ns: i64,
+        path: Option<&str>,
     ) -> Result<(), DbError> {
-        let mut object = Self::object_in(tx, ino)?.ok_or(DbError::Errno(Errno::ENOENT))?;
+        let Some(mut object) = Self::object_in(tx, ino)?.filter(|object| !object.deleted) else {
+            Self::note_skip(tx, seq, "truncate", ino, path, "object is gone")?;
+            return Ok(());
+        };
         let existing = Self::object_chunks_in(tx, ino)?;
         let mut by_no: BTreeMap<u32, ChunkRef> =
             existing.iter().map(|chunk| (chunk.chunk_no, chunk.clone())).collect();
@@ -539,17 +564,37 @@ impl ClientDb {
             split_path(old_path).ok_or(DbError::Corrupt("rename of the root"))?;
         let (new_parent_path, new_name) =
             split_path(new_path).ok_or(DbError::Corrupt("rename to the root"))?;
-        let old_parent = Self::ino_by_path_in(tx, old_parent_path)?;
-        let new_parent = Self::ino_by_path_in(tx, new_parent_path)?;
-        let Some(object) = Self::object_in(tx, ino)? else {
+        // Any missing end means the client already applied a later deletion.
+        // The rename has nothing left to move; skip it.
+        let Some(object) = Self::object_in(tx, ino)?.filter(|object| !object.deleted) else {
+            Self::note_skip(tx, seq, "rename", ino, Some(old_path), "object is gone")?;
             return Ok(());
         };
-        if object.deleted {
+        let Some(old_parent) = Self::live_dir_in(tx, old_parent_path)? else {
+            Self::note_skip(tx, seq, "rename", ino, Some(old_path), "source parent is gone")?;
             return Ok(());
-        }
+        };
+        let Some(new_parent) = Self::live_dir_in(tx, new_parent_path)? else {
+            Self::note_skip(tx, seq, "rename", ino, Some(old_path), "destination parent is gone")?;
+            return Ok(());
+        };
         let old_entry = Self::name_in_tx(tx, old_parent, old_name)?;
         let new_entry = Self::name_in_tx(tx, new_parent, new_name)?;
-        if old_entry.is_none() && new_entry == Some(ino) {
+        let Some(source) = old_entry else {
+            // The local rename (or its echo) already moved the name.
+            Self::note_echo(seq, "rename", ino, Some(old_path), "source name is gone");
+            return Ok(());
+        };
+        if source != ino {
+            // The source name now belongs to another object; the server's
+            // rename does not describe this tree. Leave it alone.
+            Self::note_echo(
+                seq,
+                "rename",
+                ino,
+                Some(old_path),
+                "source name holds another object",
+            );
             return Ok(());
         }
         if let Some(target) = new_entry {
@@ -557,14 +602,12 @@ impl ClientDb {
                 Self::detach_name(snapshot, tx, new_parent, new_name, target, seq)?;
             }
         }
-        if old_entry.is_some() {
-            tx.delete_name(old_parent, old_name)?;
-            if object.kind.is_dir() {
-                Self::rewrite_subtree_paths(tx, old_path, new_path)?;
-                if old_parent != new_parent {
-                    bump_nlink(tx, old_parent, -1)?;
-                    bump_nlink(tx, new_parent, 1)?;
-                }
+        tx.delete_name(old_parent, old_name)?;
+        if object.kind.is_dir() {
+            Self::rewrite_subtree_paths(tx, old_path, new_path)?;
+            if old_parent != new_parent {
+                bump_nlink(tx, old_parent, -1)?;
+                bump_nlink(tx, new_parent, 1)?;
             }
         }
         if Self::name_in_tx(tx, new_parent, new_name)?.is_none() {
@@ -583,16 +626,41 @@ impl ClientDb {
     ) -> Result<(), DbError> {
         let (parent_path, name) =
             split_path(path).ok_or(DbError::Corrupt("unlink of the root"))?;
-        let parent = Self::ino_by_path_in(tx, parent_path)?;
+        let Some(parent) = Self::live_dir_in(tx, parent_path)? else {
+            // The client applied a later deletion of the parent first. Drop a
+            // name row left behind by an earlier directory conflict so the
+            // path cannot resurrect, then skip.
+            Self::drop_unreachable_name(snapshot, tx, seq, path)?;
+            Self::note_skip(tx, seq, "remove", ino, Some(path), "parent directory is gone")?;
+            return Ok(());
+        };
         match Self::name_in_tx(tx, parent, name)? {
-            None => return Ok(()),
+            None => {
+                // The local removal (or its echo) already deleted the name.
+                Self::note_echo(seq, "remove", ino, Some(path), "name is gone");
+                return Ok(());
+            }
             Some(existing) if existing != ino => {
+                // A later local create or rename owns the name now. Server
+                // order wins: the local winner loses the name and its pending
+                // outbox rows recreate it afterwards.
                 Self::detach_name(snapshot, tx, parent, name, existing, seq)?;
+                Self::note_skip(
+                    tx,
+                    seq,
+                    "remove",
+                    ino,
+                    Some(path),
+                    "name is held by another object",
+                )?;
                 return Ok(());
             }
             Some(_) => {}
         }
-        let object = Self::object_in(tx, ino)?.ok_or(DbError::Errno(Errno::ENOENT))?;
+        // The name row references this inode, so a missing object row is real
+        // corruption, not an overtaken deletion.
+        let object = Self::object_in(tx, ino)?
+            .ok_or(DbError::Corrupt("unlink names an object the tree does not hold"))?;
         tx.delete_name(parent, name)?;
         if object.kind.is_dir() {
             bump_nlink(tx, parent, -1)?;
@@ -618,14 +686,19 @@ impl ClientDb {
     ) -> Result<(), DbError> {
         let (parent_path, name) =
             split_path(path).ok_or(DbError::Corrupt("link at the root"))?;
-        let parent = Self::ino_by_path_in(tx, parent_path)?;
+        let Some(parent) = Self::live_dir_in(tx, parent_path)? else {
+            Self::note_skip(tx, seq, "link", ino, Some(path), "parent directory is gone")?;
+            return Ok(());
+        };
         if Self::name_in_tx(tx, parent, name)?.is_some() {
+            // The local link (or its echo) already created the name.
+            Self::note_echo(seq, "link", ino, Some(path), "name already exists");
             return Ok(());
         }
-        let mut object = Self::object_in(tx, ino)?.ok_or(DbError::Errno(Errno::ENOENT))?;
-        if object.deleted {
-            return Err(DbError::Errno(Errno::ENOENT));
-        }
+        let Some(mut object) = Self::object_in(tx, ino)?.filter(|object| !object.deleted) else {
+            Self::note_skip(tx, seq, "link", ino, Some(path), "object is gone")?;
+            return Ok(());
+        };
         object.nlink = object.nlink.saturating_add(1);
         object.updated_seq = seq;
         tx.put_object(&object)?;
@@ -661,6 +734,105 @@ impl ClientDb {
         tx.put_object(&object)?;
         let _ = snapshot;
         Ok(())
+    }
+
+    /// Delete the name row at `path` when its parent directory is no longer
+    /// reachable.
+    ///
+    /// A directory that lost a create conflict keeps its children: the server
+    /// only detaches the directory's own name. The rows stay reachable by
+    /// `path`, so a later removal of the parent would otherwise leave them
+    /// behind for good.
+    fn drop_unreachable_name(
+        snapshot: &ReadTx,
+        tx: &WriteTx<'_>,
+        seq: i64,
+        path: &str,
+    ) -> Result<(), DbError> {
+        let Some((_, name)) = split_path(path) else {
+            return Ok(());
+        };
+        let row: Option<(Vec<u8>, Vec<u8>)> = tx
+            .conn()
+            .query_row("SELECT parent, ino FROM names WHERE path = ?1", [path], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .optional()?;
+        let Some((parent, ino)) = row else {
+            return Ok(());
+        };
+        let parent: Ino = parent
+            .try_into()
+            .map_err(|_| DbError::Corrupt("names.parent is not 16 bytes"))?;
+        let ino: Ino = ino
+            .try_into()
+            .map_err(|_| DbError::Corrupt("names.ino is not 16 bytes"))?;
+        Self::detach_name(snapshot, tx, parent, name, ino, seq)
+    }
+
+    /// Log and count an event the local tree has already overtaken.
+    fn note_skip(
+        tx: &WriteTx<'_>,
+        seq: i64,
+        kind: &'static str,
+        ino: Ino,
+        path: Option<&str>,
+        reason: &'static str,
+    ) -> Result<(), DbError> {
+        tracing::warn!(
+            event = "replay_skip",
+            seq,
+            kind,
+            ino = ?ino,
+            path = ?path,
+            reason,
+            "skipping an event the local tree has already overtaken"
+        );
+        let skipped: i64 = tx
+            .conn()
+            .query_row(
+                "SELECT value FROM meta WHERE key = ?1",
+                [META_REPLAY_SKIPPED],
+                |row| row.get(0),
+            )
+            .optional()?
+            .unwrap_or(0);
+        tx.set_meta_i64(META_REPLAY_SKIPPED, skipped.saturating_add(1))?;
+        Ok(())
+    }
+
+    /// Record a no-op that is the expected echo of a local operation.
+    fn note_echo(seq: i64, kind: &'static str, ino: Ino, path: Option<&str>, reason: &'static str) {
+        tracing::debug!(
+            event = "replay_noop",
+            seq,
+            kind,
+            ino = ?ino,
+            path = ?path,
+            reason,
+            "the local tree already holds the event's effect"
+        );
+    }
+
+    /// Resolve a path to a live directory, treating anything missing or
+    /// tombstoned as `None`.
+    fn live_dir_in(tx: &WriteTx<'_>, path: &str) -> Result<Option<Ino>, DbError> {
+        let Some(ino) = Self::ino_by_path_opt_in(tx, path)? else {
+            return Ok(None);
+        };
+        match Self::object_in(tx, ino)? {
+            Some(object) if !object.deleted && object.kind.is_dir() => Ok(Some(ino)),
+            _ => Ok(None),
+        }
+    }
+
+    /// Resolve a path to an inode without failing when the entry is gone.
+    fn ino_by_path_opt_in(tx: &WriteTx<'_>, path: &str) -> Result<Option<Ino>, DbError> {
+        match Self::ino_by_path_in(tx, path) {
+            Ok(ino) => Ok(Some(ino)),
+            Err(DbError::Errno(Errno::ENOENT)) => Ok(None),
+            Err(error) => Err(error),
+        }
     }
 
     fn name_in_tx(tx: &WriteTx<'_>, parent: Ino, name: &str) -> Result<Option<Ino>, DbError> {
@@ -1020,6 +1192,21 @@ fn seed_op_id(kind: &str, epoch: i64, path: &str) -> [u8; 16] {
 }
 
 impl ClientDb {
+    /// Events skipped because the local tree had already applied a later
+    /// deletion. A growing count is a divergence signal, not an error.
+    pub fn replay_skipped(&self) -> Result<u64, DbError> {
+        let tx = self.read()?;
+        let skipped: Option<i64> = tx
+            .conn()
+            .query_row(
+                "SELECT value FROM meta WHERE key = ?1",
+                [META_REPLAY_SKIPPED],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(u64::try_from(skipped.unwrap_or(0)).unwrap_or(0))
+    }
+
     /// Number of outbox rows still waiting for an echo.
     pub fn pending_outbox(&self) -> Result<u64, DbError> {
         let tx = self.read()?;
@@ -1458,5 +1645,113 @@ mod tests {
         assert!(db.lookup_by_path("/d/g").is_err());
         assert!(db.getattr(file_ino).is_err());
         assert!(matches!(db.lookup_by_path("/d/g"), Err(DbError::Errno(Errno::ENOENT))));
+    }
+
+    fn dir_payload(ino: Ino) -> EventPayload {
+        EventPayload::CreateDir {
+            ino,
+            mode: 0o755,
+            uid: 0,
+            gid: 0,
+            mtime_ns: 1,
+            file_root: crate::store::sqlite::file_root(ObjectKind::Dir, None, &[]),
+        }
+    }
+
+    fn file_payload(ino: Ino) -> EventPayload {
+        EventPayload::CreateFile {
+            ino,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            mtime_ns: 1,
+            file_root: crate::store::sqlite::file_root(ObjectKind::File, None, &[]),
+        }
+    }
+
+    fn replay(
+        db: &ClientDb,
+        seq: i64,
+        payload: &EventPayload,
+        path: &str,
+        path2: Option<&str>,
+        data: Option<&[u8]>,
+    ) {
+        let outcome = db
+            .apply_remote(
+                seq,
+                1,
+                Some([seq as u8; 16]),
+                "ok",
+                payload,
+                Some(path),
+                path2,
+                data,
+            )
+            .unwrap();
+        assert_eq!(outcome, super::super::db::ApplyOutcome::Applied);
+    }
+
+    #[test]
+    fn replay_skips_events_the_client_already_deleted() {
+        let (_dir, db) = open();
+        let dir_ino = [5u8; 16];
+        let file_ino = [6u8; 16];
+        let (write, _) = write_payload(file_ino, b"hello");
+
+        replay(&db, 1, &dir_payload(dir_ino), "/d", None, None);
+        replay(&db, 2, &file_payload(file_ino), "/d/f", None, None);
+        replay(&db, 3, &write, "/d/f", None, Some(b"hello"));
+
+        // The client's own unlink and rmdir land before the server's stream
+        // reaches the matching events.
+        db.unlink(dir_ino, OsStr::new("f")).unwrap();
+        db.rmdir(ROOT_INO, OsStr::new("d")).unwrap();
+        assert!(db.lookup_by_path("/d").is_err());
+
+        // The server's stream still carries the write, a rename, the child
+        // unlink and the directory rmdir. All four must pass without Fatal.
+        replay(&db, 4, &write, "/d/f", None, Some(b"hello"));
+        replay(&db, 5, &EventPayload::Rename { ino: file_ino }, "/d/f", Some("/d/g"), None);
+        replay(&db, 6, &EventPayload::Unlink { ino: file_ino }, "/d/g", None, None);
+        replay(&db, 7, &EventPayload::Rmdir { ino: dir_ino }, "/d", None, None);
+
+        assert_eq!(db.applied_seq().unwrap(), 7);
+        assert!(matches!(db.lookup_by_path("/d"), Err(DbError::Errno(Errno::ENOENT))));
+        assert!(matches!(db.lookup_by_path("/d/f"), Err(DbError::Errno(Errno::ENOENT))));
+        assert!(matches!(db.lookup_by_path("/d/g"), Err(DbError::Errno(Errno::ENOENT))));
+        assert!(db.getattr(file_ino).is_err());
+        // The write, the rename and the unlink diverged; the rmdir's name was
+        // already gone (the ordinary echo path).
+        assert_eq!(db.replay_skipped().unwrap(), 3);
+    }
+
+    #[test]
+    fn replay_skips_missing_parents_and_objects() {
+        let (_dir, db) = open();
+        let dir_ino = [7u8; 16];
+        let file_ino = [8u8; 16];
+        replay(&db, 1, &dir_payload(dir_ino), "/d", None, None);
+        replay(&db, 2, &file_payload(file_ino), "/d/f", None, None);
+        db.unlink(dir_ino, OsStr::new("f")).unwrap();
+        db.rmdir(ROOT_INO, OsStr::new("d")).unwrap();
+
+        replay(&db, 3, &file_payload([9u8; 16]), "/d/g", None, None);
+        replay(&db, 4, &EventPayload::Link { ino: file_ino }, "/e", None, None);
+        replay(
+            &db,
+            5,
+            &EventPayload::Rename { ino: file_ino },
+            "/d/f",
+            Some("/x/f"),
+            None,
+        );
+        replay(&db, 6, &EventPayload::Link { ino: [9u8; 16] }, "/d/g", None, None);
+
+        assert_eq!(db.applied_seq().unwrap(), 6);
+        assert!(db.lookup_by_path("/d").is_err());
+        assert!(db.lookup_by_path("/e").is_err());
+        assert!(db.lookup_by_path("/x/f").is_err());
+        assert_eq!(db.replay_skipped().unwrap(), 4);
     }
 }
