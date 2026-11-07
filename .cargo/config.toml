@@ -1,0 +1,5 @@
+# musl target: rustup ships a self-contained libc/crt, so no musl-gcc is
+# needed. The host `cc` is the linker; blake3 may also use it for asm.
+# Do not set RUSTFLAGS=+crt-static: the musl target is static by default.
+[target.x86_64-unknown-linux-musl]
+rustflags = []

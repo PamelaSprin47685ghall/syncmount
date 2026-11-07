@@ -1,0 +1,2 @@
+# Keep clippy's suggestions inside the MSRV floor fixed by fuser 0.18.0.
+msrv = "1.85"

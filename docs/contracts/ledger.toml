@@ -1,0 +1,24 @@
+# Contract ledger — the single index for frozen contracts (52 §3.1).
+#
+# Empty at P0. Entries are written by A1 FREEZE, never guessed: a contract
+# enters only when its signature text, compile-time assertions and golden
+# vector (if any) are present. `sig_hash` is BLAKE3 of the normalised
+# signature text; CI compares it with the exported `pub` surface.
+#
+# Record shape (one table per contract, appended by the integrator):
+#
+# [[contracts]]
+# id = "F1"
+# title = "frame"
+# files = ["src/protocol/frame.rs", "src/protocol/codec.rs"]
+# rev = 1
+# owner = "FRM"
+# consumers = ["CRY", "MSG", "TRN", "SRV", "CLI", "TST"]
+# golden = "tests/golden/f1-frame.bin"
+# golden_state = "pending"          # pending | green | na
+# status = "draft"                  # draft | sign-frozen | golden-green | deprecated
+# sig_hash = ""
+# frozen_at = ""
+
+schema = 1
+contracts = []

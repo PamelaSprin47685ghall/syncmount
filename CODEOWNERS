@@ -1,0 +1,65 @@
+# Ownership follows 52 §6.1. Replace the placeholder teams with the real
+# GitHub org/teams before enabling branch protection.
+#
+# Hot files have exactly one writer; everyone else sends a patch request.
+
+*                                   @syncmount/integrator
+
+# L0 INT — assembly points and the contract ledger.
+/src/lib.rs                         @syncmount/integrator
+/src/cli.rs                         @syncmount/integrator
+/src/bin/syncmount.rs               @syncmount/integrator
+/src/client/mod.rs                  @syncmount/integrator
+/src/sync/ports.rs                  @syncmount/integrator
+/docs/contracts/                    @syncmount/integrator
+
+# L1 BLD — build, CI, release.
+/Cargo.toml                         @syncmount/build
+/Cargo.lock                         @syncmount/build
+/rust-toolchain.toml                @syncmount/build
+/rustfmt.toml                       @syncmount/build
+/clippy.toml                        @syncmount/build
+/deny.toml                          @syncmount/build
+/.cargo/                            @syncmount/build
+/.github/                           @syncmount/build
+/scripts/                           @syncmount/build
+/man/                               @syncmount/build
+/install.sh                         @syncmount/build
+
+# L2 FRM — frames and codec.
+/src/protocol/frame.rs              @syncmount/frames
+/src/protocol/codec.rs              @syncmount/frames
+/src/protocol/errors.rs             @syncmount/frames
+/src/protocol/version.rs            @syncmount/frames
+
+# L3 CRY — wire crypto and identity.
+/src/protocol/crypto.rs             @syncmount/crypto
+/src/protocol/identity.rs           @syncmount/crypto
+/src/crypto/                        @syncmount/crypto
+
+# L4 MSG — messages and fragmentation.
+/src/protocol/messages.rs           @syncmount/messages
+/src/protocol/fragment.rs           @syncmount/messages
+
+# L5 STO — local store.
+/src/store/                         @syncmount/store
+
+# L7 TRN — transport.
+/src/transport/                     @syncmount/transport
+
+# L8 SRV — server.
+/src/server/                        @syncmount/server
+
+# L9 CLI — client implementation.
+/src/client/                        @syncmount/client
+
+# L10 FUS — FUSE adapter.
+/src/fuse/                          @syncmount/fuse
+
+# L11 SYN — sync engine.
+/src/sync/                          @syncmount/sync
+
+# L12 TST — tests, benches, testkit.
+/src/testkit/                       @syncmount/testing
+/tests/                             @syncmount/testing
+/benches/                           @syncmount/testing

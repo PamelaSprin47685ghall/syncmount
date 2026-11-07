@@ -1,0 +1,92 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  core:
+    name: core (fmt / clippy / test)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.85.0
+        with:
+          components: rustfmt, clippy
+      - name: fmt
+        run: cargo fmt --all -- --check
+      - name: clippy
+        run: cargo clippy --locked --all-targets --features testkit -- -D warnings
+      - name: clippy (server-only)
+        run: cargo clippy --locked --all-targets --no-default-features -- -D warnings
+      - name: test
+        run: cargo test --locked --features testkit --lib --tests
+
+  fuse:
+    name: fuse (conditional)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.85.0
+      - name: Install fuse3
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y fuse3
+          sudo rm -f /usr/local/bin/fusermount3
+          echo user_allow_other | sudo tee -a /etc/fuse.conf
+      - name: Probe /dev/fuse
+        id: probe
+        run: |
+          if [ -r /dev/fuse ] && [ -w /dev/fuse ]; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "SKIP: /dev/fuse is not readable and writable on this runner"
+          fi
+      - name: FUSE tests
+        if: steps.probe.outputs.available == 'true'
+        env:
+          FUSERMOUNT_PATH: /usr/bin/fusermount3
+          SYNCMOUNT_REQUIRE_FUSE: "1"
+        run: |
+          if [ ! -f tests/fuse_mount.rs ]; then
+            echo "SKIP: tests/fuse_mount.rs lands with W13"
+            exit 0
+          fi
+          cargo test --locked --features testkit,fuse-tests --test fuse_mount -- --nocapture
+
+  msrv:
+    name: msrv 1.85.0 / musl
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.85.0
+        with:
+          targets: x86_64-unknown-linux-musl
+      - name: check (all targets)
+        run: cargo +1.85.0 check --locked --all-targets --features testkit
+      - name: build (host)
+        run: cargo +1.85.0 build --locked --profile dist
+      - name: build (musl static)
+        run: cargo +1.85.0 build --locked --profile dist --target x86_64-unknown-linux-musl
+      - name: Assert static binary
+        run: |
+          bin=target/x86_64-unknown-linux-musl/dist/syncmount
+          file "$bin"
+          if ldd "$bin" 2>&1 | grep -q '=>'; then
+            echo "ERROR: binary is dynamically linked" >&2
+            exit 1
+          fi
+          if readelf -d "$bin" | grep -q NEEDED; then
+            echo "ERROR: binary has dynamic NEEDED entries" >&2
+            exit 1
+          fi
+          size=$(stat -c%s "$bin")
+          echo "size: $size bytes"
+          test "$size" -lt $((15 * 1024 * 1024))
+          "$bin" --version

@@ -1,0 +1,637 @@
+.TH SYNCMOUNT 1 "2026-11-07" "syncmount 0.1.0" "User Commands"
+.SH NAME
+syncmount \- end-to-end encrypted, eventually consistent FUSE filesystem
+.SH SYNOPSIS
+.B syncmount
+.RI [ options ]
+.B client
+.I URL MOUNTPOINT
+.RI [ client-options ]
+.br
+.B syncmount
+.RI [ options ]
+.B server
+.I URL
+.RI [ server-options ]
+.br
+.B syncmount
+.RI [ options ]
+.I URL MOUNTPOINT
+.br
+.B syncmount
+.RI [ options ]
+.I URL
+.br
+.B syncmount
+.RI [ options ]
+.B status
+.RI [ \-\-json ]
+.RI [ \-\-mount-id " ID" ]
+.br
+.B syncmount
+.RI [ options ]
+.B debug-state
+.RI [ \-\-json ]
+.RI [ \-\-mount-id " ID" ]
+.br
+.B syncmount
+.RI [ options ]
+.B debug-manifest-diff
+.I MOUNTPOINT
+.RI [ OTHER ]
+.RI ( \-\-url " URL" " | " \-\-cluster " HEX" )
+.br
+.B syncmount
+.RI [ options ]
+.B debug-seq-gaps
+.RI [ \-\-json ]
+.RI [ \-\-mount-id " ID" ]
+.br
+.B syncmount
+.RI [ options ]
+.B debug-conntrace
+.RI [ \-\-limit " N" ]
+.RI [ \-\-mount-id " ID" ]
+.SH DESCRIPTION
+.B syncmount
+mounts one encrypted namespace as a local directory and keeps every client
+converged through a stateless sequencer.
+The client applies data writes locally, returns immediately, and sends
+encrypted operations to the server in the background.
+Namespace changes and
+.B fcntl
+lock changes wait for the sequencer's verdict before the call returns.
+The server assigns a total order and broadcasts ciphertext; it holds no key,
+writes no disk and neither sees nor verifies Ed25519 signatures.
+All payloads are sealed with ChaCha8-Poly1305 under the cluster key; a build
+may select ChaCha20-Poly1305.
+Control frames are plaintext hints.
+Conflicts are resolved deterministically by every client replaying the same
+order.
+.PP
+A client that loses its transport unmounts immediately and exits with status 10.
+There is no offline mode and no pending-operation replay: remounting reconciles
+the local tree against the cluster, cluster wins, and local-only paths are
+deleted.
+.PP
+The 16-byte cluster identity is derived from the normalised URL
+.RI ( scheme://authority/prefix ).
+Every client of one cluster must use the same URL spelling, because the URL is
+part of the Argon2id salt.
+.SH COMMANDS
+.TP
+.B client \fIURL MOUNTPOINT\fR
+Mount the namespace at
+.I MOUNTPOINT
+and run until the transport fails or a signal arrives.
+.I MOUNTPOINT
+must be an existing absolute directory.
+The path of
+.I URL
+is the namespace prefix; it must match the server and every other client.
+The scheme must be
+.BR http .
+An
+.B https
+URL is rejected at dial with
+.BR TlsUnsupported ;
+the client has no TLS stack.
+.TP
+.B server \fIURL\fR
+Run the sequencer.
+Only the path of
+.I URL
+becomes the namespace prefix; the host and port of
+.I URL
+are ignored.
+The listen address is chosen by
+.B \-\-listen
+or
+.BR \-\-port .
+.TP
+.B status
+Print one line per running client from its status document.
+.TP
+.B debug-state
+Print the full status document, which is the replay and lifecycle state a
+running client publishes.
+.TP
+.B debug-manifest-diff \fIMOUNTPOINT\fR \fI[OTHER]\fR
+Read the local manifest cache below
+.I MOUNTPOINT
+and print its entry count, sequence and epoch.
+With
+.IR OTHER ,
+compare two caches and print the added, removed and changed paths.
+The cluster must be named by
+.B \-\-url
+or
+.BR \-\-cluster .
+.TP
+.B debug-seq-gaps
+Scan the connection trace for missing sequence numbers and print the first gap,
+the last gap and the total count.
+.TP
+.B debug-conntrace
+Print the most recent frame events, oldest first.
+.SH OPTIONS
+.SS Global
+.TP
+.BI \-\-log\-level " FILTER"
+Set the tracing filter.
+The value is a level name
+.RB ( trace ", " debug ", " info ", " warn ", " error )
+or a full EnvFilter directive.
+Precedence: this option, then
+.BR RUST_LOG ,
+then
+.BR SYNCMOUNT_LOG ,
+then
+.BR info .
+An invalid directive is a startup error.
+.TP
+.BI \-\-log\-format " FORMAT"
+Render logs as
+.B text
+(default, alias
+.BR pretty )
+or
+.BR json .
+.TP
+.B \-\-foreground
+Accepted for unit files and container entrypoints.
+Both modes already run in the foreground; the option is a no-op.
+.TP
+.BR \-h ", " \-\-help
+Print help.
+.TP
+.BR \-V ", " \-\-version
+Print the software, protocol, frame, WCP, rsync and signature versions.
+.SS Client
+.TP
+.B \-\-allow\-other
+Allow every local user to access the mount.
+Requires
+.B user_allow_other
+in
+.IR /etc/fuse.conf ;
+without it the client refuses to start.
+.TP
+.B \-\-allow\-empty\-view
+Accept a JOIN that offers no view above sequence zero.
+Cluster-wins then deletes every local-only path; this flag records that
+consent.
+.TP
+.BI \-\-key\-file " PATH"
+Read the master password from
+.IR PATH .
+The file must be a regular file owned by the current user with mode 0600.
+One trailing newline is stripped.
+.TP
+.B \-\-key
+Refused.
+A password in argv is visible in
+.B ps
+and shell history.
+Use
+.B SYNCMOUNT_MASTER_PASSWORD
+or
+.B SYNCMOUNT_MASTER_PASSWORD_FILE
+instead, or pass
+.BR \-\-key\-file .
+With neither variable set and no
+.B \-\-key\-file
+option, the client prompts on the terminal.
+.SS Server
+.TP
+.BI \-\-listen " ADDR"
+Bind
+.IR ADDR
+.RB ( host:port
+or
+.IR ip:port ).
+Default:
+.BR 127.0.0.1:8080 .
+Port 0 asks the kernel for an ephemeral port; the chosen address is logged.
+.TP
+.BI \-\-port " PORT"
+Bind
+.B 127.0.0.1:PORT.
+Conflicts with
+.BR \-\-listen .
+.SS Status and debug
+.TP
+.B \-\-json
+Emit machine-readable JSON.
+.TP
+.BI \-\-mount\-id " ID"
+Restrict output to one mount id.
+.TP
+.BI \-\-limit " N"
+Number of connection-trace entries to print.
+Default: 100.
+.TP
+.BI \-\-url " URL"
+Derive the cluster identity from this URL.
+.TP
+.BI \-\-cluster " HEX"
+Use an explicit 16-byte cluster id, written as 32 hex characters.
+.SH ENVIRONMENT
+.TP
+.B SYNCMOUNT_MASTER_PASSWORD
+The master password.
+.TP
+.B SYNCMOUNT_MASTER_PASSWORD_FILE
+A file containing the master password.
+The file must be mode 0600 and owned by the current user.
+Setting both password variables is an error.
+.TP
+.B SYNCMOUNT_RUN_DIR
+Base directory for per-mount runtime state.
+Default:
+.BR /run/syncmount .
+.TP
+.B SYNCMOUNT_LISTEN
+Listen address used when
+.B \-\-listen
+is absent.
+.TP
+.B SYNCMOUNT_LOG
+Tracing filter used when
+.B RUST_LOG
+is unset.
+.TP
+.B RUST_LOG
+Tracing filter used when
+.B \-\-log\-level
+is absent.
+.TP
+.B XDG_STATE_HOME
+Base for the Ed25519 identity key.
+Default:
+.BR $HOME/.local/state .
+.TP
+.B FUSERMOUNT_PATH
+Explicit path to
+.BR fusermount3 .
+.TP
+.B SYNCMOUNT_REQUIRE_FUSE
+Test-only: a FUSE test that cannot run is a failure instead of a skip.
+.SH FILES
+Paths below use the default base;
+.B SYNCMOUNT_RUN_DIR
+replaces
+.BR /run/syncmount .
+.TP
+.B /run/syncmount/\fIMID\fR/lock
+Single-instance lock, mode 0600.
+.TP
+.B /run/syncmount/\fIMID\fR/status.json
+Atomically replaced status document, mode 0600.
+.TP
+.B $XDG_STATE_HOME/syncmount/keys/\fICLUSTER\fR/ed25519.key
+Per-client Ed25519 identity, mode 0600, bound to one cluster.
+The base defaults to
+.B ~/.local/state
+when
+.B XDG_STATE_HOME
+is unset.
+.TP
+.B /dev/fuse
+The FUSE device; the client checks that it can open it before mounting.
+.TP
+.B /etc/fuse.conf
+Must contain
+.B user_allow_other
+for
+.BR \-\-allow\-other .
+.SH EXIT STATUS
+.TP
+.B 0
+Success, including a clean unmount after a signal.
+.TP
+.B 1
+Usage error or a second instance for the same mountpoint.
+.TP
+.B 2
+Startup failure: bad URL, missing key, unusable mountpoint, bind failure,
+missing prerequisites, or an unavailable status document.
+.TP
+.B 3
+The audit log is corrupt and was retained for inspection.
+.TP
+.B 10
+The transport failed or the client was kicked; the mount has been released.
+A unit that restarts the mount must treat this status as final; see
+.BR SYSTEMD .
+.SH SYSTEMD
+The client exits with status 10 whenever it loses the cluster.
+A unit that restarts on failure would restart it into the same failure, so
+list 10 in
+.BR RestartPreventExitStatus :
+.PP
+.nf
+[Unit]
+Description=syncmount client
+
+[Service]
+Type=simple
+User=user
+RuntimeDirectory=syncmount-private
+Environment=XDG_STATE_HOME=/home/user/.local/state/private
+Environment=SYNCMOUNT_RUN_DIR=/run/syncmount-private
+Environment=SYNCMOUNT_MASTER_PASSWORD_FILE=/etc/syncmount/master-password
+ExecStart=/usr/local/bin/syncmount client http://sync.example.com/sync /home/user/share
+Restart=on-failure
+RestartPreventExitStatus=10
+
+[Install]
+WantedBy=multi-user.target
+.fi
+.PP
+.I User
+selects the account that owns the mount and reads the password file.
+Set
+.I XDG_STATE_HOME
+explicitly: a system service does not inherit the user's environment, and the
+Ed25519 identity lives under
+.IR $XDG_STATE_HOME/syncmount/keys/ .
+.I SYNCMOUNT_RUN_DIR
+must be writable by that user;
+.B RuntimeDirectory
+creates the directory and removes it when the unit stops.
+The mountpoint must already exist and be accessible to the same user.
+The password file must be owned by and readable by that user.
+.PP
+Statuses 1 and 2 are configuration errors and do not improve with a restart.
+Status 3 needs an operator because the audit log was kept for inspection.
+A clean unmount after a signal exits 0 and is not restarted by
+.BR Restart=on\-failure .
+The client does not reconnect on its own: after the network returns, start the
+unit again.
+.SH EXAMPLES
+Start a sequencer and mount it on one host:
+.PP
+.nf
+export SYNCMOUNT_MASTER_PASSWORD='correct horse battery staple'
+syncmount server http://127.0.0.1:8080/sync --listen 127.0.0.1:8080 &
+mkdir -p /mnt/share
+syncmount client http://127.0.0.1:8080/sync /mnt/share
+.fi
+.PP
+The same invocation with the implicit aliases:
+.PP
+.nf
+syncmount http://127.0.0.1:8080/sync --listen 127.0.0.1:8080 &
+syncmount http://127.0.0.1:8080/sync /mnt/share
+.fi
+.PP
+Inspect a running client:
+.PP
+.nf
+syncmount status
+syncmount status --json
+syncmount debug-conntrace --limit 20
+syncmount debug-seq-gaps --json
+.fi
+.SH LIMITATIONS
+The local data write is acknowledged before the cluster sees it.
+The operation is queued in an in-memory outbox, not on durable storage; a
+crash, disconnect or kick loses operations that were not broadcast.
+.BR fsync (2)
+and
+.BR fdatasync (2)
+flush the local disk and ask the uplink to flush its coalescer; they do not
+wait for a cluster acknowledgement.
+.PP
+The outbox also has a replay-backlog window: it closes at 256 operations that
+were sent but whose echo has not been applied, and reopens at 128.
+While it is closed,
+.BR write (2),
+.BR truncate (2),
+.BR setattr ,
+.B xattr
+and namespace calls return
+.BR ENOSPC
+before the disk or the sequencer is touched, and the uplink sends nothing new.
+.B ENOSPC
+here is backpressure, not data loss; retry after a pause or lower the write
+rate.
+Four-kilobyte random writes from one client sustain about 1,024 operations per
+second on btrfs with zstd, and more on tmpfs; above that the write returns
+.B ENOSPC
+while the mount and the client process stay alive.
+.PP
+The window protects the producer only.
+The server has a bounded per-session downlink (8 MiB or 512 frames) and kicks a
+consumer that falls behind with
+.BR QueueOverflow ,
+including an idle client that cannot apply the broadcast stream fast enough.
+The kicked client unmounts and exits with status 10; remounting recovers.
+.PP
+A transport failure, heartbeat timeout, kick or protocol violation unmounts
+the client and exits with status 10.
+There is no offline mode, no pending-operation replay and no durable outbox.
+A remount is cluster-wins: local-only paths are deleted and differing content
+and attributes are replaced.
+Reads use the local tree and can serve stale data during the convergence
+window.
+Reads are allowed during
+.BR JOINING ,
+so a reader can see a mixed tree while cluster-wins is replacing entries;
+writes return
+.BR EROFS .
+A local tree with no non-empty file and no usable baseline is the only case
+that transfers every file
+.RB ( empty-local );
+all other joins pull the holder's manifest and use manifest and rsync
+differences.
+.PP
+.nh
+.BR mmap (2)
+with
+.BR MAP_SHARED ,
+device nodes, Unix sockets, FIFOs and
+.B O_APPEND
+are best effort: they are accepted and do not fail because of the weak
+cross-client semantics.
+Shared mappings write back through the ordinary write path and participate in
+last-writer-wins, but
+.BR msync (2)
+is local only, a remote invalidation can raise
+.BR SIGBUS ,
+and concurrent mappings on two clients are an uncontrolled race.
+.B O_APPEND
+is anchored at the local EOF and can interleave across clients.
+A device node and a Unix socket are local kernel endpoints whose metadata may
+be broadcast; the endpoint is not shared across hosts.
+FIFO writes do not cross clients.
+Only regular files, directories and symbolic links have real cross-client
+semantics.
+atime is not synchronized; ctime is assigned at apply time from the server
+order and is consistent across clients; uid and gid are not mapped between
+hosts; mtime is client-supplied.
+.BR ioctl (2)
+supports only a small
+.B FS_IOC_GETFLAGS/SETFLAGS
+subset mapped to setattr; other commands return
+.BR ENOTTY .
+.hy
+.PP
+.B flock
+is local to one mount and never crosses clients.
+.B fcntl
+record locks are cross-client and strongly ordered: a cluster mount
+negotiates POSIX locks, every
+.BR getlk / setlk
+reaches the deterministic byte-range table, every lock change is an ordered
+operation, and the caller waits for its replay verdict.
+A conflicting
+.B F_SETLK
+returns
+.BR EAGAIN ;
+.B F_GETLK
+reads the table at the client's applied sequence, so it can be stale by the
+convergence window.
+The owner is the mount, not the process; the reported
+.I l_pid
+is 0, and blocking
+.B F_SETLKW
+returns
+.BR EOPNOTSUPP .
+A departed holder's locks are released by a signed
+.B LEAVE
+or by lease expiry, not by a server hint; a crashed holder's locks are not
+reclaimed immediately.
+.PP
+Namespace operations are queued and the caller waits for the replay verdict;
+a concurrent loser receives the losing errno and its local tree is not changed.
+The wait costs one sequencer round trip and answers
+.B ENOTCONN
+on disconnect or after 10 seconds; the operation may still be applied later.
+.PP
+A joining client proves its key with
+.BR JOIN_PROOF ,
+sealed with the cluster key.
+A member answers with
+.BR JOIN_ACCEPT ,
+which carries the keys it knows.
+The receive path verifies every operation against that directory and fails
+closed on an unknown key or a bad signature, so a wrong password is rejected
+at JOIN when a member is online.
+A cluster with no online member trusts its first client without verification,
+so a wrong password is accepted there and creates an isolated cluster.
+Key distribution forms a star around each verifier; a cluster of three or more
+clients is not stable until every pair has exchanged keys.
+A member that is online but silent for the two-second proof deadline also
+fails the JOIN.
+.PP
+Above sequence zero a JOIN also needs a view. The server names an online holder
+whose applied watermark equals
+.IR current ;
+the client pulls that holder's manifest, blockmap and the blocks its diff needs
+over a relay session, then runs cluster-wins.
+A solo client that has applied
+.I current
+or is one
+.B LEAVE
+behind may use its local manifest as a self view; the client refuses a self
+view that does not describe the disk exactly.
+By default, if no holder and no self view is available, the JOIN retries
+after 1, 2, 4, 8 and 16 seconds and exits 2 without deleting local files.
+There is no snapshot transfer on this path.
+.PP
+The heartbeat starts only when the client reaches
+.BR STEADY .
+The server suppresses the stall threshold during JOIN, but its 15-second
+heartbeat timeout still applies, so a JOIN longer than 15 seconds can be
+kicked.
+RTT is not reported: the control prefix reserves that field as zero, and the
+stall threshold always uses the 300 ms fallback.
+.PP
+There is one sequencer and no leader election.
+A server restart resets the sequence, draws a new epoch and forces every
+client to resynchronise.
+The server can rewrite
+.BR seq ,
+delay, drop, duplicate or reorder frames.
+Clients detect their own gaps and epoch changes, but cannot prove a
+cross-client reorder.
+Server control frames
+.RB ( KICK ,
+.BR LEAVE ,
+.BR WELCOME ,
+.BR PONG )
+are availability hints, not authority; the plaintext
+.B LEAVE
+is ignored, so it cannot release a lock.
+.PP
+There is no perfect forward secrecy, no key rotation and no revocation.
+A leaked password decrypts past and future traffic and requires rebuilding the
+cluster.
+Every operation is signed with a random per-client Ed25519 key and verified by
+every receiving client; the server neither sees nor verifies the signature.
+A PSK holder cannot forge another member's operation without that member's
+private key.
+Key distribution is peer-mediated, so the guarantee covers only peers that
+have exchanged keys (see the JOIN paragraph above).
+The server sees frame headers, routing and control prefixes, sizes, timing,
+connection pairs and client identifiers, not payloads or paths.
+There is no built-in TLS and the client rejects an
+.B https
+URL with
+.BR TlsUnsupported .
+A conventional TLS-terminating reverse proxy cannot be dialed by the client;
+if transport protection is required, use a local tunnel that accepts plain
+HTTP on loopback.
+.PP
+Content chunks have two identifiers.
+.I chunk_id
+is
+.B BLAKE3
+of the plaintext chunk (at most 256 KiB) and is the logical identity used by
+the manifest,
+.BR DataMap ,
+.B BLOCK_REQ
+and the local chunk cache.
+.I blob_id
+is
+.B BLAKE3
+of the ciphertext and is a physical-integrity identifier.
+Deduplication happens before encryption, by
+.IR chunk_id .
+Each 64 KiB envelope of a chunk is sealed with a fresh random nonce, so equal
+plaintext produces different ciphertext.
+This is plaintext addressing: no key and no nonce are derived from the content.
+A cluster member who holds the index can tell whether two blocks are
+byte-identical; the server sees neither identifier.
+See
+.I docs/known-limitations.md
+section 4.3.
+.PP
+There is no independent fsck, broadcast log, multi-tenant routing or
+peer-to-peer transfer.
+Content verification is deferred; the watermark health check plus a remount
+are the recovery path.
+One process serves one cluster.
+rsync uses 16 MiB segments; a segment boundary can lose one block match.
+The
+.I librsync_oxide
+backend is a new, pinned dependency.
+The design point is about 20 online clients, one million files and 4 GiB per
+file; larger deployments are not promised.
+The three-or-more-client key-distribution limit applies before this design
+point.
+.PP
+The full semantic boundary, including the accepted limits and residual gaps,
+is in
+.I docs/known-limitations.md
+in the source distribution; the adversary model is in
+.IR docs/threat-model.md .
+Paths never appear in logs or status documents in clear text; only an
+eight-hex prefix of their BLAKE3 hash is published.
+.SH SEE ALSO
+.BR fusermount3 (1),
+.BR mount.fuse (8),
+.BR fuse (4),
+.BR systemd.service (5)
