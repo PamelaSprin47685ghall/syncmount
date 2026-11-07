@@ -130,18 +130,9 @@ impl Caps {
     pub const BATCH_BROADCAST: Self = Self(1 << 2);
     /// Per-session keys. Reserved.
     pub const SESSION_KEYS: Self = Self(1 << 3);
-    /// Snapshot + rsync join path. On in v1.
-    pub const SNAPSHOT_RSYNC: Self = Self(1 << 4);
     /// PSK handshake support. Mandatory in v2. Reuses bit 5, which carried
     /// `OP_SIGNATURE` in v1.
     pub const PSK_AUTH: Self = Self(1 << 5);
-    /// The server names the holder, sequence and session of a view snapshot
-    /// in `WELCOME` (`F_VIEW_HOLDER`, `F_VIEW_SEQ`, `F_VIEW_SESSION`).
-    /// Off in v1; a peer that does not set it must not send those fields.
-    pub const VIEW_SOURCE: Self = Self(1 << 6);
-    /// The server names itself as the view source in `WELCOME`
-    /// (`F_VIEW_SELF`); the view sequence is `current_seq`. Off in v1.
-    pub const VIEW_SELF: Self = Self(1 << 7);
 
     /// Capabilities without which v2 cannot operate.
     pub const REQUIRED: Self = Self(Self::CHACHA8_POLY1305.0 | Self::PSK_AUTH.0);
@@ -223,30 +214,15 @@ impl fmt::Display for Caps {
             sep(f)?;
             f.write_str("SESSION_KEYS")?;
         }
-        if self.contains(Self::SNAPSHOT_RSYNC) {
-            sep(f)?;
-            f.write_str("SNAPSHOT_RSYNC")?;
-        }
         if self.contains(Self::PSK_AUTH) {
             sep(f)?;
             f.write_str("PSK_AUTH")?;
-        }
-        if self.contains(Self::VIEW_SOURCE) {
-            sep(f)?;
-            f.write_str("VIEW_SOURCE")?;
-        }
-        if self.contains(Self::VIEW_SELF) {
-            sep(f)?;
-            f.write_str("VIEW_SELF")?;
         }
         let unknown = self
             .without(Self::REQUIRED)
             .without(Self::ZSTD)
             .without(Self::BATCH_BROADCAST)
-            .without(Self::SESSION_KEYS)
-            .without(Self::SNAPSHOT_RSYNC)
-            .without(Self::VIEW_SOURCE)
-            .without(Self::VIEW_SELF);
+            .without(Self::SESSION_KEYS);
         if !unknown.is_empty() {
             sep(f)?;
             write!(f, "0x{:08x}", unknown.0)?;
@@ -374,17 +350,14 @@ mod tests {
     fn negotiate_takes_lower_minor_and_capability_intersection() {
         let local = ProtoVersion { major: 2, minor: 5 };
         let remote = ProtoVersion { major: 2, minor: 2 };
-        let caps = Caps::REQUIRED.union(Caps::SNAPSHOT_RSYNC).union(Caps::ZSTD);
-        let got = negotiate(
-            local,
-            remote,
-            caps,
-            Caps::REQUIRED.union(Caps::SNAPSHOT_RSYNC),
-        )
-        .expect("negotiation succeeds");
+        let caps = Caps::REQUIRED
+            .union(Caps::ZSTD)
+            .union(Caps::BATCH_BROADCAST);
+        let got = negotiate(local, remote, caps, Caps::REQUIRED.union(Caps::ZSTD))
+            .expect("negotiation succeeds");
         assert_eq!(got.proto, ProtoVersion { major: 2, minor: 2 });
-        assert_eq!(got.caps, Caps::REQUIRED.union(Caps::SNAPSHOT_RSYNC));
-        assert!(!got.caps.contains(Caps::ZSTD));
+        assert_eq!(got.caps, Caps::REQUIRED.union(Caps::ZSTD));
+        assert!(!got.caps.contains(Caps::BATCH_BROADCAST));
     }
 
     #[test]
@@ -419,7 +392,7 @@ mod tests {
         let err = negotiate(
             ProtoVersion::CURRENT,
             ProtoVersion::CURRENT,
-            Caps::SNAPSHOT_RSYNC,
+            Caps::ZSTD,
             Caps::REQUIRED,
         )
         .expect_err("missing cipher must fail");
@@ -428,12 +401,12 @@ mod tests {
 
     #[test]
     fn caps_display_lists_names() {
-        let caps = Caps::REQUIRED.union(Caps::SNAPSHOT_RSYNC);
+        let caps = Caps::REQUIRED.union(Caps::ZSTD);
         let text = caps.to_string();
         assert!(text.contains("CHACHA8_POLY1305"));
         assert!(text.contains("PSK_AUTH"));
-        assert!(text.contains("SNAPSHOT_RSYNC"));
-        assert!(!text.contains("ZSTD"));
+        assert!(text.contains("ZSTD"));
+        assert!(!text.contains("BATCH_BROADCAST"));
     }
 
     #[test]
@@ -462,27 +435,5 @@ mod tests {
         assert_eq!(Caps::PSK_AUTH.bits(), 0x20);
         assert!(Caps::REQUIRED.contains(Caps::PSK_AUTH));
         assert_eq!(Caps::REQUIRED, Caps::CHACHA8_POLY1305.union(Caps::PSK_AUTH));
-    }
-
-    #[test]
-    fn caps_view_source_uses_bit_six() {
-        assert_eq!(Caps::VIEW_SOURCE.bits(), 1 << 6);
-        assert_eq!(Caps::VIEW_SOURCE.bits(), 0x40);
-        assert!(!Caps::REQUIRED.contains(Caps::VIEW_SOURCE));
-        assert!(Caps::VIEW_SOURCE.to_string().contains("VIEW_SOURCE"));
-        assert!(!Caps::EMPTY.contains(Caps::VIEW_SOURCE));
-    }
-
-    #[test]
-    fn caps_view_self_uses_bit_seven() {
-        assert_eq!(Caps::VIEW_SELF.bits(), 1 << 7);
-        assert_eq!(Caps::VIEW_SELF.bits(), 0x80);
-        assert!(!Caps::REQUIRED.contains(Caps::VIEW_SELF));
-        assert!(
-            !Caps::VIEW_SELF
-                .intersect(Caps::VIEW_SOURCE)
-                .contains(Caps::VIEW_SOURCE)
-        );
-        assert!(Caps::VIEW_SELF.to_string().contains("VIEW_SELF"));
     }
 }

@@ -1562,9 +1562,6 @@ mod tests {
     fn server_caps_require_only_the_psk_world() {
         let caps = server_caps();
         assert!(caps.contains(Caps::PSK_AUTH));
-        assert!(!caps.contains(Caps::SNAPSHOT_RSYNC));
-        assert!(!caps.contains(Caps::VIEW_SOURCE));
-        assert!(!caps.contains(Caps::VIEW_SELF));
     }
 
     #[test]

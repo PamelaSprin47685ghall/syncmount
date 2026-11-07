@@ -74,9 +74,9 @@ pub enum State {
     Locked = 1,
     /// Stale mounts and staging residue are being removed.
     Cleanup = 2,
-    /// FUSE is being mounted and the backing root opened.
+    /// FUSE is being mounted over the SQLite view.
     Mounting = 3,
-    /// The JOIN handshake and manifest install are running; writes are EROFS.
+    /// HELLO/WELCOME and the first replay are running; writes are EROFS.
     Joining = 4,
     /// The mount is fully online.
     Steady = 5,
@@ -261,20 +261,20 @@ pub enum CleanupError {
 /// Failure to mount FUSE.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MountError {
-    /// The backing root could not be opened.
+    /// The mount root could not be prepared.
     Root,
     /// `mount(2)` failed.
     Fuse,
 }
 
-/// Failure of the JOIN handshake or manifest install.
+/// Failure of the handshake or the first replay.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum JoinError {
     /// The transport could not be dialled.
     Transport,
     /// HELLO/WELCOME failed.
     Handshake,
-    /// The manifest or snapshot install failed.
+    /// The first replay failed.
     Sync,
     /// The server rejected the session.
     Rejected,
@@ -324,19 +324,19 @@ pub enum FatalError {
 pub struct JoinOutcome {
     /// Server epoch that was installed.
     pub epoch: u64,
-    /// Watermark of the installed view, i.e. the replayer's starting point.
+    /// Sequence applied by the first replay, i.e. the replayer's starting
+    /// point.
     ///
-    /// It is [`crate::client::JoinReport::view_seq`], never the server's
+    /// It is the `applied_seq` the local replica reached, never the server's
     /// `current_seq` guessed by the driver.
     pub covered: u64,
 }
 
-/// Retry schedule for a JOIN whose `WELCOME` has no remote view yet.
+/// Bounded retry schedule for the initial JOIN.
 ///
 /// The schedule is deliberately small and bounded: 1, 2, 4, 8 and 16
-/// seconds, five retries in total. A client that still sees no view after
-/// them refuses the JOIN instead of building an empty view, because
-/// cluster-wins over an empty view deletes every local-only path.
+/// seconds, five retries in total. After them the driver reports the JOIN as
+/// failed instead of retrying forever.
 ///
 /// The policy is pure. [`JoinRetryPolicy::next_delay`] only advances an
 /// index; the driver owns the sleep, so tests exercise the schedule without
@@ -347,7 +347,7 @@ pub struct JoinRetryPolicy {
     used: u32,
 }
 
-/// Number of retries a JOIN may spend waiting for a view.
+/// Number of retries a JOIN may spend before it fails.
 pub const JOIN_RETRY_LIMIT: usize = 5;
 
 impl JoinRetryPolicy {
@@ -439,9 +439,9 @@ pub enum Action {
     AcquireLock,
     /// Append the audit record for this start.
     AuditJournal,
-    /// Mount FUSE and open the backing root.
+    /// Mount FUSE over the SQLite view.
     MountFuse,
-    /// Dial, HELLO/WELCOME, install the snapshot and start following.
+    /// Dial, HELLO/WELCOME, and start following the event stream.
     StartJoin,
     /// Publish [`State::Steady`] to the write gate.
     OpenWriteGate,

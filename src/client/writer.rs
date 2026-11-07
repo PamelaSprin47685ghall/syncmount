@@ -368,7 +368,7 @@ impl Outbox {
     ///
     /// The returned guard releases the capacity on drop unless it is committed.
     /// This call never fails: the network cannot turn a local write into
-    /// `ENOSPC`. A real disk error still surfaces from the backing store.
+    /// `ENOSPC`. A real disk error still surfaces from SQLite.
     pub fn reserve(&self, bytes: usize) -> Reservation<'_> {
         let mut inner = self.lock();
         inner.reserved_bytes = inner.reserved_bytes.saturating_add(bytes);

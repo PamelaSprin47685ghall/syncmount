@@ -456,12 +456,6 @@ impl ServerHandshake {
             server_time: input.server_time,
             server_nonce: input.server_nonce,
             session_id: input.session_id,
-            snapshot_ref: None,
-            view_holder: None,
-            view_seq: None,
-            view_session: None,
-            view_self: false,
-            view_bootstrap: false,
         };
         let plain = welcome.encode()?;
         let body_hash = Welcome::proof_input(&plain, &FrameLimits::default())?;

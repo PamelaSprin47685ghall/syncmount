@@ -55,7 +55,7 @@ pub struct Counters {
     pub ops_rejected: AtomicU64,
     /// Duplicate frames dropped.
     pub ops_duplicate: AtomicU64,
-    /// Payload bytes the replay engine applied to the backing tree.
+    /// Payload bytes the replay engine applied to the replica.
     ///
     /// Local writes and the echo of the client's own operations go through
     /// the FUSE path and are not counted here.

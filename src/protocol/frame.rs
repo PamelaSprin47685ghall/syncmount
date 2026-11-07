@@ -398,8 +398,6 @@ impl fmt::Display for SessionId {
 pub struct StreamId(pub u8);
 
 impl StreamId {
-    /// Manifest stream.
-    pub const MANIFEST: Self = Self(1);
     /// Block stream.
     pub const BLOCK: Self = Self(2);
     /// Operation data stream.

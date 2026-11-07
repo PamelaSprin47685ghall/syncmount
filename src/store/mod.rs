@@ -1,34 +1,22 @@
-//! Local POSIX backing store.
+//! Shared local state for the client and the server.
 //!
-//! # The one rule
-//!
-//! The backing tree is reachable **only** through [`backing::RootFd`], opened
-//! *before* the FUSE mount covers the mountpoint. Every operation is a `*at`
-//! syscall relative to that descriptor. Never build an absolute path under the
-//! mountpoint, and never open the backing tree by path after mounting: the path
-//! would resolve through our own FUSE filesystem back into this process and
-//! deadlock (self-recursion). `RootFd` exposes no path-based constructor, so the
-//! mistake cannot be expressed through the safe API.
-//!
-//! `u_store_no_bare_path_open` scans this directory for the forbidden pattern.
+//! The persistent store is SQLite; there is no backing tree and no path-based
+//! file layer. [`sqlite`] owns the schema, the transaction shape and the event
+//! log, [`node_table`] keeps the in-memory inode identity used by the sync
+//! layer, and [`runtime_dir`] holds the status file and the instance lock.
 //!
 //! # Layout
 //!
 //! | module | responsibility |
 //! |---|---|
-//! | [`backing`] | [`BackingStore`] trait, [`PosixBacking`], [`RootFd`], `*at` helpers |
-//! | [`chunk_store`] | content-addressed chunk cache (`chunk_id` + `blob_id`) |
 //! | [`node_table`] | [`InodeId`] and the inode/path/name index |
 //! | [`runtime_dir`] | `/run/syncmount/<mount_id>`: status file and instance lock |
 //! | [`sqlite`] | shared SQLite state store for the SQLite-backed architecture |
 
-pub mod backing;
-pub mod chunk_store;
 pub mod node_table;
 pub mod runtime_dir;
 pub mod sqlite;
 
-pub use backing::{BackingStore, DirEntry, DirSink, Effect, PosixBacking, RootFd};
 pub use node_table::{InodeId, Node, NodeTable};
 pub use runtime_dir::RuntimeDir;
 
@@ -39,26 +27,15 @@ use std::os::unix::ffi::OsStrExt;
 
 /// Internal names that belong to the daemon, never to the user tree.
 ///
-/// They are hidden by the FUSE layer, excluded from the manifest, and never
-/// removed by `LocalOnly` cleanup. Writes that target these names are rejected
-/// with `EEXIST`; reads resolve them to `ENOENT`.
+/// They are hidden by the FUSE layer and skipped by an import. Writes that
+/// target these names are rejected with `EEXIST`; reads resolve them to
+/// `ENOENT`.
 pub const RESERVED_NAMES: [&str; 4] = [
     ".syncmount",
     ".syncmount-staging",
     ".syncmount-manifest",
     ".audit.log",
 ];
-
-/// Staging root below the backing root.
-pub const STAGING_DIR: &str = ".syncmount-staging";
-/// Content-addressed chunk cache below the staging root.
-pub const CHUNK_DIR: &str = ".syncmount-staging/chunks";
-/// Flat staging tree for files that are about to be renamed into place.
-pub const STAGING_TREE: &str = ".syncmount-staging/tree";
-/// Local manifest cache (accelerator, never authoritative).
-pub const MANIFEST_FILE: &str = ".syncmount-manifest";
-/// Append-only audit journal.
-pub const AUDIT_FILE: &str = ".audit.log";
 
 /// True if `name` is an internal name that must not enter the user namespace.
 pub fn is_reserved_name(name: &OsStr) -> bool {
@@ -263,57 +240,6 @@ impl Timespec {
     }
 }
 
-/// Metadata returned by the backing store.
-///
-/// This mirrors the subset of `struct stat` the FUSE layer needs; `ctime` is
-/// carried for local display only and never participates in replay or in
-/// cross-node manifest comparison.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Attr {
-    pub ino: u64,
-    pub size: u64,
-    pub blocks: u64,
-    pub blksize: u32,
-    pub mode: u32,
-    pub nlink: u32,
-    pub uid: u32,
-    pub gid: u32,
-    pub rdev: u64,
-    pub atime: Timespec,
-    pub mtime: Timespec,
-    pub ctime: Timespec,
-}
-
-impl Attr {
-    /// Convert a `rustix` stat result.
-    pub fn from_stat(stat: &rustix::fs::Stat) -> Self {
-        Self {
-            ino: stat.st_ino,
-            size: stat.st_size.max(0) as u64,
-            blocks: stat.st_blocks.max(0) as u64,
-            blksize: stat.st_blksize.max(0) as u32,
-            mode: stat.st_mode,
-            nlink: stat.st_nlink as u32,
-            uid: stat.st_uid,
-            gid: stat.st_gid,
-            rdev: stat.st_rdev,
-            atime: Timespec::new(stat.st_atime, stat.st_atime_nsec as i64),
-            mtime: Timespec::new(stat.st_mtime, stat.st_mtime_nsec as i64),
-            ctime: Timespec::new(stat.st_ctime, stat.st_ctime_nsec as i64),
-        }
-    }
-
-    /// The file type encoded in `mode`.
-    pub fn kind(&self) -> Kind {
-        Kind::from_mode(self.mode)
-    }
-
-    /// Permission bits, including setuid/setgid/sticky.
-    pub fn perm(&self) -> u32 {
-        self.mode & 0o7777
-    }
-}
-
 /// Attribute changes carried by `setattr` / `SETATTR` replay.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct AttrDelta {
@@ -323,20 +249,6 @@ pub struct AttrDelta {
     pub size: Option<u64>,
     pub atime: Option<Timespec>,
     pub mtime: Option<Timespec>,
-}
-
-/// Flags for [`BackingStore::rename`].
-///
-/// Store defines its own type so it never depends on the FUSE adapter; the
-/// numeric values match `renameat2(2)`.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct RenameFlags(pub u32);
-
-impl RenameFlags {
-    pub const NONE: Self = Self(0);
-    pub const NOREPLACE: Self = Self(rustix::fs::RenameFlags::NOREPLACE.bits());
-    pub const EXCHANGE: Self = Self(rustix::fs::RenameFlags::EXCHANGE.bits());
-    pub const WHITEOUT: Self = Self(rustix::fs::RenameFlags::WHITEOUT.bits());
 }
 
 #[cfg(test)]
@@ -378,41 +290,6 @@ mod tests {
             (FileType::Fifo.as_raw_mode() | 0o600, Kind::Fifo),
         ] {
             assert_eq!(Kind::from_mode(raw_mode), kind);
-        }
-    }
-
-    /// C-10
-    #[test]
-    fn u_store_no_bare_path_open() {
-        // W6 / C-10 / P1-2: the backing tree must never be opened by path.
-        // The needles are assembled with `concat!` so this test's own source
-        // does not contain the literal it forbids.
-        const SOURCES: [(&str, &str); 5] = [
-            ("mod.rs", include_str!("mod.rs")),
-            ("backing.rs", include_str!("backing.rs")),
-            ("chunk_store.rs", include_str!("chunk_store.rs")),
-            ("node_table.rs", include_str!("node_table.rs")),
-            ("runtime_dir.rs", include_str!("runtime_dir.rs")),
-        ];
-        let needles = [
-            concat!("File", "::open("),
-            concat!("File", "::create("),
-            concat!("std::fs", "::read("),
-        ];
-        for (file, source) in SOURCES {
-            for (line_no, line) in source.lines().enumerate() {
-                let trimmed = line.trim_start();
-                if trimmed.starts_with("//") || trimmed.starts_with('*') {
-                    continue;
-                }
-                for needle in needles {
-                    assert!(
-                        !line.contains(needle),
-                        "{file}:{} uses path-based file access: {line}",
-                        line_no + 1
-                    );
-                }
-            }
         }
     }
 }

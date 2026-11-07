@@ -58,10 +58,10 @@ pub use handshake::{
     ServerHandshake, WelcomeReply,
 };
 pub use messages::{
-    Accept, Ack, Auth, DataRef, Error as ErrorMessage, FieldMap, FileAttrs, Flow, Hello,
-    Kick, Leave, Message, MessageError, OpArgs, OpClass, OpIdLog, OpIdVerdict, Ordered, PathError,
-    Ping, Pong, Relay, RelaySub, ResyncMode, SeqGate, SeqVerdict, SnapshotRef, StreamData, SyncEnd,
-    WcpError, WcpWriter, Welcome, WelcomeLimits, WirePath, decode_plain, decode_sealed,
+    Accept, Ack, Auth, DataRef, Error as ErrorMessage, FieldMap, FileAttrs, Flow, Hello, Kick,
+    Leave, Message, MessageError, OpArgs, OpClass, OpIdLog, OpIdVerdict, Ordered, PathError, Ping,
+    Pong, Relay, RelaySub, ResyncMode, SeqGate, SeqVerdict, StreamData, SyncEnd, WcpError,
+    WcpWriter, Welcome, WelcomeLimits, WirePath, decode_plain, decode_sealed,
 };
 pub use version::{Caps, FrameVer, Negotiated, ProtoVersion, VersionError, WcpVer, negotiate};
 

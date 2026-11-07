@@ -67,8 +67,6 @@ pub mod fid {
     pub const F_RESYNC: u8 = 0x0A;
     /// Nested `WelcomeLimits` (`WELCOME`).
     pub const F_LIMITS: u8 = 0x0B;
-    /// Nested `SnapshotRef` (`WELCOME`).
-    pub const F_SNAPSHOT_REF: u8 = 0x0C;
     /// Session identifier, 16 B (`WELCOME`, `ERROR`).
     pub const F_SESSION_ID: u8 = 0x0D;
     /// Operation identifier, 16 B (`ORDERED`).
@@ -131,23 +129,13 @@ pub mod fid {
     pub const F_SERVER_NONCE: u8 = 0x38;
     /// Relay sub-message kind, `u8` (`RELAY`).
     pub const F_SUB_KIND: u8 = 0x40;
-    /// Content chunk identifier, 32 B (`RELAY`).
-    pub const F_CHUNK_ID: u8 = 0x41;
-    /// Block index, `u64` (`RELAY`).
-    pub const F_BLOCK_INDEX: u8 = 0x42;
-    /// Snapshot covered sequence, `u64` (`RELAY`).
-    pub const F_SNAPSHOT_COVERED: u8 = 0x43;
-    /// Snapshot part count, `u32` (`RELAY`).
-    pub const F_PART_COUNT: u8 = 0x44;
-    /// Plaintext digest, 32 B (`RELAY`).
-    pub const F_PLAINTEXT_DIGEST: u8 = 0x45;
     /// Vendor extension, bytes.
     pub const F_EXTRA: u8 = 0x7F;
 
     // The nested WCP streams in 44 appendix B carry no field ids of their own.
-    // These ids are frozen here so that `WelcomeLimits` and `SnapshotRef` are
-    // unambiguous on the wire; they live inside the nested stream and never
-    // appear at the top level.
+    // These ids are frozen here so that `WelcomeLimits` is unambiguous on the
+    // wire; they live inside the nested stream and never appear at the top
+    // level.
     /// `WelcomeLimits.max_frame`, `u32`.
     pub const F_LIMIT_MAX_FRAME: u8 = 0x50;
     /// `WelcomeLimits.credit_bytes`, `u32`.
@@ -156,38 +144,6 @@ pub mod fid {
     pub const F_LIMIT_SESSION_TTL_S: u8 = 0x52;
     /// `WelcomeLimits.max_sessions`, `u32`.
     pub const F_LIMIT_MAX_SESSIONS: u8 = 0x53;
-    /// `SnapshotRef.covered_seq`, `u64`.
-    pub const F_SNAP_COVERED_SEQ: u8 = 0x54;
-    /// `SnapshotRef.part_count`, `u32`.
-    pub const F_SNAP_PART_COUNT: u8 = 0x55;
-    /// `SnapshotRef.total_len`, `u64`.
-    pub const F_SNAP_TOTAL_LEN: u8 = 0x56;
-    /// `SnapshotRef.root_chunk_id`, 32 B.
-    pub const F_SNAP_ROOT_CHUNK: u8 = 0x57;
-    /// `SnapshotRef.holder`, 16 B.
-    pub const F_SNAP_HOLDER: u8 = 0x58;
-    /// View-snapshot holder, 16 B (`WELCOME`).
-    ///
-    /// Optional. `F_VIEW_HOLDER`, [`F_VIEW_SEQ`] and [`F_VIEW_SESSION`] are
-    /// one unit: all three or none.
-    pub const F_VIEW_HOLDER: u8 = 0x59;
-    /// Sequence covered by the view snapshot, `u64` (`WELCOME`).
-    pub const F_VIEW_SEQ: u8 = 0x5A;
-    /// Session serving the view snapshot, 16 B (`WELCOME`).
-    pub const F_VIEW_SESSION: u8 = 0x5B;
-    /// Self-view flag, `u8` (`WELCOME`).
-    ///
-    /// `1` means the server itself is the view source and
-    /// [`F_VIEW_SEQ`] is `current_seq`; `0` and an absent field are
-    /// equivalent. Mutually exclusive with the three view-source fields.
-    pub const F_VIEW_SELF: u8 = 0x5C;
-    /// Bootstrap-view flag, `u8` (`WELCOME`).
-    ///
-    /// `1` means the joiner is the only identity on an empty cluster and may
-    /// describe its own disk as the sequence-zero cluster view. `0` and an
-    /// absent field are equivalent. Mutually exclusive with
-    /// [`F_VIEW_SELF`] and the three view-source fields.
-    pub const F_VIEW_BOOTSTRAP: u8 = 0x5D;
     /// Server proof over the canonical `WELCOME` body, 61 B (`WELCOME`).
     ///
     /// `alg u8 | nonce 12 | ciphertext 32 | tag 16`, sealed under the
@@ -545,9 +501,9 @@ pub enum MessageError {
     Path(PathError),
     /// `F_OP_CLASS` is outside `1..=15`; fatal (49 A14).
     UnknownOpClass(u8),
-    /// `F_SUB_KIND` is outside `1..=10`.
+    /// `F_SUB_KIND` is not a known relay sub-message kind.
     UnknownRelaySub(u8),
-    /// `F_RESYNC` is outside `0..=2`.
+    /// `F_RESYNC` is neither `0` (none) nor `2` (full).
     UnknownResync(u8),
     /// `F_TRN_REASON` is unknown.
     UnknownTrnReason(u16),
@@ -580,28 +536,6 @@ pub enum MessageError {
         /// Required exact length.
         need: usize,
     },
-    /// The view-source fields are not all present or all absent.
-    ///
-    /// `F_VIEW_HOLDER`, `F_VIEW_SEQ` and `F_VIEW_SESSION` form one unit;
-    /// a sender must emit either all three or none.
-    PartialViewSource {
-        /// Whether `F_VIEW_HOLDER` was present.
-        holder: bool,
-        /// Whether `F_VIEW_SEQ` was present.
-        seq: bool,
-        /// Whether `F_VIEW_SESSION` was present.
-        session: bool,
-    },
-    /// `F_VIEW_SELF` is set while a view-source field is present.
-    ///
-    /// A self view names the server as the source and derives its sequence
-    /// from `current_seq`; it cannot also carry an explicit source.
-    ViewSelfConflict,
-    /// `F_VIEW_BOOTSTRAP` is set while another view source is present.
-    ///
-    /// A bootstrap view means "the local disk is the view"; it cannot also
-    /// name a holder, a view sequence, a session or a self view.
-    ViewBootstrapConflict,
 }
 
 impl MessageError {
@@ -640,25 +574,6 @@ impl fmt::Display for MessageError {
             Self::BadBodyLen { len, need } => {
                 write!(f, "body is {len} bytes, exactly {need} required")
             }
-            Self::PartialViewSource {
-                holder,
-                seq,
-                session,
-            } => write!(
-                f,
-                "view-source fields must appear together: \
-                 F_VIEW_HOLDER={holder}, F_VIEW_SEQ={seq}, F_VIEW_SESSION={session}"
-            ),
-            Self::ViewSelfConflict => write!(
-                f,
-                "F_VIEW_SELF cannot be combined with \
-                 F_VIEW_HOLDER, F_VIEW_SEQ or F_VIEW_SESSION"
-            ),
-            Self::ViewBootstrapConflict => write!(
-                f,
-                "F_VIEW_BOOTSTRAP cannot be combined with \
-                 F_VIEW_SELF, F_VIEW_HOLDER, F_VIEW_SEQ or F_VIEW_SESSION"
-            ),
         }
     }
 }
@@ -1053,9 +968,7 @@ fn path_field<'a>(
 pub enum ResyncMode {
     /// No resync needed.
     None = 0,
-    /// Manifest diff against the covered sequence.
-    ManifestDiff = 1,
-    /// Full snapshot transfer.
+    /// Full replay from the compacted event stream.
     Full = 2,
 }
 
@@ -1064,7 +977,6 @@ impl ResyncMode {
     pub fn from_u8(raw: u8) -> Result<Self, MessageError> {
         match raw {
             0 => Ok(Self::None),
-            1 => Ok(Self::ManifestDiff),
             2 => Ok(Self::Full),
             other => Err(MessageError::UnknownResync(other)),
         }
@@ -1114,54 +1026,6 @@ impl WelcomeLimits {
         writer.u32(fid::F_LIMIT_CREDIT_BYTES, self.credit_bytes);
         writer.u32(fid::F_LIMIT_SESSION_TTL_S, self.session_ttl_s);
         writer.u32(fid::F_LIMIT_MAX_SESSIONS, self.max_sessions);
-    }
-}
-
-/// Snapshot reference nested in `WELCOME` under `F_SNAPSHOT_REF`.
-///
-/// It names a snapshot but carries no path: the server treats it as an
-/// opaque reference (44 §3.4, INV-16).
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub struct SnapshotRef {
-    /// Sequence covered by the snapshot.
-    pub covered_seq: u64,
-    /// Number of snapshot parts.
-    pub part_count: u32,
-    /// Total plaintext length.
-    pub total_len: u64,
-    /// Root chunk identifier.
-    pub root_chunk_id: [u8; 32],
-    /// Client holding the snapshot.
-    pub holder: ClientId,
-}
-
-impl SnapshotRef {
-    fn decode(body: &[u8], limits: &Limits) -> Result<Self, MessageError> {
-        let fields = FieldMap::parse(body, limits)?;
-        Ok(Self {
-            covered_seq: required(
-                fields.u64(fid::F_SNAP_COVERED_SEQ)?,
-                fid::F_SNAP_COVERED_SEQ,
-            )?,
-            part_count: required(fields.u32(fid::F_SNAP_PART_COUNT)?, fid::F_SNAP_PART_COUNT)?,
-            total_len: required(fields.u64(fid::F_SNAP_TOTAL_LEN)?, fid::F_SNAP_TOTAL_LEN)?,
-            root_chunk_id: required(
-                fields.fixed::<32>(fid::F_SNAP_ROOT_CHUNK)?,
-                fid::F_SNAP_ROOT_CHUNK,
-            )?,
-            holder: ClientId::from_bytes(required(
-                fields.fixed::<16>(fid::F_SNAP_HOLDER)?,
-                fid::F_SNAP_HOLDER,
-            )?),
-        })
-    }
-
-    fn write(&self, writer: &mut WcpWriter) {
-        writer.u64(fid::F_SNAP_COVERED_SEQ, self.covered_seq);
-        writer.u32(fid::F_SNAP_PART_COUNT, self.part_count);
-        writer.u64(fid::F_SNAP_TOTAL_LEN, self.total_len);
-        writer.bytes(fid::F_SNAP_ROOT_CHUNK, &self.root_chunk_id);
-        writer.bytes(fid::F_SNAP_HOLDER, &self.holder.to_bytes());
     }
 }
 
@@ -1271,23 +1135,6 @@ pub struct Welcome {
     pub server_nonce: [u8; 32],
     /// Join session.
     pub session_id: SessionId,
-    /// Optional snapshot reference.
-    pub snapshot_ref: Option<SnapshotRef>,
-    /// Client holding the view snapshot. Present only with
-    /// [`Self::view_seq`] and [`Self::view_session`].
-    pub view_holder: Option<ClientId>,
-    /// Sequence covered by the view snapshot.
-    pub view_seq: Option<Seq>,
-    /// Session that serves the view snapshot.
-    pub view_session: Option<SessionId>,
-    /// Whether the server itself is the view source. The view sequence is
-    /// [`Self::current_seq`]. Cannot be set together with the three
-    /// view-source fields above.
-    pub view_self: bool,
-    /// Whether the joiner may use its own disk as the sequence-zero view.
-    /// Cannot be set together with [`Self::view_self`] or the three
-    /// view-source fields above.
-    pub view_bootstrap: bool,
 }
 
 impl Welcome {
@@ -1301,55 +1148,6 @@ impl Welcome {
             fields.fixed::<16>(fid::F_SESSION_ID)?,
             fid::F_SESSION_ID,
         )?);
-        let snapshot_ref = match fields.get(fid::F_SNAPSHOT_REF) {
-            Some(nested) => Some(SnapshotRef::decode(nested, limits)?),
-            None => None,
-        };
-        let view_holder = fields
-            .fixed::<16>(fid::F_VIEW_HOLDER)?
-            .map(ClientId::from_bytes);
-        let view_seq = fields.u64(fid::F_VIEW_SEQ)?.map(Seq);
-        let view_session = fields
-            .fixed::<16>(fid::F_VIEW_SESSION)?
-            .map(SessionId::from_le_bytes);
-        match (view_holder, view_seq, view_session) {
-            (None, None, None) | (Some(_), Some(_), Some(_)) => {}
-            (holder, seq, session) => {
-                return Err(MessageError::PartialViewSource {
-                    holder: holder.is_some(),
-                    seq: seq.is_some(),
-                    session: session.is_some(),
-                });
-            }
-        }
-        let view_self = match fields.u8(fid::F_VIEW_SELF)? {
-            None | Some(0) => false,
-            Some(1) => true,
-            Some(_) => {
-                return Err(MessageError::BadValue {
-                    fid: fid::F_VIEW_SELF,
-                    reason: "must be 0 or 1",
-                });
-            }
-        };
-        if view_self && (view_holder.is_some() || view_seq.is_some() || view_session.is_some()) {
-            return Err(MessageError::ViewSelfConflict);
-        }
-        let view_bootstrap = match fields.u8(fid::F_VIEW_BOOTSTRAP)? {
-            None | Some(0) => false,
-            Some(1) => true,
-            Some(_) => {
-                return Err(MessageError::BadValue {
-                    fid: fid::F_VIEW_BOOTSTRAP,
-                    reason: "must be 0 or 1",
-                });
-            }
-        };
-        if view_bootstrap
-            && (view_self || view_holder.is_some() || view_seq.is_some() || view_session.is_some())
-        {
-            return Err(MessageError::ViewBootstrapConflict);
-        }
         Ok(Self {
             proto: ProtoVersion {
                 major: required(fields.u16(fid::F_PROTO_MAJOR)?, fid::F_PROTO_MAJOR)?,
@@ -1373,12 +1171,6 @@ impl Welcome {
                 fid::F_SERVER_NONCE,
             )?,
             session_id,
-            snapshot_ref,
-            view_holder,
-            view_seq,
-            view_session,
-            view_self,
-            view_bootstrap,
         })
     }
 
@@ -1420,21 +1212,6 @@ impl Welcome {
         &self,
         proof: Option<&[u8; Self::SERVER_PROOF_LEN]>,
     ) -> Result<Vec<u8>, MessageError> {
-        if self.view_self
-            && (self.view_holder.is_some()
-                || self.view_seq.is_some()
-                || self.view_session.is_some())
-        {
-            return Err(MessageError::ViewSelfConflict);
-        }
-        if self.view_bootstrap
-            && (self.view_self
-                || self.view_holder.is_some()
-                || self.view_seq.is_some()
-                || self.view_session.is_some())
-        {
-            return Err(MessageError::ViewBootstrapConflict);
-        }
         let mut writer = WcpWriter::new();
         writer.u16(fid::F_PROTO_MAJOR, self.proto.major);
         writer.u16(fid::F_PROTO_MINOR, self.proto.minor);
@@ -1447,30 +1224,6 @@ impl Welcome {
         writer.u64(fid::F_SERVER_TIME, self.server_time);
         writer.bytes(fid::F_SERVER_NONCE, &self.server_nonce);
         writer.bytes(fid::F_SESSION_ID, &self.session_id.to_le_bytes());
-        if let Some(snapshot) = self.snapshot_ref {
-            writer.nested(fid::F_SNAPSHOT_REF, |nested| snapshot.write(nested));
-        }
-        match (self.view_holder, self.view_seq, self.view_session) {
-            (None, None, None) => {}
-            (Some(holder), Some(seq), Some(session)) => {
-                writer.bytes(fid::F_VIEW_HOLDER, &holder.to_bytes());
-                writer.u64(fid::F_VIEW_SEQ, seq.get());
-                writer.bytes(fid::F_VIEW_SESSION, &session.to_le_bytes());
-            }
-            (holder, seq, session) => {
-                return Err(MessageError::PartialViewSource {
-                    holder: holder.is_some(),
-                    seq: seq.is_some(),
-                    session: session.is_some(),
-                });
-            }
-        }
-        if self.view_self {
-            writer.u8(fid::F_VIEW_SELF, 1);
-        }
-        if self.view_bootstrap {
-            writer.u8(fid::F_VIEW_BOOTSTRAP, 1);
-        }
         if let Some(proof) = proof {
             writer.bytes(fid::F_SERVER_PROOF, proof);
         }
@@ -1623,12 +1376,6 @@ pub enum RelaySub {
     Grant = 2,
     /// Snapshot request.
     SnapshotReq = 3,
-    /// Snapshot reference.
-    SnapshotRef = 4,
-    /// Manifest request.
-    ManifestReq = 5,
-    /// Signed manifest.
-    ManifestSig = 6,
     /// Diff request.
     DiffReq = 7,
     /// Block request.
@@ -1646,9 +1393,6 @@ impl RelaySub {
             1 => Ok(Self::Offer),
             2 => Ok(Self::Grant),
             3 => Ok(Self::SnapshotReq),
-            4 => Ok(Self::SnapshotRef),
-            5 => Ok(Self::ManifestReq),
-            6 => Ok(Self::ManifestSig),
             7 => Ok(Self::DiffReq),
             8 => Ok(Self::BlockReq),
             9 => Ok(Self::BlockMiss),
@@ -1668,9 +1412,6 @@ impl RelaySub {
             Self::Offer => "OFFER",
             Self::Grant => "GRANT",
             Self::SnapshotReq => "SNAPSHOT_REQ",
-            Self::SnapshotRef => "SNAPSHOT_REF",
-            Self::ManifestReq => "MANIFEST_REQ",
-            Self::ManifestSig => "MANIFEST_SIG",
             Self::DiffReq => "DIFF_REQ",
             Self::BlockReq => "BLOCK_REQ",
             Self::BlockMiss => "BLOCK_MISS",
@@ -2589,12 +2330,6 @@ mod tests {
             server_time: 1_234,
             server_nonce: [0x22; 32],
             session_id: SessionId(0x33),
-            snapshot_ref: None,
-            view_holder: None,
-            view_seq: None,
-            view_session: None,
-            view_self: false,
-            view_bootstrap: false,
         }
     }
 
@@ -2901,7 +2636,7 @@ mod tests {
             epoch: 42,
             current_seq: Seq(9),
             client_id: ClientId::from_bytes([7u8; 16]),
-            resync: ResyncMode::ManifestDiff,
+            resync: ResyncMode::None,
             limits: WelcomeLimits {
                 max_frame: 128 * 1024,
                 credit_bytes: 8 * 1024 * 1024,
@@ -2911,12 +2646,6 @@ mod tests {
             server_time: 1_700_000_000,
             server_nonce: [3u8; 32],
             session_id: SessionId(0),
-            snapshot_ref: None,
-            view_holder: None,
-            view_seq: None,
-            view_session: None,
-            view_self: false,
-            view_bootstrap: false,
         };
         let ordered_leave = ordered_leave_body();
         let ordered = Ordered::decode(&ordered_leave, &limits).unwrap();
@@ -3032,26 +2761,19 @@ mod tests {
         }
     }
 
-    /// 44 §3.4 -- HELLO and both WELCOME states roundtrip.
+    /// 44 §3.4 -- HELLO and WELCOME roundtrip.
     #[test]
     fn u_messages_hello_welcome_roundtrip() {
         let limits = limits();
         let hello = Hello::new(
             ProtoVersion::CURRENT,
-            Caps::REQUIRED.union(Caps::SNAPSHOT_RSYNC),
+            Caps::REQUIRED,
             ClientId::from_bytes([7u8; 16]),
             [9u8; 32],
         );
         let body = hello.encode().unwrap();
         assert_eq!(Hello::decode(&body, &limits).unwrap(), hello);
 
-        let snapshot = SnapshotRef {
-            covered_seq: 7,
-            part_count: 3,
-            total_len: 1 << 20,
-            root_chunk_id: [4u8; 32],
-            holder: ClientId::from_bytes([6u8; 16]),
-        };
         let accepted = Welcome {
             proto: ProtoVersion::CURRENT,
             caps: Caps::REQUIRED,
@@ -3068,19 +2790,12 @@ mod tests {
             server_time: 1_700_000_000,
             server_nonce: [3u8; 32],
             session_id: SessionId(0),
-            snapshot_ref: Some(snapshot),
-            view_holder: None,
-            view_seq: None,
-            view_session: None,
-            view_self: false,
-            view_bootstrap: false,
         };
         let body = accepted.encode().unwrap();
         assert_eq!(Welcome::decode(&body, &limits).unwrap(), accepted);
 
         let other_session = Welcome {
             session_id: SessionId(5),
-            snapshot_ref: None,
             ..accepted
         };
         let body = other_session.encode().unwrap();
@@ -3090,303 +2805,6 @@ mod tests {
         assert_eq!(
             Welcome::decode(&body, &limits).unwrap_err(),
             MessageError::Wcp(WcpError::MissingField(fid::F_SESSION_ID))
-        );
-    }
-
-    /// 44 §3.4 -- the view-source triple is all-or-nothing and optional.
-    #[test]
-    fn u_messages_welcome_view_source_roundtrip() {
-        let limits = limits();
-        let base = Welcome {
-            proto: ProtoVersion::CURRENT,
-            caps: Caps::REQUIRED.union(Caps::VIEW_SOURCE),
-            epoch: 3,
-            current_seq: Seq(77),
-            client_id: ClientId::from_bytes([1u8; 16]),
-            resync: ResyncMode::ManifestDiff,
-            limits: WelcomeLimits {
-                max_frame: 128 * 1024,
-                credit_bytes: 1 << 20,
-                session_ttl_s: 30,
-                max_sessions: 4,
-            },
-            server_time: 1_700_000_001,
-            server_nonce: [2u8; 32],
-            session_id: SessionId(0),
-            snapshot_ref: None,
-            view_holder: None,
-            view_seq: None,
-            view_session: None,
-            view_self: false,
-            view_bootstrap: false,
-        };
-
-        // All absent: the encoding carries none of the three fids, and an
-        // old decoder therefore sees the same WELCOME it always saw.
-        let legacy = base.encode().unwrap();
-        let fields = FieldMap::parse(&legacy, &limits).unwrap();
-        assert!(fields.get(fid::F_VIEW_HOLDER).is_none());
-        assert!(fields.get(fid::F_VIEW_SEQ).is_none());
-        assert!(fields.get(fid::F_VIEW_SESSION).is_none());
-        let decoded = Welcome::decode(&legacy, &limits).unwrap();
-        assert_eq!(decoded, base);
-        assert!(decoded.view_holder.is_none());
-        assert!(decoded.view_seq.is_none());
-        assert!(decoded.view_session.is_none());
-
-        // Unknown fids stay ignorable: adding one must not disturb decoding.
-        let extended = rebuilt(&legacy, &[(0x7E, vec![1, 2, 3])], &[]);
-        assert_eq!(Welcome::decode(&extended, &limits).unwrap(), base);
-
-        // All present: every value survives the roundtrip.
-        let full = Welcome {
-            view_holder: Some(ClientId::from_bytes([0xA5; 16])),
-            view_seq: Some(Seq(4242)),
-            view_session: Some(SessionId(0x0123_4567_89ab_cdef_0011_2233_4455_6677)),
-            ..base
-        };
-        let body = full.encode().unwrap();
-        let fields = FieldMap::parse(&body, &limits).unwrap();
-        assert_eq!(
-            fields.fixed::<16>(fid::F_VIEW_HOLDER).unwrap(),
-            Some([0xA5; 16])
-        );
-        assert_eq!(fields.u64(fid::F_VIEW_SEQ).unwrap(), Some(4242));
-        assert_eq!(
-            fields.fixed::<16>(fid::F_VIEW_SESSION).unwrap(),
-            Some(SessionId(0x0123_4567_89ab_cdef_0011_2233_4455_6677).to_le_bytes())
-        );
-        assert_eq!(Welcome::decode(&body, &limits).unwrap(), full);
-
-        // Each missing member is rejected on decode.
-        for missing in [fid::F_VIEW_HOLDER, fid::F_VIEW_SEQ, fid::F_VIEW_SESSION] {
-            let partial = rebuilt(&body, &[], &[missing]);
-            assert!(matches!(
-                Welcome::decode(&partial, &limits).unwrap_err(),
-                MessageError::PartialViewSource { .. }
-            ));
-        }
-
-        // A partial struct is rejected on encode as well.
-        let partial = Welcome {
-            view_session: None,
-            ..full
-        };
-        assert_eq!(
-            partial.encode().unwrap_err(),
-            MessageError::PartialViewSource {
-                holder: true,
-                seq: true,
-                session: false,
-            }
-        );
-    }
-
-    /// 44 §3.4 -- `F_VIEW_SELF` is optional, boolean and exclusive with the
-    /// explicit view-source triple. A self view takes its sequence from
-    /// `current_seq`, so `view_seq` stays absent.
-    #[test]
-    fn u_messages_welcome_view_self_roundtrip() {
-        let limits = limits();
-        let base = Welcome {
-            proto: ProtoVersion::CURRENT,
-            caps: Caps::REQUIRED.union(Caps::VIEW_SELF),
-            epoch: 4,
-            current_seq: Seq(1234),
-            client_id: ClientId::from_bytes([3u8; 16]),
-            resync: ResyncMode::ManifestDiff,
-            limits: WelcomeLimits {
-                max_frame: 128 * 1024,
-                credit_bytes: 1 << 20,
-                session_ttl_s: 30,
-                max_sessions: 4,
-            },
-            server_time: 1_700_000_002,
-            server_nonce: [4u8; 32],
-            session_id: SessionId(0),
-            snapshot_ref: None,
-            view_holder: None,
-            view_seq: None,
-            view_session: None,
-            view_self: false,
-            view_bootstrap: false,
-        };
-
-        // An old encoding has no F_VIEW_SELF and decodes to false.
-        let legacy = base.encode().unwrap();
-        assert!(
-            FieldMap::parse(&legacy, &limits)
-                .unwrap()
-                .get(fid::F_VIEW_SELF)
-                .is_none()
-        );
-        assert!(!Welcome::decode(&legacy, &limits).unwrap().view_self);
-
-        // Explicit zero means the same thing as absence.
-        let zero = rebuilt(&legacy, &[(fid::F_VIEW_SELF, vec![0])], &[]);
-        assert!(!Welcome::decode(&zero, &limits).unwrap().view_self);
-
-        // A self view round-trips and leaves the explicit triple empty.
-        let self_view = Welcome {
-            view_self: true,
-            ..base
-        };
-        let body = self_view.encode().unwrap();
-        let fields = FieldMap::parse(&body, &limits).unwrap();
-        assert_eq!(fields.u8(fid::F_VIEW_SELF).unwrap(), Some(1));
-        assert!(fields.get(fid::F_VIEW_HOLDER).is_none());
-        assert!(fields.get(fid::F_VIEW_SEQ).is_none());
-        assert!(fields.get(fid::F_VIEW_SESSION).is_none());
-        let decoded = Welcome::decode(&body, &limits).unwrap();
-        assert_eq!(decoded, self_view);
-        assert_eq!(decoded.current_seq, Seq(1234));
-        assert!(decoded.view_seq.is_none());
-
-        // A self view cannot also name an explicit source.
-        let explicit = Welcome {
-            view_holder: Some(ClientId::from_bytes([9u8; 16])),
-            view_seq: Some(Seq(7)),
-            view_session: Some(SessionId(8)),
-            ..base
-        };
-        let explicit_body = explicit.encode().unwrap();
-        let conflict = rebuilt(&explicit_body, &[(fid::F_VIEW_SELF, vec![1])], &[]);
-        assert_eq!(
-            Welcome::decode(&conflict, &limits).unwrap_err(),
-            MessageError::ViewSelfConflict
-        );
-        let both = Welcome {
-            view_self: true,
-            ..explicit
-        };
-        assert_eq!(both.encode().unwrap_err(), MessageError::ViewSelfConflict);
-
-        // Only 0 and 1 are valid wire values.
-        let bad = rebuilt(&legacy, &[(fid::F_VIEW_SELF, vec![2])], &[]);
-        assert!(matches!(
-            Welcome::decode(&bad, &limits).unwrap_err(),
-            MessageError::BadValue { fid: f, .. } if f == fid::F_VIEW_SELF
-        ));
-
-        // Unknown fids remain ignorable alongside a self view.
-        let extended = rebuilt(&body, &[(0x7D, vec![5, 6])], &[]);
-        assert_eq!(Welcome::decode(&extended, &limits).unwrap(), self_view);
-    }
-
-    /// 44 §3.4 -- `F_VIEW_BOOTSTRAP` is optional, boolean and exclusive with
-    /// every other view source. A decoder that does not know the fid keeps
-    /// the old shape.
-    #[test]
-    fn u_messages_welcome_view_bootstrap_roundtrip() {
-        let limits = limits();
-        let base = Welcome {
-            proto: ProtoVersion::CURRENT,
-            caps: Caps::REQUIRED.union(Caps::VIEW_SOURCE),
-            epoch: 5,
-            current_seq: Seq::UNSEQUENCED,
-            client_id: ClientId::from_bytes([5u8; 16]),
-            resync: ResyncMode::ManifestDiff,
-            limits: WelcomeLimits {
-                max_frame: 128 * 1024,
-                credit_bytes: 1 << 20,
-                session_ttl_s: 30,
-                max_sessions: 4,
-            },
-            server_time: 1_700_000_003,
-            server_nonce: [6u8; 32],
-            session_id: SessionId(0),
-            snapshot_ref: None,
-            view_holder: None,
-            view_seq: None,
-            view_session: None,
-            view_self: false,
-            view_bootstrap: false,
-        };
-
-        // Absence and an explicit zero are the same.
-        let legacy = base.encode().unwrap();
-        assert!(
-            FieldMap::parse(&legacy, &limits)
-                .unwrap()
-                .get(fid::F_VIEW_BOOTSTRAP)
-                .is_none()
-        );
-        assert!(!Welcome::decode(&legacy, &limits).unwrap().view_bootstrap);
-        let zero = rebuilt(&legacy, &[(fid::F_VIEW_BOOTSTRAP, vec![0])], &[]);
-        assert!(!Welcome::decode(&zero, &limits).unwrap().view_bootstrap);
-
-        // The flag round-trips and leaves every other source empty.
-        let bootstrap = Welcome {
-            view_bootstrap: true,
-            ..base
-        };
-        let body = bootstrap.encode().unwrap();
-        let fields = FieldMap::parse(&body, &limits).unwrap();
-        assert_eq!(fields.u8(fid::F_VIEW_BOOTSTRAP).unwrap(), Some(1));
-        assert!(fields.get(fid::F_VIEW_SELF).is_none());
-        assert!(fields.get(fid::F_VIEW_HOLDER).is_none());
-        assert!(fields.get(fid::F_VIEW_SEQ).is_none());
-        assert!(fields.get(fid::F_VIEW_SESSION).is_none());
-        assert_eq!(Welcome::decode(&body, &limits).unwrap(), bootstrap);
-
-        // An old decoder drops the unknown fid and sees today's WELCOME.
-        let without = rebuilt(&body, &[], &[fid::F_VIEW_BOOTSTRAP]);
-        let old = Welcome::decode(&without, &limits).unwrap();
-        assert!(!old.view_bootstrap);
-        assert_eq!(
-            old,
-            Welcome {
-                view_bootstrap: false,
-                ..bootstrap
-            }
-        );
-
-        // Only 0 and 1 are valid wire values.
-        let bad = rebuilt(&legacy, &[(fid::F_VIEW_BOOTSTRAP, vec![2])], &[]);
-        assert!(matches!(
-            Welcome::decode(&bad, &limits).unwrap_err(),
-            MessageError::BadValue { fid: f, .. } if f == fid::F_VIEW_BOOTSTRAP
-        ));
-
-        // The flag cannot ride with the explicit triple or a self view.
-        let explicit = Welcome {
-            view_holder: Some(ClientId::from_bytes([9u8; 16])),
-            view_seq: Some(Seq(7)),
-            view_session: Some(SessionId(8)),
-            ..base
-        };
-        let explicit_body = explicit.encode().unwrap();
-        let conflict = rebuilt(&explicit_body, &[(fid::F_VIEW_BOOTSTRAP, vec![1])], &[]);
-        assert_eq!(
-            Welcome::decode(&conflict, &limits).unwrap_err(),
-            MessageError::ViewBootstrapConflict
-        );
-        let both = Welcome {
-            view_bootstrap: true,
-            ..explicit
-        };
-        assert_eq!(
-            both.encode().unwrap_err(),
-            MessageError::ViewBootstrapConflict
-        );
-
-        let self_view = Welcome {
-            view_self: true,
-            ..base
-        };
-        let self_body = self_view.encode().unwrap();
-        let conflict = rebuilt(&self_body, &[(fid::F_VIEW_BOOTSTRAP, vec![1])], &[]);
-        assert_eq!(
-            Welcome::decode(&conflict, &limits).unwrap_err(),
-            MessageError::ViewBootstrapConflict
-        );
-        let both = Welcome {
-            view_bootstrap: true,
-            ..self_view
-        };
-        assert_eq!(
-            both.encode().unwrap_err(),
-            MessageError::ViewBootstrapConflict
         );
     }
 
@@ -3611,17 +3029,17 @@ mod tests {
     /// 44:V6 -- protocol negotiation and WCP version matrix.
     #[test]
     fn u_messages_version_matrix() {
-        let caps = Caps::REQUIRED.union(Caps::SNAPSHOT_RSYNC);
+        let caps = Caps::REQUIRED.union(Caps::ZSTD);
         let negotiated = negotiate(
             ProtoVersion { major: 1, minor: 5 },
             ProtoVersion { major: 1, minor: 2 },
-            caps.union(Caps::ZSTD),
+            caps.union(Caps::BATCH_BROADCAST),
             caps,
         )
         .unwrap();
         assert_eq!(negotiated.proto, ProtoVersion { major: 1, minor: 2 });
         assert_eq!(negotiated.caps, caps);
-        assert!(!negotiated.caps.contains(Caps::ZSTD));
+        assert!(!negotiated.caps.contains(Caps::BATCH_BROADCAST));
 
         assert_eq!(
             negotiate(
