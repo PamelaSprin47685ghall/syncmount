@@ -51,7 +51,7 @@ pub use baseline::Baseline;
 pub use config::SyncConfig;
 pub use manifest::codec::{BlockmapIndexRef, ManifestRef};
 pub use manifest::diff::{DiffCounts, DiffKind, DiffPlan, PlanItem};
-pub use manifest::{Blockmap, LocalManifest, Manifest};
+pub use manifest::{Blockmap, LocalManifest, LocalManifestState, Manifest};
 pub use resume::{
     ApplyOutcome, ChunkPresence, ChunkReader, ClusterWins, DeltaPeer, DiskTree, FileResume,
     JoinView, Ledger, RemoteView, Resume, SyncState,

@@ -310,6 +310,12 @@ pub struct Progress {
     pub duplicate: bool,
     /// True when the frame was buffered behind a hole.
     pub buffered: bool,
+    /// Payload bytes this call materialized in the backing tree.
+    ///
+    /// Only `WRITE` effects the replay engine applied are counted. A local
+    /// write and the echo of the client's own operation are written by the
+    /// FUSE path, so they do not appear here.
+    pub bytes_written: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -2366,6 +2372,7 @@ impl Replayer {
                     verdict: Ok(()),
                     duplicate: true,
                     buffered: false,
+                    bytes_written: 0,
                 }),
             };
         }
@@ -2383,10 +2390,11 @@ impl Replayer {
                 verdict: Ok(()),
                 duplicate: false,
                 buffered: true,
+                bytes_written: 0,
             });
         }
 
-        let verdict = self.apply_frame(incoming, now, backing, data)?;
+        let (verdict, mut written) = self.apply_frame(incoming, now, backing, data)?;
         while let Some(frame) = self
             .reorder
             .pop(self.applied.checked_next().unwrap_or(self.applied))
@@ -2394,7 +2402,8 @@ impl Replayer {
             // The verdict of a buffered frame belongs to its own waiter, which
             // `apply_frame` already woke; the caller only sees the frame at
             // `expected`.
-            let _ = self.apply_frame(frame, now, backing, data)?;
+            let (_, extra) = self.apply_frame(frame, now, backing, data)?;
+            written = written.saturating_add(extra);
         }
         if self.reorder.is_empty() {
             self.backpressure.set_gap(false);
@@ -2404,6 +2413,7 @@ impl Replayer {
             verdict,
             duplicate: false,
             buffered: false,
+            bytes_written: written,
         })
     }
 
@@ -2463,7 +2473,7 @@ impl Replayer {
         now: Duration,
         backing: &dyn ReplayBacking,
         data: &dyn OpData,
-    ) -> Result<Result<(), Errno>, Fatal> {
+    ) -> Result<(Result<(), Errno>, u64), Fatal> {
         let seq = incoming.seq;
         let op = incoming.op;
         if self.dedup.observe(op.op_id, seq, now) != OpIdVerdict::Fresh {
@@ -2472,7 +2482,7 @@ impl Replayer {
             self.applied = seq;
             self.waiters.wake(op.op_id, Ok(()));
             self.budget.note_steady(now);
-            return Ok(Ok(()));
+            return Ok((Ok(()), 0));
         }
 
         // A fresh echo of our own operation frees one slot in the production
@@ -2483,6 +2493,7 @@ impl Replayer {
         }
 
         let plan = self.read_state().plan(&op);
+        let mut written = 0u64;
         let verdict = match plan.verdict {
             Verdict::Apply => {
                 let already_on_disk = self.pending.take(op.op_id).is_some();
@@ -2490,6 +2501,14 @@ impl Replayer {
                     if let Err(errno) = self.read_state().materialize(&plan, backing, data) {
                         return Err(Fatal::Materialize { seq, errno });
                     }
+                    written = plan
+                        .effects
+                        .iter()
+                        .map(|effect| match effect {
+                            FsEffect::Write { data: source, .. } => source.total_len,
+                            _ => 0,
+                        })
+                        .sum();
                     if op.client_id != self.client_id {
                         if let Err(errno) = self.rebase(&plan, backing) {
                             return Err(Fatal::Materialize { seq, errno });
@@ -2513,7 +2532,7 @@ impl Replayer {
         self.applied = seq;
         self.waiters.wake(op.op_id, verdict);
         self.budget.note_steady(now);
-        Ok(verdict)
+        Ok((verdict, written))
     }
 
     fn rebase(&mut self, plan: &Plan, backing: &dyn ReplayBacking) -> Result<(), Errno> {
@@ -3444,7 +3463,7 @@ mod tests {
         );
 
         let remote = data.add(9, b"REMOT");
-        replayer
+        let progress = replayer
             .on_ordered(
                 frame(2, pwrite(2, 2, "/f", 0, remote)),
                 t(0),
@@ -3452,6 +3471,7 @@ mod tests {
                 &data,
             )
             .unwrap();
+        assert_eq!(progress.bytes_written, 5, "remote payload bytes");
         assert_eq!(backing.file(ino).as_deref(), Some(&b"LOCAL"[..]));
         assert_eq!(backing.effect_count(), 1);
         assert!(pending.is_empty());
@@ -3483,6 +3503,10 @@ mod tests {
             .on_ordered(frame(2, op), t(0), &backing, &data)
             .unwrap();
         assert_eq!(progress.verdict, Ok(()));
+        assert_eq!(
+            progress.bytes_written, 0,
+            "a local echo must not be counted twice"
+        );
         assert_eq!(backing.file(ino).as_deref(), Some(&b""[..]));
         assert_eq!(replayer.read_state().inode(ino).unwrap().size, 5);
         assert!(pending.is_empty());

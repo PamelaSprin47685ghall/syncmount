@@ -17,6 +17,12 @@
 //! cache only turns `Identical` into `ContentDiff` (43 §3.4). That is why
 //! [`LocalManifest::load`] returns `Option` and swallows every error: a cache
 //! that cannot be trusted is the same as no cache.
+//!
+//! The bootstrap JOIN is the one exception: when a non-empty disk becomes the
+//! cluster's initial view, the cache is the only evidence that the tree is a
+//! previously mounted one rather than a directory that happens to hold files.
+//! [`LocalManifest::inspect`] therefore distinguishes a missing cache from a
+//! corrupt one so the client can refuse both by default.
 
 pub mod blockmap;
 pub mod codec;
@@ -145,6 +151,18 @@ pub struct LocalManifest {
     pub manifest: Manifest,
 }
 
+/// What [`LocalManifest::inspect`] found in the mount root.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LocalManifestState {
+    /// No cache file exists.
+    Missing,
+    /// A cache file exists but does not decode or does not belong to this
+    /// cluster.
+    Corrupt,
+    /// A usable cache.
+    Valid(LocalManifest),
+}
+
 impl LocalManifest {
     /// Fixed prefix: magic, version, cluster, epoch, sequence, entry count,
     /// payload length.
@@ -219,6 +237,22 @@ impl LocalManifest {
     pub fn load(root: &RootFd, cluster: ClusterId) -> Option<Self> {
         let bytes = read_all(root, MANIFEST_FILE).ok()?;
         Self::decode(&bytes, cluster).ok()
+    }
+
+    /// Classify the cache file without hiding why it is unusable.
+    ///
+    /// [`Self::load`] collapses every failure into `None`. A bootstrap JOIN
+    /// must tell a new mount (no cache) from a damaged one (cache present but
+    /// undecodable), because the second case asks the operator to inspect or
+    /// remove the file instead of silently adopting the disk.
+    pub fn inspect(root: &RootFd, cluster: ClusterId) -> LocalManifestState {
+        match read_all(root, MANIFEST_FILE) {
+            Err(_) => LocalManifestState::Missing,
+            Ok(bytes) => match Self::decode(&bytes, cluster) {
+                Ok(manifest) => LocalManifestState::Valid(manifest),
+                Err(_) => LocalManifestState::Corrupt,
+            },
+        }
     }
 
     /// Replace the cache atomically.

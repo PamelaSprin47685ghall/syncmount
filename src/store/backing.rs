@@ -615,13 +615,16 @@ impl BackingStore for PosixBacking {
             rustix::fs::ftruncate(&fd, size).map_err(Errno::from)?;
         }
         if delta.uid.is_some() || delta.gid.is_some() {
-            let owner = delta.uid.map(rustix::fs::Uid::from_raw_unchecked);
-            let group = delta.gid.map(rustix::fs::Gid::from_raw_unchecked);
+            // Manifest uid/gid are author labels (docs/known-limitations
+            // §2.4), not owners: a non-root client cannot chown to a foreign
+            // id (EPERM), so the file takes the local process credentials.
+            let owner = rustix::process::geteuid();
+            let group = rustix::process::getegid();
             rustix::fs::chownat(
                 parent_fd.as_fd(),
                 name.as_os_str(),
-                owner,
-                group,
+                Some(owner),
+                Some(group),
                 AtFlags::empty(),
             )
             .map_err(Errno::from)?;
@@ -852,6 +855,7 @@ impl BackingStore for PosixBacking {
 mod tests {
     use super::*;
     use std::os::fd::AsRawFd;
+    use std::os::unix::fs::MetadataExt;
     use tempfile::TempDir;
 
     fn setup(_tag: &str) -> (TempDir, RootFd) {
@@ -1551,6 +1555,31 @@ mod tests {
         backing
             .fsync(write_only, false)
             .unwrap_or_else(|err| panic!("fsync write-only: {err:?}"));
+    }
+
+    /// 31:M1-3
+    #[test]
+    fn u_store_backing_setattr_keeps_local_owner() {
+        let (tmp, backing) = backing("setattr-owner");
+        let file = make_file(&backing, InodeId::ROOT, "f");
+        let euid = rustix::process::geteuid().as_raw();
+        let egid = rustix::process::getegid().as_raw();
+        backing
+            .set_attr(
+                file,
+                &AttrDelta {
+                    uid: Some(euid.wrapping_add(1)),
+                    gid: Some(egid.wrapping_add(1)),
+                    mode: Some(0o640),
+                    ..AttrDelta::default()
+                },
+            )
+            .unwrap_or_else(|err| panic!("set_attr: {err:?}"));
+        let meta = std::fs::metadata(tmp.path().join("mnt/f"))
+            .unwrap_or_else(|err| panic!("metadata: {err}"));
+        assert_eq!(meta.uid(), euid);
+        assert_eq!(meta.gid(), egid);
+        assert_eq!(meta.mode() & 0o777, 0o640);
     }
 
     /// 31:M1-2

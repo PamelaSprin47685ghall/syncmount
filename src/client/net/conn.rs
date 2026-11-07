@@ -363,6 +363,7 @@ mod tests {
             view_seq: None,
             view_session: None,
             view_self: false,
+            view_bootstrap: false,
         }
     }
 

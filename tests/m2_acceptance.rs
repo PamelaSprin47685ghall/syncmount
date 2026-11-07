@@ -49,6 +49,9 @@ use syncmount::protocol::{
     ClientId, DataRef, Flags, FrameBuf, FrameDecoder, FrameHeader, FrameRef, Limits, MsgType, OpId,
     Prefix, Seq, SessionId, encode_frame,
 };
+use syncmount::sync::{
+    Blockmap, ChunkId, ChunkKind, ChunkReader, DeltaPeer, JoinView, Manifest, RemoteView, SyncError,
+};
 use syncmount::server::{ServeConfig, Server};
 use syncmount::store::{Errno, PosixBacking, RootFd};
 use syncmount::transport::{AcceptedHttp, HttpAcceptor};
@@ -266,6 +269,40 @@ struct ClientNode {
     tasks: Vec<JoinHandle<()>>,
 }
 
+/// The M2 control-plane harness has no relay ports. A second JOIN would
+/// otherwise be refused because a holder view is unreachable without them.
+/// An empty view at sequence zero is exact and deletes nothing.
+#[derive(Debug)]
+struct EmptyView;
+
+#[derive(Debug)]
+struct NoChunks;
+
+impl ChunkReader for NoChunks {
+    fn read(&self, _kind: ChunkKind, _id: ChunkId) -> Result<Option<Vec<u8>>, SyncError> {
+        Ok(None)
+    }
+}
+
+impl JoinView for EmptyView {
+    fn remote(&self) -> RemoteView {
+        RemoteView {
+            reference: None,
+            manifest: Manifest::new(Seq::UNSEQUENCED, Vec::new()),
+            blockmap: Blockmap::new(Seq::UNSEQUENCED, Vec::new(), Vec::new())
+                .expect("empty blockmap"),
+        }
+    }
+
+    fn chunks(&self) -> Arc<dyn ChunkReader> {
+        Arc::new(NoChunks)
+    }
+
+    fn delta(&self) -> Option<Arc<dyn DeltaPeer>> {
+        None
+    }
+}
+
 impl ClientNode {
     async fn connect(
         addr: std::net::SocketAddr,
@@ -286,7 +323,9 @@ impl ClientNode {
         };
         // The JOIN runs the cluster-wins step: a remount deletes local-only
         // paths and installs the cluster view (31:M2-8).
-        let mut client = Client::new(config).with_cluster(ClusterId::from_bytes([9; 16]));
+        let mut client = Client::new(config)
+            .with_cluster(ClusterId::from_bytes([9; 16]))
+            .with_join_view(Arc::new(EmptyView));
         let parts = client.join(Seq::UNSEQUENCED, 0).await.expect("JOIN");
         let epoch = parts.welcome.epoch;
         let covered = parts.welcome.current_seq;

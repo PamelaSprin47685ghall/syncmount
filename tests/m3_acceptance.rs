@@ -322,6 +322,16 @@ impl TestJoinView {
     }
 }
 
+/// A sequence-zero empty view for control-plane clients that do not build
+/// relay ports. It is exact and deletes nothing.
+fn empty_join_view() -> Arc<TestJoinView> {
+    TestJoinView::new(
+        Manifest::new(Seq::UNSEQUENCED, Vec::new()),
+        Blockmap::new(Seq::UNSEQUENCED, Vec::new(), Vec::new()).expect("empty blockmap"),
+        MemChunks::new(),
+    )
+}
+
 #[derive(Debug)]
 struct SlowReader {
     inner: Arc<MemChunks>,
@@ -736,8 +746,12 @@ async fn m3_5_server_restart_epoch_forces_full_resync() {
 
     let dir_a = TempDir::new().unwrap();
     let dir_b = TempDir::new().unwrap();
-    let mut a = Client::new(client_config(addr, dir_a.path(), 0xa1)).with_cluster(CLUSTER);
-    let mut b = Client::new(client_config(addr, dir_b.path(), 0xb1)).with_cluster(CLUSTER);
+    let mut a = Client::new(client_config(addr, dir_a.path(), 0xa1))
+        .with_cluster(CLUSTER)
+        .with_join_view(empty_join_view());
+    let mut b = Client::new(client_config(addr, dir_b.path(), 0xb1))
+        .with_cluster(CLUSTER)
+        .with_join_view(empty_join_view());
     let parts_a = a.join(Seq::UNSEQUENCED, 0).await.expect("JOIN A");
     let parts_b = b.join(Seq::UNSEQUENCED, 0).await.expect("JOIN B");
     let epoch_before = parts_a.welcome.epoch;
@@ -992,7 +1006,8 @@ struct Node {
 impl Node {
     async fn connect(addr: SocketAddr, id: ClientId, dir: &Path, data: Arc<TestData>) -> Self {
         let mut client = Client::new(client_config(addr, dir, 0x80 | (id.to_bytes()[0] & 0x7f)))
-            .with_cluster(CLUSTER);
+            .with_cluster(CLUSTER)
+            .with_join_view(empty_join_view());
         let parts = client.join(Seq::UNSEQUENCED, 0).await.expect("JOIN node");
         let epoch = parts.welcome.epoch;
         let covered = parts.welcome.current_seq;

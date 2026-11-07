@@ -47,6 +47,9 @@ pub enum ViewChoice {
         /// Sequence the local manifest must cover.
         seq: Seq,
     },
+    /// The joiner is the only identity on a sequence-zero cluster; its own
+    /// disk is the cluster's initial view.
+    Bootstrap,
 }
 
 /// One selected view source.
@@ -168,6 +171,11 @@ impl ViewRegistry {
     ///
     /// A self view mints no session and records no route: there is nothing to
     /// redeem later, and a reconnect must recompute the decision.
+    ///
+    /// A bootstrap view requires a sequence-zero watermark, the joiner to be
+    /// the only attached identity, and the caller to allow it. It mints no
+    /// session either: the joiner builds the view locally and becomes the
+    /// holder for later joiners through the normal `select_view` path.
     #[allow(clippy::too_many_arguments)]
     pub fn select_view_or_self(
         &mut self,
@@ -178,10 +186,17 @@ impl ViewRegistry {
         epoch_seen: u64,
         epoch: u64,
         allow_self: bool,
+        allow_bootstrap: bool,
         now: Instant,
     ) -> Option<ViewChoice> {
         if let Some(source) = self.select_view(online, joiner, current, now) {
             return Some(ViewChoice::Holder(source));
+        }
+        if allow_bootstrap
+            && current == Seq::UNSEQUENCED
+            && online.is_alone(&joiner)
+        {
+            return Some(ViewChoice::Bootstrap);
         }
         // A one-sequence gap is the `LEAVE` a crash-time disconnect injects.
         // The caller additionally proves the gap contains no `ORDERED`; this
@@ -466,7 +481,7 @@ mod tests {
         now: Instant,
     ) -> Option<ViewChoice> {
         registry.select_view_or_self(
-            table, joiner, current, applied, epoch_seen, epoch, allow_self, now,
+            table, joiner, current, applied, epoch_seen, epoch, allow_self, false, now,
         )
     }
 
@@ -700,5 +715,106 @@ mod tests {
         };
         assert_eq!(source.holder, client(0x20));
         assert_eq!(registry.len(), 1);
+    }
+
+    /// A solo identity at sequence zero may describe its own disk as the
+    /// cluster's initial view. A holder still wins, and a sequenced
+    /// watermark keeps the self-view path.
+    #[test]
+    fn bootstrap_view_requires_a_solo_sequence_zero_client() {
+        let now = Instant::now();
+        let joiner = client(0x10);
+        let table = online(&[]);
+        let mut registry = ViewRegistry::new();
+
+        assert_eq!(
+            registry.select_view_or_self(
+                &table.table,
+                joiner,
+                Seq::UNSEQUENCED,
+                Seq::UNSEQUENCED,
+                0,
+                1,
+                false,
+                true,
+                now,
+            ),
+            Some(ViewChoice::Bootstrap)
+        );
+        assert!(
+            registry.is_empty(),
+            "a bootstrap view mints no session and records no route"
+        );
+
+        // The caller must opt in.
+        assert_eq!(
+            registry.select_view_or_self(
+                &table.table,
+                joiner,
+                Seq::UNSEQUENCED,
+                Seq::UNSEQUENCED,
+                0,
+                1,
+                false,
+                false,
+                now,
+            ),
+            None
+        );
+
+        // A sequenced watermark never becomes a bootstrap view.
+        assert_eq!(
+            registry.select_view_or_self(
+                &table.table,
+                joiner,
+                Seq(5),
+                Seq(5),
+                1,
+                1,
+                false,
+                true,
+                now,
+            ),
+            None
+        );
+
+        // An attached identity that cannot serve a view blocks bootstrap.
+        let mut attached = online(&[(0x20, Seq::UNSEQUENCED)]);
+        attached.table.get_mut(&client(0x20)).unwrap().state = SessionState::AwaitingDownstream;
+        assert_eq!(
+            registry.select_view_or_self(
+                &attached.table,
+                joiner,
+                Seq::UNSEQUENCED,
+                Seq::UNSEQUENCED,
+                0,
+                1,
+                false,
+                true,
+                now,
+            ),
+            None
+        );
+
+        // A caught-up holder wins over bootstrap at zero.
+        let held = online(&[(0x20, Seq::UNSEQUENCED)]);
+        let choice = registry
+            .select_view_or_self(
+                &held.table,
+                joiner,
+                Seq::UNSEQUENCED,
+                Seq::UNSEQUENCED,
+                0,
+                1,
+                false,
+                true,
+                now,
+            )
+            .expect("a holder at zero");
+        let ViewChoice::Holder(source) = choice else {
+            panic!("expected a holder, got {choice:?}");
+        };
+        assert_eq!(source.holder, client(0x20));
+        assert_eq!(source.seq, Seq::UNSEQUENCED);
     }
 }

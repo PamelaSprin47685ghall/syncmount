@@ -174,11 +174,38 @@ the client retries the JOIN after 1, 2, 4, 8 and 16 seconds and then exits 2.
 Cluster-wins has not run at that point, so no local file is deleted. A
 multi-member cluster cannot use a self view: as soon as another identity is
 attached, only a caught-up holder can serve, and a cluster with no such holder
-fails the same way. At sequence zero the empty view is exact and the JOIN
-proceeds without a holder.
+fails the same way.
 
-`--allow-empty-view` is the explicit opt-in to an empty view above sequence
-zero; cluster-wins then deletes local-only paths.
+Sequence zero has its own path. The first identity on an empty cluster is
+offered a bootstrap view (`F_VIEW_BOOTSTRAP`, `0x5D`, an optional `u8` in
+`WELCOME`) when both endpoints advertise `VIEW_SOURCE`, the server's watermark
+is zero, and no other identity is attached. The client then scans its own
+disk, uses that manifest and blockmap as the sequence-zero cluster view, and
+becomes the holder for later joiners through the normal manifest-only path.
+No server state is added: the bootstrap decision is derived from the current
+online table and is recomputed on every reconnect.
+
+A non-empty disk is adopted only when it carries a valid
+`.syncmount-manifest`. A missing cache means "new mount"; a cache that does
+not decode means "damaged state". Both are refused with exit 2 and the disk
+is left byte-for-byte unchanged. An empty disk proceeds with an exact empty
+view. `--allow-empty-view` is the explicit opt-in to the loss: at sequence
+zero it accepts the empty view for a non-empty disk, and cluster-wins then
+deletes local-only paths.
+
+The bootstrap source lives only as long as the server process. The server
+keeps no durable state, so a restart draws a new epoch and a new sequence
+zero. If the bootstrap client is offline when another client connects, that
+client becomes the new bootstrap source; when the original returns it sees a
+cluster whose initial content is already defined and its local-only paths are
+deleted. The first client to connect therefore defines the cluster's initial
+content. That is the same trust-on-first-use boundary as key bootstrapping
+(§4.6), not a separate authorization.
+
+An old client ignores the unknown `0x5D` field and still takes its old
+sequence-zero empty-view path, which deletes local-only files. No protocol
+change can repair that client; the protection exists only in clients that
+understand the flag.
 
 The limits follow: a new client cannot recover history while every holder is
 offline or behind; a solo restart recovers only from a manifest that matches
@@ -290,7 +317,9 @@ cluster.
   can look wrong. Permission checks are not based on these values: the FUSE
   mount uses the daemon's local credentials and the mount ACL (`RootAndOwner`
   by default, `All` with `--allow-other`). Treat uid/gid as author labels, not
-  access control.
+  access control. When the replay engine applies a `SETATTR`, the backing file
+  takes the local client's effective uid/gid; the author's uid/gid remain
+  manifest metadata.
 - **birth time** is not provided. `statx` `STATX_BTIME` is absent from the FUSE
   `getattr` surface.
 
@@ -477,6 +506,10 @@ The first client in an empty cluster has no peer verifier. It bootstraps on its
 own self-certified key. A wrong PSK cannot be detected in that state and
 creates an isolated cluster; a later correctly-keyed client cannot join while
 the wrong-key client is the only online member.
+
+The same first client also defines the cluster's initial file view when it is
+the only identity at sequence zero (§1.8). A wrong-key or wrong-content first
+client is therefore authoritative until the cluster is rebuilt.
 
 Key distribution is peer-mediated: `JOIN_PROOF`, `JOIN_ACCEPT`, the snapshot
 `keys[]` section, inline public keys on ordered frames, and `KEY_REQ`/

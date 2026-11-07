@@ -240,8 +240,9 @@ async fn hp_1_two_clients_history() {
     let a_bytes = a_doc["counters"]["bytes_written"]
         .as_u64()
         .expect("A bytes_written");
-    // `counters.bytes_written` 目前不是生产计数器（全仓没有 bump 点），
-    // 只记录、不断言；写入是否成功由下面的 A 读回与 SHA-256 证明。
+    // `counters.bytes_written` 只统计 replay 引擎应用的远程写；A 自己写的
+    // 回显走 pending 跳过，因此 A 的该计数保持 0。写入是否成功由下面的
+    // A 读回与 SHA-256 证明。
     for (rel, (len, hash)) in &expected {
         let bytes = fs::read(a.mountpoint.join(rel))
             .unwrap_or_else(|error| panic!("A cannot read back {rel}: {error}"));

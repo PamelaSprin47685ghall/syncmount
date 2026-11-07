@@ -36,8 +36,8 @@ use tokio::task::JoinHandle;
 use crate::protocol::{
     BodyEncoding, Caps, ClientId, ErrorMessage, Flags, FrameBuf, FrameEncoder, FrameHeader,
     FrameRef, JoinState, KickReason, Leave, Message, MsgType, Prefix, PrefixKind, ProtoVersion,
-    ProtocolError, ResyncMode, Seq, SessionId, SnapshotRef, TrnReason, Welcome, WelcomeLimits,
-    decode_plain,
+    ProtocolError, ResyncMode, Seq, SessionId, SnapshotRef, StreamId, TrnReason, Welcome,
+    WelcomeLimits, decode_plain,
 };
 use crate::transport::{MpscSender, PeerId};
 
@@ -724,22 +724,31 @@ impl SequencerCore {
                 epoch_seen,
                 self.epoch.get(),
                 allow_self,
+                // The bootstrap flag rides in `WELCOME`; the capability pair
+                // above is the only gate the server needs. An old client
+                // ignores the unknown fid and keeps its empty-view path.
+                true,
                 now,
             )
         } else {
             None
         };
-        let (view_holder, view_seq, view_session, view_self) = match view {
+        let (view_holder, view_seq, view_session, view_self, view_bootstrap) = match view {
             Some(ViewChoice::Holder(source)) => (
                 Some(source.holder),
                 Some(source.seq),
                 Some(source.session),
                 false,
+                false,
             ),
             // Protocol B: a self view carries no holder, sequence or session
             // fields; the client uses `current_seq` and its local manifest.
-            Some(ViewChoice::SelfView { .. }) => (None, None, None, true),
-            None => (None, None, None, false),
+            Some(ViewChoice::SelfView { .. }) => (None, None, None, true, false),
+            // An empty cluster with this joiner as its only identity: the
+            // joiner's disk becomes the sequence-zero view. No holder, no
+            // session, no server-side state.
+            Some(ViewChoice::Bootstrap) => (None, None, None, false, true),
+            None => (None, None, None, false, false),
         };
         let welcome = Welcome {
             proto: ProtoVersion::CURRENT,
@@ -771,6 +780,7 @@ impl SequencerCore {
             view_seq,
             view_session,
             view_self,
+            view_bootstrap,
         };
         let body = welcome.encode().map_err(|_| TrnReason::Internal)?;
         encode_control(MsgType::WELCOME, Prefix::None, &body, Seq::UNSEQUENCED)
@@ -849,6 +859,12 @@ impl SequencerCore {
     }
 
     /// Route one relay-path frame without touching its bytes.
+    ///
+    /// `STREAM_DATA` on the `OP_DATA` stream is write payload that every
+    /// reader must apply, so it is encoded once and fanned out to every
+    /// session except its author. Every other frame — including
+    /// `STREAM_DATA` on `BLOCK`, which is a point-to-point pull — keeps
+    /// travelling through the relay slot that names one peer.
     fn on_relay(&mut self, from: ClientId, frame: FrameBuf, now: Instant) {
         if !self.online.contains(&from) {
             return;
@@ -860,6 +876,17 @@ impl SequencerCore {
         };
         if let Some(session) = self.online.get_mut(&from) {
             session.last_seen_at = now;
+        }
+        // A pull slot names one holder; it is not a broadcast audience. The
+        // payload itself belongs to every reader, so fan it out before the
+        // relay dispatch and never charge it to a slot or flow window.
+        if kind == MsgType::STREAM_DATA && prefix.stream == StreamId::OP_DATA {
+            let Some(wire) = self.encode_relay(&frame) else {
+                self.send_error_to(from, TrnReason::Internal, Some(prefix.session_id));
+                return;
+            };
+            self.fanout(wire, Some(from), None);
+            return;
         }
         let action = if kind == MsgType::FLOW {
             match decode_plain(MsgType::FLOW, &frame.body, &self.config.limits) {
@@ -1131,24 +1158,40 @@ impl SequencerCore {
         }
     }
 
-    /// Broadcast one encoded frame to every non-kicking session.
+    /// Broadcast one sequenced frame to every non-kicking session.
+    ///
+    /// `seq` becomes each receiver's `last_good_seq`, so a later `KICK` or
+    /// injected `LEAVE` quotes a sequence the client has actually seen.
+    fn broadcast(&mut self, wire: Bytes, seq: Seq) {
+        self.fanout(wire, None, Some(seq));
+    }
+
+    /// Fan one encoded frame out to every session that accepts broadcasts.
     ///
     /// `Bytes` clones are reference-count bumps; the actor performs one
     /// `try_send` per session and never awaits.
+    ///
+    /// `except` skips the author of the frame. `seq` is written to
+    /// `last_good_seq` only for sequenced frames: an unsequenced fan-out
+    /// (`OP_DATA`) must not replace a real sequence with `UNSEQUENCED`.
     ///
     /// An overflow ends a session only when the queue has not drained for
     /// [`DRAIN_GRACE`]: a slow consumer that keeps taking frames stays
     /// attached, and the one frame that did not fit is counted and dropped
     /// so the queue stays bounded. The client sees the sequence gap and
     /// resynchronizes; nothing is lost silently.
-    fn broadcast(&mut self, wire: Bytes, seq: Seq) {
+    fn fanout(&mut self, wire: Bytes, except: Option<ClientId>, seq: Option<Seq>) {
         let mut kicked = Vec::new();
         for (client, session) in self.online.iter_mut() {
-            if !session.state.receives_broadcast() {
+            if !session.state.receives_broadcast() || except == Some(*client) {
                 continue;
             }
             match session.outbox.try_push_data(wire.clone()) {
-                PushOutcome::Queued => session.last_good_seq = seq,
+                PushOutcome::Queued => {
+                    if let Some(seq) = seq {
+                        session.last_good_seq = seq;
+                    }
+                }
                 PushOutcome::Overflow if session.outbox.queued.since_drain() > DRAIN_GRACE => {
                     kicked.push((*client, KickReason::QueueOverflow));
                 }
@@ -1444,6 +1487,87 @@ mod tests {
         FrameBuf::new(header, prefix, body)
     }
 
+    /// One `STREAM_DATA` fragment of a routed sync session.
+    fn stream_data_frame(
+        id: SessionId,
+        stream: crate::protocol::StreamId,
+        body_len: usize,
+    ) -> FrameBuf {
+        let prefix = Prefix::Route(crate::protocol::RoutePrefix::new(id, stream, 0, 1));
+        let body = vec![0x5a; body_len];
+        let mut header = FrameHeader::new(
+            MsgType::STREAM_DATA,
+            Flags::ENC.with(Flags::ROUTED),
+            0,
+            Seq::UNSEQUENCED,
+        );
+        header.len = u32::try_from(prefix.encoded_len() + body.len()).unwrap();
+        FrameBuf::new(header, prefix, body)
+    }
+
+    fn sync_end_frame(id: SessionId) -> FrameBuf {
+        let body = crate::protocol::SyncEnd {
+            reason: crate::protocol::SyncEndReason::Done,
+            detail: None,
+        }
+        .encode()
+        .unwrap();
+        let prefix = Prefix::Route(crate::protocol::RoutePrefix::new(
+            id,
+            crate::protocol::StreamId::CTRL,
+            0,
+            0,
+        ));
+        let mut header = FrameHeader::new(MsgType::SYNC_END, Flags::ROUTED, 0, Seq::UNSEQUENCED);
+        header.len = u32::try_from(prefix.encoded_len() + body.len()).unwrap();
+        FrameBuf::new(header, prefix, body)
+    }
+
+    fn is_stream_frame(frame: &FrameBuf, id: SessionId, stream: crate::protocol::StreamId) -> bool {
+        frame.header.msg_type == MsgType::STREAM_DATA
+            && frame
+                .prefix
+                .as_route()
+                .is_some_and(|prefix| prefix.session_id == id && prefix.stream == stream)
+    }
+
+    /// Receive frames until `want` matches. A timeout or a closed downlink
+    /// fails at the receiver the caller named.
+    async fn recv_matching(
+        rx: &mut mpsc::Receiver<Bytes>,
+        what: &str,
+        want: impl Fn(&FrameBuf) -> bool,
+    ) -> FrameBuf {
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
+        loop {
+            let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let bytes = tokio::time::timeout(left, rx.recv())
+                .await
+                .unwrap_or_else(|_| panic!("timed out waiting for {what}"))
+                .unwrap_or_else(|| panic!("downlink closed while waiting for {what}"));
+            let frame = decode(&bytes);
+            if want(&frame) {
+                return frame;
+            }
+        }
+    }
+
+    /// Receive frames until `want` matches, or the bound expires.
+    async fn try_recv_matching(
+        rx: &mut mpsc::Receiver<Bytes>,
+        want: impl Fn(&FrameBuf) -> bool,
+    ) -> Option<FrameBuf> {
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
+        loop {
+            let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let bytes = tokio::time::timeout(left, rx.recv()).await.ok()??;
+            let frame = decode(&bytes);
+            if want(&frame) {
+                return Some(frame);
+            }
+        }
+    }
+
     fn take_kick(ctrl: &mut mpsc::Receiver<Bytes>) -> Option<KickReason> {
         while let Ok(bytes) = ctrl.try_recv() {
             let frame = decode(&bytes);
@@ -1593,6 +1717,51 @@ mod tests {
         assert_eq!(welcome.view_holder, None);
         assert_eq!(welcome.view_seq, None);
         assert_eq!(welcome.view_session, None);
+
+        sequencer.shutdown().await.unwrap();
+        task.await.unwrap();
+    }
+
+    /// The first identity on a sequence-zero cluster is told that its disk is
+    /// the view. A later joiner gets the normal holder triple instead.
+    #[tokio::test]
+    async fn server_welcome_marks_a_solo_sequence_zero_client_as_bootstrap() {
+        let config = ServeConfig::for_tests();
+        let outbox = config.outbox;
+        let (sequencer, _metrics, task) = start(config, 5).await;
+        let first = client(0x72);
+        let second = client(0x73);
+
+        let mut first_reply =
+            register_with_caps(&sequencer, first, 72, &outbox, Caps::VIEW_SOURCE).await;
+        let welcome = welcome_of(&mut first_reply.ctrl).await;
+        assert!(welcome.view_bootstrap);
+        assert!(!welcome.view_self);
+        assert_eq!(welcome.view_holder, None);
+        assert_eq!(welcome.view_seq, None);
+        assert_eq!(welcome.view_session, None);
+        assert_eq!(welcome.current_seq, Seq::UNSEQUENCED);
+
+        // The first client must pair its downlink before it can serve.
+        let (events, _body) = crate::transport::MpscBody::channel(4);
+        sequencer.events(72, events).await.unwrap();
+
+        let mut second_reply =
+            register_with_caps(&sequencer, second, 73, &outbox, Caps::VIEW_SOURCE).await;
+        let welcome = welcome_of(&mut second_reply.ctrl).await;
+        assert!(!welcome.view_bootstrap);
+        assert_eq!(welcome.view_holder, Some(first));
+        assert_eq!(welcome.view_seq, Some(Seq::UNSEQUENCED));
+        assert!(welcome.view_session.is_some());
+
+        // A client that does not advertise VIEW_SOURCE gets no view at all;
+        // it keeps the old empty-view behaviour.
+        let mut plain_reply = register(&sequencer, client(0x74), 74, &outbox).await;
+        let plain = welcome_of(&mut plain_reply.ctrl).await;
+        assert!(!plain.view_bootstrap);
+        assert_eq!(plain.view_holder, None);
+        assert_eq!(plain.view_seq, None);
+        assert_eq!(plain.view_session, None);
 
         sequencer.shutdown().await.unwrap();
         task.await.unwrap();
@@ -2371,5 +2540,95 @@ mod tests {
         assert_eq!(decoded.header.msg_type, MsgType::WELCOME);
         assert_eq!(decoded.header.seq, Seq::UNSEQUENCED);
         assert!(!decoded.header.flags.contains(Flags::ENC));
+    }
+
+    /// `OP_DATA` is write payload every reader must apply, so it must reach
+    /// every reader's downlink and never its author. A `BLOCK` is a pull from
+    /// the one peer that holds the bytes, so it stays point-to-point.
+    #[tokio::test]
+    async fn server_op_data_broadcasts_to_every_reader_but_blocks_stay_point_to_point() {
+        let config = ServeConfig::for_tests();
+        let outbox = config.outbox;
+        let (sequencer, _metrics, task) = start(config, 5).await;
+        let writer = client(0xA1);
+        let reader_b = client(0xB2);
+        let reader_c = client(0xC3);
+
+        let mut writer_reply = register(&sequencer, writer, 0xA1, &outbox).await;
+        let mut b_reply = register(&sequencer, reader_b, 0xB2, &outbox).await;
+        let mut c_reply = register(&sequencer, reader_c, 0xC3, &outbox).await;
+        // Both downlinks must pair before the relay selector can pick them.
+        let (b_events, _b_body) = crate::transport::MpscBody::channel(4);
+        sequencer.events(0xB2, b_events).await.unwrap();
+        let (c_events, _c_body) = crate::transport::MpscBody::channel(4);
+        sequencer.events(0xC3, c_events).await.unwrap();
+
+        // 57 bytes on the wire: the incident's 27-byte WRITE payload plus the
+        // 30-byte AEAD envelope. `STREAM_DATA` is sealed, so anything below
+        // `ENV_OVERHEAD` would be rejected by the frame encoder.
+        const OP_DATA_BODY: usize = 27 + 30;
+        let x = SessionId(0x51);
+        sequencer.relay(writer, relay_open_frame(x)).await.unwrap();
+        sequencer
+            .relay(
+                writer,
+                stream_data_frame(x, crate::protocol::StreamId::OP_DATA, OP_DATA_BODY),
+            )
+            .await
+            .unwrap();
+
+        for (name, data) in [("B", &mut b_reply.data), ("C", &mut c_reply.data)] {
+            let frame = recv_matching(data, "the OP_DATA broadcast", |frame: &FrameBuf| {
+                is_stream_frame(frame, x, crate::protocol::StreamId::OP_DATA)
+            })
+            .await;
+            assert_eq!(
+                frame.body.len(),
+                OP_DATA_BODY,
+                "{name} received a partial payload"
+            );
+        }
+        assert!(
+            try_recv_matching(&mut writer_reply.data, |frame: &FrameBuf| {
+                is_stream_frame(frame, x, crate::protocol::StreamId::OP_DATA)
+            })
+            .await
+            .is_none(),
+            "the author must not receive its own OP_DATA frame"
+        );
+
+        let y = SessionId(0x52);
+        sequencer.relay(writer, relay_open_frame(y)).await.unwrap();
+        sequencer
+            .relay(
+                writer,
+                stream_data_frame(y, crate::protocol::StreamId::BLOCK, 32),
+            )
+            .await
+            .unwrap();
+
+        let b_block = try_recv_matching(&mut b_reply.data, |frame: &FrameBuf| {
+            is_stream_frame(frame, y, crate::protocol::StreamId::BLOCK)
+        })
+        .await;
+        let c_block = try_recv_matching(&mut c_reply.data, |frame: &FrameBuf| {
+            is_stream_frame(frame, y, crate::protocol::StreamId::BLOCK)
+        })
+        .await;
+        assert_eq!(
+            b_block.is_some() as usize + c_block.is_some() as usize,
+            1,
+            "a BLOCK pull must reach exactly one peer"
+        );
+
+        // Close both sessions. Opening Y already replaced X's slot, so X's
+        // SYNC_END is answered as unknown; Y's releases the live slot. The
+        // selected peers may see either frame.
+        for id in [x, y] {
+            sequencer.relay(writer, sync_end_frame(id)).await.unwrap();
+        }
+
+        sequencer.shutdown().await.unwrap();
+        task.await.unwrap();
     }
 }

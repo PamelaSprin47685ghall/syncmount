@@ -55,7 +55,10 @@ pub struct Counters {
     pub ops_rejected: AtomicU64,
     /// Duplicate frames dropped.
     pub ops_duplicate: AtomicU64,
-    /// Payload bytes written to the backing tree.
+    /// Payload bytes the replay engine applied to the backing tree.
+    ///
+    /// Local writes and the echo of the client's own operations go through
+    /// the FUSE path and are not counted here.
     pub bytes_written: AtomicU64,
     /// Frames read from the downlink.
     pub frames_in: AtomicU64,
@@ -111,7 +114,7 @@ pub struct CounterSnapshot {
     pub ops_rejected: u64,
     /// Duplicate frames.
     pub ops_duplicate: u64,
-    /// Bytes written.
+    /// Bytes applied by the replay engine.
     pub bytes_written: u64,
     /// Frames received.
     pub frames_in: u64,

@@ -259,8 +259,9 @@ impl Holder {
 
     /// The sequence this holder would label a view with right now.
     ///
-    /// May be [`Seq::UNSEQUENCED`] when nothing is tracked; [`Holder::view_for`]
-    /// rejects that value instead of serving an unsequenced view.
+    /// May be [`Seq::UNSEQUENCED`] when nothing is tracked. Zero is a valid
+    /// label for a bootstrap view: the joiner's disk is the cluster's initial
+    /// state and there is no operation history behind it.
     pub fn latest_seq(&self) -> Seq {
         if let Some(applied) = self.applied_seq.get() {
             let seq = Seq(applied.load(Ordering::Relaxed));
@@ -293,9 +294,6 @@ impl Holder {
     /// [`HolderError::Sync`] when the disk cannot be described, and
     /// [`HolderError::Task`] when the blocking build panics.
     pub async fn view_for(&self, at_seq: Seq) -> Result<Arc<HolderView>, HolderError> {
-        if !at_seq.is_sequenced() {
-            return Err(HolderError::NoViewSeq);
-        }
         if let Some(view) = self.cached_view(at_seq) {
             return Ok(view);
         }
@@ -587,9 +585,6 @@ fn build_view(
     cluster: crate::protocol::crypto::ClusterId,
     at_seq: Seq,
 ) -> Result<HolderView, SyncError> {
-    if !at_seq.is_sequenced() {
-        return Err(SyncError::Format("cannot describe an unsequenced view"));
-    }
     let rows = match LocalManifest::load(root, cluster) {
         Some(cache) if cache_matches_disk(root, cluster, cache.manifest.entries()) => {
             match blocks_from_entries(root, store, cache.manifest.entries()) {
@@ -1192,7 +1187,8 @@ mod tests {
             }
         ));
 
-        // default=0 and no tracker: no sequenced view exists.
+        // default=0 and no tracker: zero is a valid bootstrap label, but an
+        // unlabelled request still has no sequence to answer with.
         let sink: Arc<dyn FrameSink> = Arc::new(mpsc::channel::<FrameBuf>(4).0);
         let holder = Holder::new(
             Arc::clone(&harness._holder_root),
@@ -1202,11 +1198,11 @@ mod tests {
             Seq::UNSEQUENCED,
             sink,
         );
-        let error = holder
+        let view = holder
             .view_for(Seq::UNSEQUENCED)
             .await
-            .expect_err("an unsequenced view must be refused");
-        assert!(matches!(error, HolderError::NoViewSeq));
+            .expect("zero is a bootstrap label");
+        assert_eq!(view.at_seq(), Seq::UNSEQUENCED);
         let frame = manual_request(
             &KeyRing::derive(&[7u8; 32], &CLUSTER).expect("ring"),
             RelaySub::ManifestReq,
@@ -1218,6 +1214,23 @@ mod tests {
             .await
             .expect_err("no default seq to describe");
         assert!(matches!(error, HolderError::NoViewSeq));
+    }
+
+    /// A sequence-zero view describes the disk and can be served to a
+    /// joiner. Nothing in the containers requires a positive sequence.
+    #[tokio::test]
+    async fn u_holder_serves_a_sequence_zero_bootstrap_view() {
+        let harness = Harness::new(b"bootstrap").await;
+        let view = harness
+            .holder
+            .view_for(Seq::UNSEQUENCED)
+            .await
+            .expect("a zero view");
+        assert_eq!(view.at_seq(), Seq::UNSEQUENCED);
+        assert_eq!(view.manifest().at_seq, Seq::UNSEQUENCED);
+        assert!(view.manifest().find("hello.txt").is_some());
+        assert!(view.manifest().len() >= 4);
+        assert_eq!(view.blockmap().at_seq(), Seq::UNSEQUENCED);
     }
 
     #[tokio::test]

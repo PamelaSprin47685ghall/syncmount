@@ -946,6 +946,7 @@ mod tests {
             view_seq: session.map(|_| Seq(4)),
             view_session: session,
             view_self: false,
+            view_bootstrap: false,
         }
     }
 

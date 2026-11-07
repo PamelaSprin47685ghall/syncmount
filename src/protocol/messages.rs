@@ -211,6 +211,13 @@ pub mod fid {
     /// [`F_VIEW_SEQ`] is `current_seq`; `0` and an absent field are
     /// equivalent. Mutually exclusive with the three view-source fields.
     pub const F_VIEW_SELF: u8 = 0x5C;
+    /// Bootstrap-view flag, `u8` (`WELCOME`).
+    ///
+    /// `1` means the joiner is the only identity on an empty cluster and may
+    /// describe its own disk as the sequence-zero cluster view. `0` and an
+    /// absent field are equivalent. Mutually exclusive with
+    /// [`F_VIEW_SELF`] and the three view-source fields.
+    pub const F_VIEW_BOOTSTRAP: u8 = 0x5D;
 }
 
 /// A WCP encoding or decoding failure.
@@ -618,6 +625,11 @@ pub enum MessageError {
     /// A self view names the server as the source and derives its sequence
     /// from `current_seq`; it cannot also carry an explicit source.
     ViewSelfConflict,
+    /// `F_VIEW_BOOTSTRAP` is set while another view source is present.
+    ///
+    /// A bootstrap view means "the local disk is the view"; it cannot also
+    /// name a holder, a view sequence, a session or a self view.
+    ViewBootstrapConflict,
 }
 
 impl MessageError {
@@ -667,6 +679,11 @@ impl fmt::Display for MessageError {
                 f,
                 "F_VIEW_SELF cannot be combined with \
                  F_VIEW_HOLDER, F_VIEW_SEQ or F_VIEW_SESSION"
+            ),
+            Self::ViewBootstrapConflict => write!(
+                f,
+                "F_VIEW_BOOTSTRAP cannot be combined with \
+                 F_VIEW_SELF, F_VIEW_HOLDER, F_VIEW_SEQ or F_VIEW_SESSION"
             ),
         }
     }
@@ -1321,6 +1338,10 @@ pub struct Welcome {
     /// [`Self::current_seq`]. Cannot be set together with the three
     /// view-source fields above.
     pub view_self: bool,
+    /// Whether the joiner may use its own disk as the sequence-zero view.
+    /// Cannot be set together with [`Self::view_self`] or the three
+    /// view-source fields above.
+    pub view_bootstrap: bool,
 }
 
 impl Welcome {
@@ -1369,6 +1390,24 @@ impl Welcome {
         if view_self && (view_holder.is_some() || view_seq.is_some() || view_session.is_some()) {
             return Err(MessageError::ViewSelfConflict);
         }
+        let view_bootstrap = match fields.u8(fid::F_VIEW_BOOTSTRAP)? {
+            None | Some(0) => false,
+            Some(1) => true,
+            Some(_) => {
+                return Err(MessageError::BadValue {
+                    fid: fid::F_VIEW_BOOTSTRAP,
+                    reason: "must be 0 or 1",
+                });
+            }
+        };
+        if view_bootstrap
+            && (view_self
+                || view_holder.is_some()
+                || view_seq.is_some()
+                || view_session.is_some())
+        {
+            return Err(MessageError::ViewBootstrapConflict);
+        }
         Ok(Self {
             proto: ProtoVersion {
                 major: required(fields.u16(fid::F_PROTO_MAJOR)?, fid::F_PROTO_MAJOR)?,
@@ -1398,6 +1437,7 @@ impl Welcome {
             view_seq,
             view_session,
             view_self,
+            view_bootstrap,
         })
     }
 
@@ -1412,6 +1452,14 @@ impl Welcome {
                 || self.view_session.is_some())
         {
             return Err(MessageError::ViewSelfConflict);
+        }
+        if self.view_bootstrap
+            && (self.view_self
+                || self.view_holder.is_some()
+                || self.view_seq.is_some()
+                || self.view_session.is_some())
+        {
+            return Err(MessageError::ViewBootstrapConflict);
         }
         let mut writer = WcpWriter::new();
         writer.u16(fid::F_PROTO_MAJOR, self.proto.major);
@@ -1448,6 +1496,9 @@ impl Welcome {
         }
         if self.view_self {
             writer.u8(fid::F_VIEW_SELF, 1);
+        }
+        if self.view_bootstrap {
+            writer.u8(fid::F_VIEW_BOOTSTRAP, 1);
         }
         Ok(writer.finish()?)
     }
@@ -2735,6 +2786,7 @@ mod tests {
             view_seq: None,
             view_session: None,
             view_self: false,
+            view_bootstrap: false,
         };
         let ordered_leave = ordered_leave_body();
         let ordered = Ordered::decode(&ordered_leave, &limits).unwrap();
@@ -2876,6 +2928,7 @@ mod tests {
             view_seq: None,
             view_session: None,
             view_self: false,
+            view_bootstrap: false,
         };
         let body = accepted.encode().unwrap();
         assert_eq!(Welcome::decode(&body, &limits).unwrap(), accepted);
@@ -2930,6 +2983,7 @@ mod tests {
             view_seq: None,
             view_session: None,
             view_self: false,
+            view_bootstrap: false,
         };
 
         // All absent: the encoding carries none of the three fids, and an
@@ -3021,6 +3075,7 @@ mod tests {
             view_seq: None,
             view_session: None,
             view_self: false,
+            view_bootstrap: false,
         };
 
         // An old encoding has no F_VIEW_SELF and decodes to false.
@@ -3082,6 +3137,124 @@ mod tests {
         // Unknown fids remain ignorable alongside a self view.
         let extended = rebuilt(&body, &[(0x7D, vec![5, 6])], &[]);
         assert_eq!(Welcome::decode(&extended, &limits).unwrap(), self_view);
+    }
+
+    /// 44 §3.4 -- `F_VIEW_BOOTSTRAP` is optional, boolean and exclusive with
+    /// every other view source. A decoder that does not know the fid keeps
+    /// the old shape.
+    #[test]
+    fn u_messages_welcome_view_bootstrap_roundtrip() {
+        let limits = limits();
+        let base = Welcome {
+            proto: ProtoVersion::CURRENT,
+            caps: Caps::REQUIRED.union(Caps::VIEW_SOURCE),
+            epoch: 5,
+            current_seq: Seq::UNSEQUENCED,
+            client_id: ClientId::from_bytes([5u8; 16]),
+            resync: ResyncMode::ManifestDiff,
+            limits: WelcomeLimits {
+                max_frame: 128 * 1024,
+                credit_bytes: 1 << 20,
+                session_ttl_s: 30,
+                max_sessions: 4,
+            },
+            server_time: 1_700_000_003,
+            server_nonce: [6u8; 32],
+            join_state: JoinState::Accepted,
+            session_id: None,
+            snapshot_ref: None,
+            view_holder: None,
+            view_seq: None,
+            view_session: None,
+            view_self: false,
+            view_bootstrap: false,
+        };
+
+        // Absence and an explicit zero are the same.
+        let legacy = base.encode().unwrap();
+        assert!(
+            FieldMap::parse(&legacy, &limits)
+                .unwrap()
+                .get(fid::F_VIEW_BOOTSTRAP)
+                .is_none()
+        );
+        assert!(!Welcome::decode(&legacy, &limits).unwrap().view_bootstrap);
+        let zero = rebuilt(&legacy, &[(fid::F_VIEW_BOOTSTRAP, vec![0])], &[]);
+        assert!(!Welcome::decode(&zero, &limits).unwrap().view_bootstrap);
+
+        // The flag round-trips and leaves every other source empty.
+        let bootstrap = Welcome {
+            view_bootstrap: true,
+            ..base
+        };
+        let body = bootstrap.encode().unwrap();
+        let fields = FieldMap::parse(&body, &limits).unwrap();
+        assert_eq!(fields.u8(fid::F_VIEW_BOOTSTRAP).unwrap(), Some(1));
+        assert!(fields.get(fid::F_VIEW_SELF).is_none());
+        assert!(fields.get(fid::F_VIEW_HOLDER).is_none());
+        assert!(fields.get(fid::F_VIEW_SEQ).is_none());
+        assert!(fields.get(fid::F_VIEW_SESSION).is_none());
+        assert_eq!(Welcome::decode(&body, &limits).unwrap(), bootstrap);
+
+        // An old decoder drops the unknown fid and sees today's WELCOME.
+        let without = rebuilt(&body, &[], &[fid::F_VIEW_BOOTSTRAP]);
+        let old = Welcome::decode(&without, &limits).unwrap();
+        assert!(!old.view_bootstrap);
+        assert_eq!(
+            old,
+            Welcome {
+                view_bootstrap: false,
+                ..bootstrap
+            }
+        );
+
+        // Only 0 and 1 are valid wire values.
+        let bad = rebuilt(&legacy, &[(fid::F_VIEW_BOOTSTRAP, vec![2])], &[]);
+        assert!(matches!(
+            Welcome::decode(&bad, &limits).unwrap_err(),
+            MessageError::BadValue { fid: f, .. } if f == fid::F_VIEW_BOOTSTRAP
+        ));
+
+        // The flag cannot ride with the explicit triple or a self view.
+        let explicit = Welcome {
+            view_holder: Some(ClientId::from_bytes([9u8; 16])),
+            view_seq: Some(Seq(7)),
+            view_session: Some(SessionId(8)),
+            ..base
+        };
+        let explicit_body = explicit.encode().unwrap();
+        let conflict = rebuilt(&explicit_body, &[(fid::F_VIEW_BOOTSTRAP, vec![1])], &[]);
+        assert_eq!(
+            Welcome::decode(&conflict, &limits).unwrap_err(),
+            MessageError::ViewBootstrapConflict
+        );
+        let both = Welcome {
+            view_bootstrap: true,
+            ..explicit
+        };
+        assert_eq!(
+            both.encode().unwrap_err(),
+            MessageError::ViewBootstrapConflict
+        );
+
+        let self_view = Welcome {
+            view_self: true,
+            ..base
+        };
+        let self_body = self_view.encode().unwrap();
+        let conflict = rebuilt(&self_body, &[(fid::F_VIEW_BOOTSTRAP, vec![1])], &[]);
+        assert_eq!(
+            Welcome::decode(&conflict, &limits).unwrap_err(),
+            MessageError::ViewBootstrapConflict
+        );
+        let both = Welcome {
+            view_bootstrap: true,
+            ..self_view
+        };
+        assert_eq!(
+            both.encode().unwrap_err(),
+            MessageError::ViewBootstrapConflict
+        );
     }
 
     /// 44 §3.4 -- ERROR, KICK, FLOW, SYNC_END and LEAVE roundtrip.

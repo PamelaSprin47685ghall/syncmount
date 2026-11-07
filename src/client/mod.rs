@@ -75,7 +75,9 @@ use crate::store::{AttrDelta, BackingStore, Errno, InodeId, Kind, PosixBacking, 
 use crate::store::{NodeTable, RootFd};
 use crate::sync::baseline::FsTree;
 use crate::sync::chunk::VerifiedChunkStore;
-use crate::sync::manifest::{Blockmap, LocalManifest, Manifest, ManifestService};
+use crate::sync::manifest::{
+    Blockmap, LocalManifest, LocalManifestState, Manifest, ManifestService,
+};
 use crate::sync::rsync::OxideEngine;
 use crate::sync::{
     ChunkId, ChunkKind, ChunkReader, ClusterWins, DeltaPeer, DiffCounts, DiskTree, JoinView,
@@ -660,11 +662,14 @@ impl Client {
     /// replayer starts at that watermark, which must equal `current_seq` and
     /// the view's own watermark.
     ///
-    /// Above sequence zero a JOIN with no view is retried for 1/2/4/8/16
-    /// seconds and then refused: the only view the client could build is
-    /// empty, and cluster-wins would delete every local-only path. At sequence
-    /// zero the empty view is exact and allowed. [`Config::allow_empty_view`]
-    /// opts into the loss explicitly; the CLI flag is wired separately.
+    /// A JOIN with no view is retried for 1/2/4/8/16 seconds and then
+    /// refused. Above sequence zero this is always a hole. At sequence zero
+    /// it is a hole only while the local tree is non-empty: the first client
+    /// may not have finished pairing, and an empty view would delete those
+    /// files. An empty local tree proceeds. A `WELCOME` may also carry the
+    /// bootstrap flag: the client then scans its own disk and adopts it as
+    /// the sequence-zero cluster view. [`Config::allow_empty_view`] opts into
+    /// the loss explicitly; the CLI flag is wired separately.
     ///
     /// `applied` and `epoch_seen` are the ctrl-prefix watermark. The returned
     /// parts are split between the uplink and the downlink task.
@@ -998,17 +1003,43 @@ impl Client {
     /// one.
     ///
     /// The condition is narrow on purpose. A declared `WELCOME.view_seq`, a
-    /// snapshot reference with sync ports, or an injected [`JoinView`] all
-    /// give the client a real view. Anything else at `current_seq > 0` is a
-    /// hole, and the only empty view the client could build would delete
-    /// local-only paths.
+    /// snapshot reference with sync ports, a bootstrap flag, or an injected
+    /// [`JoinView`] all give the client a real view. Anything else at
+    /// `current_seq > 0` is a hole, and so is a sequence-zero cluster with a
+    /// non-empty disk: the first client may not have finished pairing yet,
+    /// and an empty view would delete the local tree. Retrying is safe;
+    /// deleting is not.
     fn join_wants_view(&self, welcome: &Welcome) -> bool {
-        !self.config.allow_empty_view
-            && !welcome.view_self
-            && welcome.current_seq.is_sequenced()
-            && welcome.view_seq.is_none()
-            && welcome.snapshot_ref.is_none()
-            && self.join_view.is_none()
+        if self.config.allow_empty_view
+            || welcome.view_self
+            || welcome.view_bootstrap
+            || welcome.view_seq.is_some()
+            || welcome.snapshot_ref.is_some()
+            || self.join_view.is_some()
+        {
+            return false;
+        }
+        welcome.current_seq.is_sequenced() || self.local_tree_nonempty()
+    }
+
+    /// Whether the mounted tree has at least one user-visible entry.
+    ///
+    /// A walk failure counts as non-empty: retrying the JOIN is safe, while
+    /// assuming an empty tree would let cluster-wins delete files.
+    fn local_tree_nonempty(&self) -> bool {
+        let Some(root) = self.root.as_ref() else {
+            return false;
+        };
+        match DiskTree::new(root.as_ref(), self.cluster).walk() {
+            Ok(entries) => !entries.is_empty(),
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "cannot walk the local tree; assuming it is not empty"
+                );
+                true
+            }
+        }
     }
 
     /// Run the `JOIN_PROOF` exchange after `WELCOME`.
@@ -1229,8 +1260,9 @@ impl Client {
     /// A positive watermark with no view is refused unless
     /// [`Config::allow_empty_view`] was set: cluster-wins over an empty view
     /// deletes every local-only path, and the server keeps no replay window
-    /// to rebuild the missing history. At watermark zero the empty view is
-    /// exact and always allowed.
+    /// to rebuild the missing history. At watermark zero the same refusal
+    /// applies whenever the local tree is non-empty; an empty tree has
+    /// nothing to lose.
     async fn cluster_wins(&self, welcome: &Welcome) -> Result<JoinReport, ClientError> {
         let root = match &self.root {
             Some(root) => Arc::clone(root),
@@ -1245,6 +1277,7 @@ impl Client {
             delta,
             view_seq,
             covered_seq,
+            exact,
         } = self.remote_view(welcome).await?;
         // Check before the diff: a rejected view must not delete anything.
         let view_seq = view_watermark(welcome.view_seq, view_seq)?;
@@ -1262,22 +1295,58 @@ impl Client {
         let plan_manifest = manifest.clone();
         let plan = tokio::task::spawn_blocking(move || {
             let tree = DiskTree::new(plan_root.as_ref(), cache_cluster);
-            let local = tree.cached_manifest();
+            // A self view or a bootstrap scan already describes this disk.
+            // Using the persisted cache instead would turn every file the
+            // scan just read into a `ContentDiff` whenever the cache is
+            // stale, and the exactness guard would refuse a JOIN that is
+            // actually correct.
+            let local = if exact {
+                Some(LocalManifest {
+                    cluster_id: cluster,
+                    at_seq: plan_manifest.at_seq,
+                    epoch,
+                    manifest: plan_manifest.clone(),
+                })
+            } else {
+                tree.cached_manifest()
+            };
             crate::sync::manifest::diff::plan(local.as_ref(), &plan_manifest, &tree, cluster)
         })
         .await
         .map_err(|_| ClientError::Task("join plan task failed".to_owned()))??;
 
-        if welcome.view_self {
-            // A self view must describe the disk exactly. Anything else is a
-            // stale manifest or a local edit; refuse before deleting or
-            // pulling a single byte.
+        if welcome.view_self || exact {
+            // A self view or a bootstrap scan must describe the disk exactly.
+            // Anything else is a change between the scan and this walk;
+            // refuse before deleting or pulling a single byte.
             let counts = plan.counts();
             if counts.transfers() != 0 || counts.local_only != 0 {
+                let kind = if welcome.view_self { "self" } else { "bootstrap" };
                 return Err(ClientError::Join(format!(
-                    "self view disagrees with the local tree: {} transfers, {} local-only paths; \
+                    "{kind} view disagrees with the local tree: {} transfers, {} local-only paths; \
                      refusing to delete or pull",
                     counts.transfers(),
+                    counts.local_only
+                )));
+            }
+        }
+
+        // Last line of defence: an empty view must never delete local files
+        // unless the operator opted into that loss. This covers every path
+        // that reaches cluster-wins without a view: an old server, a missing
+        // relay, or a retry budget that ended in an empty view.
+        let empty_view = !welcome.view_self
+            && !welcome.view_bootstrap
+            && welcome.view_seq.is_none()
+            && welcome.snapshot_ref.is_none()
+            && welcome.current_seq == Seq::UNSEQUENCED
+            && manifest.is_empty();
+        if empty_view {
+            let counts = plan.counts();
+            if counts.local_only != 0 && !self.config.allow_empty_view {
+                return Err(ClientError::Join(format!(
+                    "the sequence-zero view is empty but the local tree has {} local-only \
+                     paths; refusing to delete them",
                     counts.local_only
                 )));
             }
@@ -1361,6 +1430,10 @@ impl Client {
     /// A `WELCOME` that names a view the client cannot reach is an error, not
     /// an excuse to build an empty view. The same holds above sequence zero
     /// with no view at all unless [`Config::allow_empty_view`] is set.
+    ///
+    /// A bootstrap `WELCOME` is different: the client is the only identity
+    /// on a sequence-zero cluster and the disk is the truth. The client scans
+    /// it through its own [`Holder`] and returns that manifest as the view.
     async fn remote_view(&self, welcome: &Welcome) -> Result<ResolvedView, ClientError> {
         if let Some(view) = &self.join_view {
             let remote = view.remote();
@@ -1370,6 +1443,127 @@ impl Client {
                 chunks: view.chunks(),
                 delta: view.delta(),
                 covered_seq: None,
+                exact: false,
+            });
+        }
+        if welcome.view_bootstrap {
+            // The server says this client is the only identity on a
+            // sequence-zero cluster. The disk is the cluster's initial view:
+            // there is no history and nothing to compare against.
+            if welcome.current_seq != Seq::UNSEQUENCED {
+                return Err(ClientError::Join(format!(
+                    "WELCOME declares a bootstrap view at current seq {}; \
+                     only sequence zero is valid",
+                    welcome.current_seq.get()
+                )));
+            }
+            let empty = || -> Result<ResolvedView, ClientError> {
+                Ok(ResolvedView {
+                    view: RemoteView {
+                        reference: None,
+                        manifest: Manifest::new(Seq::UNSEQUENCED, Vec::new()),
+                        blockmap: Blockmap::new(Seq::UNSEQUENCED, Vec::new(), Vec::new())?,
+                    },
+                    chunks: Arc::new(EmptyChunks),
+                    delta: None,
+                    view_seq: Seq::UNSEQUENCED,
+                    covered_seq: None,
+                    exact: false,
+                })
+            };
+            // Without a mounted root there is no local disk to adopt and
+            // nothing cluster-wins could delete. Embedded callers that only
+            // test the JOIN control plane keep the empty sequence-zero view.
+            let Some(root) = self.root.as_ref() else {
+                return empty();
+            };
+            let cluster = self
+                .cluster
+                .unwrap_or_else(|| ClusterId::from_bytes([0u8; 16]));
+            let disk_empty = DiskTree::new(root.as_ref(), self.cluster)
+                .walk()
+                .map_err(|error| {
+                    ClientError::Join(format!(
+                        "bootstrap cannot walk the local tree: {error}"
+                    ))
+                })?
+                .is_empty();
+            if disk_empty {
+                // Nothing on disk, nothing to describe: the empty view is
+                // exact and cannot delete anything.
+                return empty();
+            }
+            // A non-empty disk may only become the cluster's initial view
+            // when it is recognisably a previous mount. A missing cache is a
+            // new mount; a corrupt one is damaged state. Both are refused
+            // unless the operator explicitly accepts an empty view.
+            match LocalManifest::inspect(root, cluster) {
+                LocalManifestState::Valid(_) => {}
+                LocalManifestState::Missing if self.config.allow_empty_view => {
+                    tracing::warn!(
+                        "bootstrap disk has no local manifest; joining with an empty \
+                         view by explicit opt-in; local-only paths will be deleted"
+                    );
+                    return empty();
+                }
+                LocalManifestState::Missing => {
+                    return Err(ClientError::Join(
+                        "bootstrap disk is not empty but has no local manifest; \
+                         refusing to adopt it as the cluster view (remove the files \
+                         or set allow_empty_view to accept the loss)"
+                            .to_owned(),
+                    ));
+                }
+                LocalManifestState::Corrupt if self.config.allow_empty_view => {
+                    tracing::warn!(
+                        "bootstrap disk has a corrupt local manifest; joining with an \
+                         empty view by explicit opt-in; local-only paths will be deleted"
+                    );
+                    return empty();
+                }
+                LocalManifestState::Corrupt => {
+                    return Err(ClientError::Join(
+                        "bootstrap disk is not empty and its local manifest is corrupt; \
+                         refusing to adopt it as the cluster view (inspect or remove \
+                         .syncmount-manifest, or set allow_empty_view to accept the loss)"
+                            .to_owned(),
+                    ));
+                }
+            }
+            let ports = self.sync_ports.as_ref().ok_or_else(|| {
+                ClientError::Join(
+                    "WELCOME declares a bootstrap view but no sync ports were supplied"
+                        .to_owned(),
+                )
+            })?;
+            let holder = self.holder.as_ref().ok_or_else(|| {
+                ClientError::Join(
+                    "WELCOME declares a bootstrap view but no holder was started"
+                        .to_owned(),
+                )
+            })?;
+            let view = holder
+                .view_for(Seq::UNSEQUENCED)
+                .await
+                .map_err(|error| {
+                    ClientError::Join(format!("bootstrap view scan failed: {error}"))
+                })?;
+            let cache = ports.cache.clone().ok_or_else(|| {
+                ClientError::Join("sync ports have no chunk cache".to_owned())
+            })?;
+            return Ok(ResolvedView {
+                view: RemoteView {
+                    reference: None,
+                    manifest: view.manifest().clone(),
+                    blockmap: view.blockmap().clone(),
+                },
+                // The scan wrote every block into the local store, so the
+                // cache can serve a block if the diff ever needs one.
+                chunks: cache,
+                delta: None,
+                view_seq: Seq::UNSEQUENCED,
+                covered_seq: None,
+                exact: true,
             });
         }
         if welcome.view_self {
@@ -1423,6 +1617,7 @@ impl Client {
                 // apply; starting at `current_seq` skips it without a hole.
                 view_seq: welcome.current_seq,
                 covered_seq: None,
+                exact: true,
             });
         }
         if welcome.view_seq.is_some() {
@@ -1452,16 +1647,15 @@ impl Client {
                     delta: ports.delta.clone(),
                     view_seq,
                     covered_seq: None,
+                    exact: false,
                 });
             }
-            // Without relay ports the holder's manifest is unreachable. At
-            // watermark zero the empty view is exact, so the existing zero
-            // branch below is the safe fallback; above zero it must refuse.
-            if welcome.current_seq != Seq::UNSEQUENCED {
-                return Err(ClientError::Join(
-                    "WELCOME names a view holder but no sync ports were supplied".to_owned(),
-                ));
-            }
+            // Without relay ports the holder's manifest is unreachable. The
+            // empty view below would delete local-only paths even at
+            // watermark zero, so this is always a refusal.
+            return Err(ClientError::Join(
+                "WELCOME names a view holder but no sync ports were supplied".to_owned(),
+            ));
         }
         if let Some(ports) = &self.sync_ports {
             if let Some(reference) = welcome.snapshot_ref {
@@ -1487,6 +1681,7 @@ impl Client {
                     delta: ports.delta.clone(),
                     view_seq,
                     covered_seq: Some(installed.covered_seq),
+                    exact: false,
                 });
             }
         }
@@ -1503,6 +1698,7 @@ impl Client {
                 delta: None,
                 view_seq: Seq::UNSEQUENCED,
                 covered_seq: None,
+                exact: false,
             });
         }
         if welcome.snapshot_ref.is_some() {
@@ -1534,6 +1730,7 @@ impl Client {
             delta: None,
             view_seq: welcome.current_seq,
             covered_seq: None,
+            exact: false,
         })
     }
 
@@ -2753,6 +2950,7 @@ fn note_replay_step(
         Counters::bump(&counters.ops_duplicate);
     } else {
         Counters::bump(&counters.ops_applied);
+        Counters::add(&counters.bytes_written, progress.bytes_written);
         if progress.verdict.is_err() {
             Counters::bump(&counters.ops_rejected);
         }
@@ -2798,6 +2996,10 @@ struct ResolvedView {
     view_seq: Seq,
     /// Watermark the snapshot installed, when one was pulled.
     covered_seq: Option<Seq>,
+    /// True when [`Self::view`] describes the local disk exactly: a self view
+    /// or a bootstrap scan. The diff must then use the view's manifest as the
+    /// local cache instead of the persisted one, which may be stale.
+    exact: bool,
 }
 
 /// Reject a `WELCOME` whose declared view is not the current watermark.
@@ -2815,6 +3017,23 @@ fn check_welcome_view(welcome: &Welcome) -> Result<(), ClientError> {
         return Err(ClientError::Join(
             "WELCOME mixes view_self with a holder view".to_owned(),
         ));
+    }
+    if welcome.view_bootstrap
+        && (welcome.view_self
+            || welcome.view_holder.is_some()
+            || welcome.view_seq.is_some()
+            || welcome.view_session.is_some())
+    {
+        return Err(ClientError::Join(
+            "WELCOME mixes view_bootstrap with another view source".to_owned(),
+        ));
+    }
+    if welcome.view_bootstrap && welcome.current_seq != Seq::UNSEQUENCED {
+        return Err(ClientError::Join(format!(
+            "WELCOME declares a bootstrap view at current seq {}; \
+             only sequence zero is valid",
+            welcome.current_seq.get()
+        )));
     }
     match welcome.view_seq {
         Some(view_seq) if view_seq != welcome.current_seq => Err(ClientError::Join(format!(
@@ -3036,6 +3255,7 @@ mod tests {
             view_seq: None,
             view_session: None,
             view_self: false,
+            view_bootstrap: false,
         };
         let resolved = client.remote_view(&welcome).await.unwrap();
         assert_eq!(resolved.view_seq, Seq(4096));
@@ -3075,6 +3295,7 @@ mod tests {
             view_seq: None,
             view_session: None,
             view_self: false,
+            view_bootstrap: false,
         }
     }
 
@@ -3101,6 +3322,17 @@ mod tests {
         fn delta(&self) -> Option<Arc<dyn DeltaPeer>> {
             None
         }
+    }
+
+    /// An empty view for control-plane tests whose second client does not
+    /// build relay ports. It covers sequence zero exactly, so cluster-wins
+    /// neither transfers nor deletes anything.
+    fn empty_join_view() -> Arc<FixedView> {
+        Arc::new(FixedView {
+            manifest: Manifest::new(Seq::UNSEQUENCED, Vec::new()),
+            blockmap: Blockmap::new(Seq::UNSEQUENCED, Vec::new(), Vec::new())
+                .expect("empty blockmap"),
+        })
     }
 
     /// A positive watermark with no view is a data-loss path, not a
@@ -3505,6 +3737,364 @@ mod tests {
         assert!(!opted_in.join_wants_view(&welcome_at(Seq(5))));
     }
 
+    /// A holder that disappears during the pull is a relay condition: the
+    /// whole JOIN is retried inside the same budget, not failed fatally.
+    #[test]
+    fn u_no_peer_during_the_pull_is_transient() {
+        let error = ClientError::Sync(SyncError::Link("NoPeer".to_owned()));
+        assert!(is_transient_join(&error));
+        let error = ClientError::Sync(SyncError::Link("transient: timeout".to_owned()));
+        assert!(is_transient_join(&error));
+        assert!(!is_transient_join(&ClientError::Join("no view".to_owned())));
+    }
+
+    fn bootstrap_welcome(epoch: u64) -> Welcome {
+        let mut welcome = welcome_at(Seq::UNSEQUENCED);
+        welcome.epoch = epoch;
+        welcome.view_bootstrap = true;
+        welcome
+    }
+
+    /// A bootstrap JOIN adopts a non-empty disk: the scan supplies both the
+    /// view and the diff cache, so nothing is transferred or deleted. The old
+    /// manifest's epoch and sequence are replaced by `(0, WELCOME.epoch)`.
+    #[tokio::test]
+    async fn i_bootstrap_adopts_a_non_empty_disk() {
+        use crate::sync::ChunkReader;
+        use crate::sync::test_support::{
+            CLUSTER, FakeLink, FakeState, MemChunks, MemTree, make_image, ports,
+        };
+
+        let dir = tempfile::TempDir::new().expect("root");
+        for index in 0..7 {
+            std::fs::write(
+                dir.path().join(format!("file-{index}.txt")),
+                b"data",
+            )
+            .expect("write");
+        }
+        let root = Arc::new(RootFd::open_before_mount(dir.path()).expect("root fd"));
+        LocalManifest {
+            cluster_id: CLUSTER,
+            at_seq: Seq(5),
+            epoch: 1,
+            manifest: Manifest::new(Seq(5), Vec::new()),
+        }
+        .store(root.as_ref())
+        .expect("store old manifest");
+
+        let store = Arc::new(
+            VerifiedChunkStore::open(Arc::clone(&root), [0x42; 32]).expect("chunk store"),
+        );
+        let ring = Arc::new(KeyRing::derive(&[0x51; 32], &CLUSTER).expect("ring"));
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let holder = Arc::new(Holder::new(
+            Arc::clone(&root),
+            Arc::clone(&store),
+            ring,
+            CLUSTER,
+            Seq::UNSEQUENCED,
+            Arc::new(tx),
+        ));
+        let chunks = MemChunks::new();
+        let link = FakeLink::new(Arc::clone(&chunks));
+        let state = FakeState::new(0, make_image(0, &[], 1));
+        let mut sync_ports = ports(state, chunks, link, MemTree::new());
+        sync_ports.cache = Some(Arc::clone(&store) as Arc<dyn ChunkReader>);
+
+        let mut client = Client::new(config())
+            .with_cluster(CLUSTER)
+            .with_sync_ports(sync_ports);
+        client.root = Some(Arc::clone(&root));
+        client.holder = Some(Arc::clone(&holder));
+
+        let welcome = bootstrap_welcome(7);
+        let resolved = client.remote_view(&welcome).await.expect("bootstrap view");
+        assert_eq!(resolved.view_seq, Seq::UNSEQUENCED);
+        assert_eq!(resolved.view.manifest.at_seq, Seq::UNSEQUENCED);
+        assert_eq!(resolved.view.manifest.len(), 7);
+        assert!(resolved.exact);
+
+        // The scan wrote real blocks into the cache the view names.
+        let index = resolved
+            .view
+            .manifest
+            .find_index("file-0.txt")
+            .expect("entry");
+        let id = resolved
+            .view
+            .blockmap
+            .block(index, 0)
+            .expect("block id");
+        assert_eq!(
+            resolved
+                .chunks
+                .read(ChunkKind::File, id)
+                .expect("read")
+                .expect("present"),
+            b"data"
+        );
+
+        let report = client.cluster_wins(&welcome).await.expect("cluster wins");
+        assert_eq!(report.counts.transfers(), 0);
+        assert_eq!(report.counts.local_only, 0);
+        for index in 0..7 {
+            assert!(
+                dir.path().join(format!("file-{index}.txt")).exists(),
+                "bootstrap deleted a local file"
+            );
+        }
+        let cache = LocalManifest::load(root.as_ref(), CLUSTER).expect("rewritten manifest");
+        assert_eq!(cache.at_seq, Seq::UNSEQUENCED);
+        assert_eq!(cache.epoch, 7);
+        assert_eq!(cache.manifest.len(), 7);
+    }
+
+    /// A second joiner at sequence zero pulls the bootstrap holder's view
+    /// through the normal manifest/blockmap path and installs every file.
+    #[tokio::test]
+    async fn i_bootstrap_holder_serves_a_second_joiner() {
+        use crate::sync::ChunkReader;
+        use crate::sync::test_support::{
+            CLUSTER, FakeLink, FakeState, MemChunks, MemTree, make_image, ports,
+        };
+
+        let first_dir = tempfile::TempDir::new().expect("first root");
+        for index in 0..3 {
+            std::fs::write(
+                first_dir.path().join(format!("file-{index}.txt")),
+                b"data",
+            )
+            .expect("write");
+        }
+        let first_root = Arc::new(
+            RootFd::open_before_mount(first_dir.path()).expect("first root fd"),
+        );
+        let first_store = Arc::new(
+            VerifiedChunkStore::open(Arc::clone(&first_root), [0x42; 32])
+                .expect("first chunk store"),
+        );
+        let ring = Arc::new(KeyRing::derive(&[0x51; 32], &CLUSTER).expect("ring"));
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let holder = Holder::new(
+            Arc::clone(&first_root),
+            Arc::clone(&first_store),
+            ring,
+            CLUSTER,
+            Seq::UNSEQUENCED,
+            Arc::new(tx),
+        );
+        let view = holder
+            .view_for(Seq::UNSEQUENCED)
+            .await
+            .expect("bootstrap scan");
+        let manifest = view.manifest().clone();
+        let blockmap = view.blockmap().clone();
+
+        let second_dir = tempfile::TempDir::new().expect("second root");
+        let second_root = Arc::new(
+            RootFd::open_before_mount(second_dir.path()).expect("second root fd"),
+        );
+        let chunks = MemChunks::new();
+        let link = FakeLink::new(Arc::clone(&chunks));
+        *link.manifest.lock().unwrap() = Some(manifest);
+        *link.blockmap.lock().unwrap() = Some(blockmap);
+        let state = FakeState::new(0, make_image(0, &[], 1));
+        let mut sync_ports = ports(state, chunks, link, MemTree::new());
+        sync_ports.cache = Some(Arc::clone(&first_store) as Arc<dyn ChunkReader>);
+
+        let mut client = Client::new(config())
+            .with_cluster(CLUSTER)
+            .with_sync_ports(sync_ports);
+        client.root = Some(Arc::clone(&second_root));
+
+        let mut welcome = welcome_at(Seq::UNSEQUENCED);
+        welcome.view_holder = Some(ClientId::from_bytes([1; 16]));
+        welcome.view_seq = Some(Seq::UNSEQUENCED);
+        welcome.view_session = Some(crate::protocol::SessionId(1));
+
+        let resolved = client.remote_view(&welcome).await.expect("pull view");
+        assert_eq!(resolved.view_seq, Seq::UNSEQUENCED);
+        assert_eq!(resolved.view.manifest.len(), 3);
+        assert!(!resolved.exact);
+
+        let report = client.cluster_wins(&welcome).await.expect("apply view");
+        assert_eq!(report.counts.remote_only, 3);
+        assert_eq!(report.counts.transfers(), 3);
+        for index in 0..3 {
+            assert_eq!(
+                std::fs::read(second_dir.path().join(format!("file-{index}.txt")))
+                    .expect("read"),
+                b"data"
+            );
+        }
+        let cache = LocalManifest::load(second_root.as_ref(), CLUSTER).expect("manifest");
+        assert_eq!(cache.at_seq, Seq::UNSEQUENCED);
+        assert_eq!(cache.manifest.len(), 3);
+    }
+
+    /// An empty disk is a legitimate bootstrap source: the empty view cannot
+    /// delete anything and the cache is written at sequence zero.
+    #[tokio::test]
+    async fn i_bootstrap_empty_disk_is_an_empty_view() {
+        use crate::sync::test_support::CLUSTER;
+
+        let dir = tempfile::TempDir::new().expect("root");
+        let root = Arc::new(RootFd::open_before_mount(dir.path()).expect("root fd"));
+        let mut client = Client::new(config()).with_cluster(CLUSTER);
+        client.root = Some(Arc::clone(&root));
+
+        let welcome = bootstrap_welcome(7);
+        let resolved = client.remote_view(&welcome).await.expect("bootstrap view");
+        assert!(resolved.view.manifest.is_empty());
+        assert_eq!(resolved.view_seq, Seq::UNSEQUENCED);
+        assert!(!resolved.exact);
+
+        let report = client.cluster_wins(&welcome).await.expect("cluster wins");
+        assert_eq!(report.counts.local_only, 0);
+        let cache = LocalManifest::load(root.as_ref(), CLUSTER).expect("manifest");
+        assert_eq!(cache.at_seq, Seq::UNSEQUENCED);
+        assert!(cache.manifest.is_empty());
+    }
+
+    /// A non-empty disk without a usable cache is not silently adopted. The
+    /// error distinguishes a new mount from a damaged cache, and the disk is
+    /// untouched.
+    #[tokio::test]
+    async fn i_bootstrap_refuses_a_non_empty_disk_without_a_manifest() {
+        use crate::sync::test_support::CLUSTER;
+
+        let dir = tempfile::TempDir::new().expect("root");
+        std::fs::write(dir.path().join("keep.txt"), b"keep").expect("write");
+        let root = Arc::new(RootFd::open_before_mount(dir.path()).expect("root fd"));
+        let mut client = Client::new(config()).with_cluster(CLUSTER);
+        client.root = Some(Arc::clone(&root));
+
+        let error = client
+            .remote_view(&bootstrap_welcome(7))
+            .await
+            .expect_err("a missing manifest must be refused");
+        match error {
+            ClientError::Join(message) => assert!(
+                message.contains("no local manifest"),
+                "unexpected message: {message}"
+            ),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(
+            std::fs::read(dir.path().join("keep.txt")).expect("read"),
+            b"keep"
+        );
+    }
+
+    #[tokio::test]
+    async fn i_bootstrap_refuses_a_corrupt_manifest() {
+        use crate::sync::test_support::CLUSTER;
+
+        let dir = tempfile::TempDir::new().expect("root");
+        std::fs::write(dir.path().join("keep.txt"), b"keep").expect("write");
+        std::fs::write(dir.path().join(".syncmount-manifest"), b"not a manifest")
+            .expect("write corrupt cache");
+        let root = Arc::new(RootFd::open_before_mount(dir.path()).expect("root fd"));
+        let mut client = Client::new(config()).with_cluster(CLUSTER);
+        client.root = Some(Arc::clone(&root));
+
+        let error = client
+            .remote_view(&bootstrap_welcome(7))
+            .await
+            .expect_err("a corrupt manifest must be refused");
+        match error {
+            ClientError::Join(message) => assert!(
+                message.contains("corrupt"),
+                "unexpected message: {message}"
+            ),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(
+            std::fs::read(dir.path().join("keep.txt")).expect("read"),
+            b"keep"
+        );
+    }
+
+    /// A sequence-zero WELCOME without a view is not safe merely because the
+    /// watermark is zero: the local tree may be non-empty. The JOIN retries
+    /// first, and cluster-wins refuses an empty view as the last line.
+    #[tokio::test]
+    async fn i_sequence_zero_without_a_view_never_deletes_a_non_empty_disk() {
+        use crate::sync::test_support::CLUSTER;
+
+        let dir = tempfile::TempDir::new().expect("root");
+        std::fs::write(dir.path().join("keep.txt"), b"keep").expect("write");
+        let root = Arc::new(RootFd::open_before_mount(dir.path()).expect("root fd"));
+        let mut client = Client::new(config()).with_cluster(CLUSTER);
+        client.root = Some(Arc::clone(&root));
+        let welcome = welcome_at(Seq::UNSEQUENCED);
+
+        assert!(
+            client.join_wants_view(&welcome),
+            "a non-empty disk at seq zero must retry, not accept an empty view"
+        );
+        let resolved = client.remote_view(&welcome).await.expect("empty view");
+        assert!(resolved.view.manifest.is_empty());
+        let error = client
+            .cluster_wins(&welcome)
+            .await
+            .expect_err("an empty view must not delete local files");
+        match error {
+            ClientError::Join(message) => assert!(
+                message.contains("local-only"),
+                "unexpected message: {message}"
+            ),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(
+            std::fs::read(dir.path().join("keep.txt")).expect("read"),
+            b"keep"
+        );
+    }
+
+    /// The explicit opt-in still accepts the loss.
+    #[tokio::test]
+    async fn i_sequence_zero_empty_view_opt_in_deletes() {
+        use crate::sync::test_support::CLUSTER;
+
+        let dir = tempfile::TempDir::new().expect("root");
+        std::fs::write(dir.path().join("gone.txt"), b"gone").expect("write");
+        let root = Arc::new(RootFd::open_before_mount(dir.path()).expect("root fd"));
+        let mut client = Client::new(config().with_allow_empty_view(true))
+            .with_cluster(CLUSTER);
+        client.root = Some(Arc::clone(&root));
+
+        let report = client
+            .cluster_wins(&welcome_at(Seq::UNSEQUENCED))
+            .await
+            .expect("explicit opt-in");
+        assert_eq!(report.counts.local_only, 1);
+        assert!(!dir.path().join("gone.txt").exists());
+    }
+
+    /// A declared view at zero without relay ports used to fall through to
+    /// the empty view. It must be refused instead.
+    #[tokio::test]
+    async fn i_view_seq_at_zero_without_ports_is_refused() {
+        let mut welcome = welcome_at(Seq::UNSEQUENCED);
+        welcome.view_holder = Some(ClientId::from_bytes([1; 16]));
+        welcome.view_seq = Some(Seq::UNSEQUENCED);
+        welcome.view_session = Some(crate::protocol::SessionId(1));
+        let client = Client::new(config());
+        let error = client
+            .remote_view(&welcome)
+            .await
+            .expect_err("a holder view needs ports");
+        match error {
+            ClientError::Join(message) => assert!(
+                message.contains("no sync ports"),
+                "unexpected message: {message}"
+            ),
+            other => panic!("{other:?}"),
+        }
+    }
+
     /// A `LEAVE` is a sequenced broadcast: B's pump must replay it, or
     /// `applied_seq` stays behind and every later frame looks like a gap.
     #[tokio::test]
@@ -3593,7 +4183,8 @@ mod tests {
             "the cluster starts empty"
         );
 
-        let mut b = Client::new(proof_config(addr, &b_mnt, &signing_b, "leave-b"));
+        let mut b = Client::new(proof_config(addr, &b_mnt, &signing_b, "leave-b"))
+            .with_join_view(empty_join_view());
         let parts_b = b.join(Seq::UNSEQUENCED, 0).await.expect("B joins");
         let epoch = parts_b.welcome.epoch;
         let b_id = signing_b.client_id();
@@ -3691,7 +4282,8 @@ mod tests {
         // A second client proves the cluster is not the single-client case.
         // Both leave; A's disconnect injects a sequenced LEAVE, so the
         // cluster is above zero when B remounts.
-        let mut b0 = Client::new(proof_config(addr, &b_mnt, &signing_c, "rebuild-b0"));
+        let mut b0 = Client::new(proof_config(addr, &b_mnt, &signing_c, "rebuild-b0"))
+            .with_join_view(empty_join_view());
         let parts_b0 = b0.join(Seq::UNSEQUENCED, 0).await.expect("B joins");
         drop(parts_b0);
         drop(parts_a);
@@ -3939,7 +4531,8 @@ mod tests {
         let signing_b = proof_signing(0x42);
         let mut b = Client::new(proof_config(addr, &b_mount, &signing_b, "proof-b"))
             .with_cluster(cluster)
-            .with_join_auth(Arc::clone(&master), Arc::clone(&signing_b));
+            .with_join_auth(Arc::clone(&master), Arc::clone(&signing_b))
+            .with_join_view(empty_join_view());
         let parts_b = b
             .join_with_ring(Seq::UNSEQUENCED, 0, Some(&ring))
             .await
@@ -4049,7 +4642,8 @@ mod tests {
         let signing_b = proof_signing(0x42);
         let mut b = Client::new(proof_config(addr, &b_mnt, &signing_b, "pump-b"))
             .with_cluster(cluster)
-            .with_join_auth(Arc::clone(&master), Arc::clone(&signing_b));
+            .with_join_auth(Arc::clone(&master), Arc::clone(&signing_b))
+            .with_join_view(empty_join_view());
         let parts_b = b
             .join_with_ring(Seq::UNSEQUENCED, 0, Some(&ring))
             .await
@@ -4339,12 +4933,14 @@ mod tests {
             Client::new(config_a)
                 .with_cluster(cluster)
                 .with_join_auth(Arc::clone(&master), Arc::clone(&id_a))
+                .with_join_view(empty_join_view())
                 .run_with_identity(Arc::clone(&ring), id_a),
         );
         let mut b_task = tokio::spawn(
             Client::new(config_b)
                 .with_cluster(cluster)
                 .with_join_auth(Arc::clone(&master), Arc::clone(&id_b))
+                .with_join_view(empty_join_view())
                 .run_with_identity(Arc::clone(&ring), id_b),
         );
 
@@ -4356,7 +4952,10 @@ mod tests {
             "both FUSE mounts did not appear"
         );
         assert!(
-            wait_until(Duration::from_secs(10), || {
+            // The first client now scans its mounted tree before it can
+            // publish a bootstrap view; the FUSE walk competes with the
+            // other tests in this binary.
+            wait_until(Duration::from_secs(20), || {
                 metrics.clients.load(Ordering::Relaxed) >= 2
             })
             .await,
