@@ -1,28 +1,31 @@
-//! Server: HTTP surface, one sequencer actor, online table.
+//! Server: HTTP surface, one sequencer actor, SQLite authority.
 //!
 //! # Scope
 //!
-//! W9 owns the total order and the session lifecycle:
-//!
 //! ```text
-//! http      HttpAcceptor → POST {prefix}/rpc, GET {prefix}/events, healthz
-//! session   per-connection reader/writer, nonce pairing, detach
-//! sequencer single actor: stamp, fan-out, watermark T2/T3, LEAVE, tick
-//! online    OnlineTable, SessionState, Outbox (32 MiB ceiling), Watermark
+//! http      HttpAcceptor -> POST {prefix}/rpc, GET {prefix}/events, healthz
+//! session   PSK handshake, per-connection reader/writer, OP_DATA assembly
+//! sequencer single actor: commit, fanout, replay cursor, LEAVE, drain
+//! store     one blocking thread: SQLite transaction, state mirror, wire log
+//! wire      ORDERED <-> state::Op / EventDraft / replay frames
+//! online    OnlineTable keyed by SessionId, Outbox, Watermark
 //! config    ServeConfig and every frozen constant
 //! ```
 //!
-//! W10 adds `relay`, `health`, `kick`, `snapshot_registry` and `metrics`. The
-//! seams are deliberate: [`session`] hands every routed frame to
-//! [`SeqCmd::Relay`], and [`Metrics::sync_sessions`] is written by the relay
-//! hub through the actor.
+//! # Ordering and durability
 //!
-//! # What the server never does
+//! The server holds the PSK. It decrypts `ORDERED`, decodes the operation,
+//! plans it with the shared `state` machine, commits the row changes and the
+//! event in one SQLite transaction, and only then broadcasts the client's
+//! original ciphertext with `header.seq` rewritten. A crash between commit
+//! and broadcast is repaired by replay; the reverse order is forbidden.
 //!
-//! It holds no key, parses no `enc_body`, writes no disk, keeps no replay
-//! window and never rewrites a routed prefix (42 §0, I4–I8). The only header
-//! field it touches is `seq`.
-
+//! # Identity
+//!
+//! A session is the server-assigned [`protocol::SessionId`]. The wire still
+//! carries `client_id`, but the server never uses it for routing or trust:
+//! the PSK is the only credential. An unauthenticated connection never enters
+//! the online table.
 pub mod config;
 pub mod health;
 pub mod http;
@@ -31,8 +34,8 @@ pub mod metrics;
 pub mod online;
 pub mod relay;
 pub mod sequencer;
-pub mod snapshot_registry;
-pub mod view_registry;
+pub mod store;
+pub mod wire;
 
 mod session;
 
@@ -49,17 +52,16 @@ pub use online::{
 };
 pub use relay::{RelayHub, RelayLimits, RelaySession, RelayState, RouteAction, Window};
 pub use sequencer::{
-    DetachCause, EventsOutcome, EventsReject, HelloReply, HelloRequest, SeqCmd, SeqSnapshot,
-    Sequencer, SequencerError, WatermarkReport,
+    AttachReply, AttachRequest, DetachCause, DrainReport, EventsOutcome, EventsReject, PairReply,
+    ReplayStep, SeqCmd, SeqSnapshot, Sequencer, SequencerError, WatermarkReport,
 };
-pub use snapshot_registry::{SnapshotAction, SnapshotEntry, SnapshotLimits, SnapshotRegistry};
-pub use view_registry::{ViewChoice, ViewLookup, ViewRegistry, ViewRoute, ViewSource};
+pub use store::{CommitOutcome, CommitRequest, StoreHandle, StoreMeta};
 
-/// Random per-process epoch.
+/// Event-log epoch.
 ///
-/// Never persisted (39 ruling 10): a restart produces a new epoch, the
-/// sequence restarts at zero, and every client resynchronizes. Clients compare
-/// this value; it never orders events.
+/// Persisted in `meta.epoch`. A normal restart keeps it, so clients resume
+/// from their applied sequence; only compaction increments it and resets the
+/// sequence to zero. Clients compare this value; it never orders events.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Epoch(u64);
 
@@ -91,6 +93,9 @@ impl fmt::Display for Epoch {
         write!(formatter, "0x{:016x}", self.0)
     }
 }
+
+#[cfg(test)]
+mod integration_tests;
 
 #[cfg(test)]
 mod tests {

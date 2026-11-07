@@ -29,18 +29,14 @@
 
 use std::ffi::OsString;
 use std::fs;
-#[cfg(feature = "fuse")]
 use std::io::IsTerminal;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-#[cfg(feature = "fuse")]
-use std::sync::Arc;
 
 use clap::{Args, Parser, Subcommand};
 use serde_json::Value;
-#[cfg(feature = "fuse")]
 use zeroize::Zeroizing;
 
 #[cfg(feature = "fuse")]
@@ -48,16 +44,11 @@ use crate::client::Client;
 #[cfg(feature = "fuse")]
 use crate::client::config::Config as ClientConfig;
 use crate::client::config::Endpoint as ClientEndpoint;
-#[cfg(feature = "fuse")]
 use crate::crypto::secret::MasterKey;
-#[cfg(feature = "fuse")]
-use crate::crypto::sign::SigningKey;
 use crate::logging::{self, LogFormat};
-use crate::protocol::crypto::ClusterId;
+use crate::protocol::crypto::PskSalt;
 use crate::server::{ServeConfig, Server};
-use crate::store::RootFd;
 use crate::store::runtime_dir::{self, RuntimeDir};
-use crate::sync::manifest::LocalManifest;
 use crate::version;
 
 /// Normal exit.
@@ -85,15 +76,15 @@ pub const FUSE_DEVICE: &str = "/dev/fuse";
 const SUBCOMMANDS: [&str; 7] = [
     "client",
     "server",
+    "import",
     "status",
     "debug-state",
-    "debug-manifest-diff",
     "debug-seq-gaps",
     "debug-conntrace",
 ];
 
 /// Flags that consume the following argv token.
-const VALUE_FLAGS: [&str; 10] = [
+const VALUE_FLAGS: [&str; 9] = [
     "--log-level",
     "--log-format",
     "--key",
@@ -101,9 +92,8 @@ const VALUE_FLAGS: [&str; 10] = [
     "--listen",
     "--port",
     "--mount-id",
-    "--url",
-    "--cluster",
     "--limit",
+    "--db",
 ];
 
 /// Parsed command line.
@@ -143,12 +133,12 @@ pub enum Command {
     Client(ClientArgs),
     /// Run the stateless sequencer.
     Server(ServerArgs),
+    /// Import a POSIX directory tree into a client database.
+    Import(ImportArgs),
     /// Print the status of running clients.
     Status(StatusArgs),
     /// Dump the replay/lifecycle state of a running client.
     DebugState(DebugArgs),
-    /// Compare two local manifest caches.
-    DebugManifestDiff(ManifestDiffArgs),
     /// Report seq gaps in the connection trace.
     DebugSeqGaps(DebugArgs),
     /// Dump the connection trace ring.
@@ -169,11 +159,9 @@ pub struct ClientArgs {
     #[arg(long)]
     pub allow_other: bool,
 
-    /// Accept a JOIN with no remote view above sequence zero.
-    ///
-    /// Cluster-wins then deletes every local-only path; this records consent.
-    #[arg(long)]
-    pub allow_empty_view: bool,
+    /// SQLite database path (overrides SYNCMOUNT_DB).
+    #[arg(long, value_name = "PATH")]
+    pub db: Option<PathBuf>,
 
     /// Read the master password from this file (mode 0600).
     #[arg(long, value_name = "PATH")]
@@ -197,6 +185,51 @@ pub struct ServerArgs {
     /// Listen port on `127.0.0.1`.
     #[arg(long, value_name = "PORT", conflicts_with = "listen")]
     pub port: Option<u16>,
+
+    /// SQLite database file for the authoritative state and event log.
+    #[arg(
+        long = "db",
+        env = "SYNCMOUNT_SERVER_DB",
+        value_name = "PATH",
+        default_value = crate::server::config::DEFAULT_DB_FILE
+    )]
+    pub db: PathBuf,
+
+    /// Read the master password from this file (mode 0600).
+    #[arg(long, value_name = "PATH")]
+    pub key_file: Option<PathBuf>,
+}
+
+/// `syncmount import --from DIR [--db PATH]`.
+#[derive(Debug, Args)]
+pub struct ImportArgs {
+    /// Source POSIX directory tree. Symbolic links are not followed.
+    #[arg(long, value_name = "DIR")]
+    pub from: PathBuf,
+
+    /// SQLite database path (default: state dir + namespace).
+    #[arg(long, value_name = "PATH")]
+    pub db: Option<PathBuf>,
+
+    /// Namespace directory used for the default database path.
+    #[arg(long, default_value = "root", value_name = "NAME")]
+    pub namespace: String,
+
+    /// Clear the existing tree, outbox and chunks before importing.
+    #[arg(long)]
+    pub replace: bool,
+
+    /// Generate the deterministic seed outbox events after importing.
+    #[arg(long)]
+    pub seed: bool,
+
+    /// Cluster id as 32 hex characters; the default is derived from the PSK.
+    #[arg(long, value_name = "HEX")]
+    pub cluster: Option<String>,
+
+    /// Read the master password from this file (mode 0600).
+    #[arg(long, value_name = "PATH")]
+    pub key_file: Option<PathBuf>,
 }
 
 /// `syncmount status`.
@@ -235,22 +268,6 @@ pub struct ConntraceArgs {
     pub limit: usize,
 }
 
-/// `syncmount debug-manifest-diff MOUNTPOINT [OTHER]`.
-#[derive(Debug, Args)]
-pub struct ManifestDiffArgs {
-    /// Mountpoint whose local manifest cache is the left side.
-    pub mountpoint: PathBuf,
-    /// Optional second mountpoint; without it only the left summary prints.
-    pub other: Option<PathBuf>,
-
-    /// Derive the legacy URL-based cluster id (pre-cutover caches only).
-    #[arg(long, value_name = "URL")]
-    pub url: Option<String>,
-
-    /// Explicit 16-byte cluster id as 32 hex characters.
-    #[arg(long, value_name = "HEX", conflicts_with = "url")]
-    pub cluster: Option<String>,
-}
 
 /// Errors that terminate the process.
 #[derive(Debug, thiserror::Error)]
@@ -408,9 +425,9 @@ fn execute(cli: Cli) -> Result<(), CliError> {
     match cli.command {
         Command::Client(args) => run_client(args),
         Command::Server(args) => run_server(args),
+        Command::Import(args) => run_import(args),
         Command::Status(args) => run_status(args),
         Command::DebugState(args) => run_debug_state(args),
-        Command::DebugManifestDiff(args) => run_manifest_diff(args),
         Command::DebugSeqGaps(args) => run_seq_gaps(args),
         Command::DebugConntrace(args) => run_conntrace(args),
     }
@@ -447,20 +464,13 @@ fn run_client_fuse(args: ClientArgs) -> Result<(), CliError> {
 
     let endpoint = ClientEndpoint::parse(&args.url)
         .map_err(|error| CliError::Usage(format!("invalid URL `{}`: {error}", args.url)))?;
-    let cluster = default_cluster();
-    let master = load_master(&cluster, args.key_file.as_deref())?;
-    let ring = Arc::new(
-        master
-            .derive_keyring(&cluster)
-            .map_err(|error| CliError::Startup(format!("key derivation failed: {error}")))?,
-    );
-    let signing = SigningKey::load_or_create(&cluster)
-        .map_err(|error| CliError::Startup(format!("identity: {error}")))?;
-    let client_id = signing.client_id();
-    let signing = Arc::new(signing);
+    let master = load_master(args.key_file.as_deref())?;
+    let cluster = namespace_id(&master);
+    let ring = master
+        .derive_psk_keyring(&PskSalt::DEFAULT)
+        .map_err(|error| CliError::Startup(format!("key derivation failed: {error}")))?;
 
-    let config = ClientConfig::new(endpoint, args.mountpoint.clone(), client_id)
-        .map(|config| config.with_allow_empty_view(args.allow_empty_view))
+    let config = ClientConfig::new(endpoint, args.mountpoint.clone())
         .map_err(|error| CliError::Startup(format!("configuration: {error}")))?;
     let mount_id = config.mount_id.clone();
 
@@ -469,28 +479,24 @@ fn run_client_fuse(args: ClientArgs) -> Result<(), CliError> {
         mode = "client",
         mount_id = %mount_id,
         mountpoint = %args.mountpoint.display(),
-        cluster = %cluster,
-        allow_other = args.allow_other,
-        allow_empty_view = args.allow_empty_view,
+        cluster = %hex::encode(cluster),
+        database = %crate::client::database_path(&config).display(),
         "starting syncmount client"
     );
 
-    let client = Client::new(config)
-        .with_cluster(cluster)
-        .with_allow_other(args.allow_other)
-        .with_join_auth(Arc::new(master), Arc::clone(&signing))
-        // Build the relay cache and tree from the root `mount_fuse` opens
-        // after the stale-mount cleanup; a pre-cleanup descriptor could point
-        // at a stale mount.
-        .with_relay(true);
-
+    let client = match &args.db {
+        Some(path) => Client::new(config)
+            .with_database_path(path)
+            .with_allow_other(args.allow_other),
+        None => Client::new(config).with_allow_other(args.allow_other),
+    };
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .map_err(|error| CliError::Startup(format!("cannot start the async runtime: {error}")))?;
 
     let code = runtime
-        .block_on(client.run_with_identity(ring, signing))
+        .block_on(client.run(ring, cluster))
         .map_err(|error| CliError::Startup(error.to_string()))?;
 
     if code == 0 {
@@ -500,48 +506,106 @@ fn run_client_fuse(args: ClientArgs) -> Result<(), CliError> {
     }
 }
 
-/// Domain separator shared by every cluster-id derivation.
-const CLUSTER_DOMAIN: &[u8] = b"sm/v1/cluster\0";
+// ---------------------------------------------------------------------------
+// import
+// ---------------------------------------------------------------------------
 
-/// Derive the legacy 16-byte cluster id from the normalised endpoint.
-///
-/// Clients no longer use this id: they all use [`default_cluster`], so the
-/// URL spelling is only a connection target. The function is kept for
-/// `debug-manifest-diff --url`, which reads caches written before the
-/// fixed-identity cutover.
-pub fn cluster_for(endpoint: &ClientEndpoint) -> ClusterId {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(CLUSTER_DOMAIN);
-    hasher.update(endpoint.scheme.as_str().as_bytes());
-    hasher.update(b"://");
-    hasher.update(endpoint.authority().as_bytes());
-    hasher.update(endpoint.prefix.as_bytes());
-    let digest = hasher.finalize();
-    let mut bytes = [0u8; ClusterId::LEN];
-    bytes.copy_from_slice(&digest.as_bytes()[..ClusterId::LEN]);
-    ClusterId::from_bytes(bytes)
+fn run_import(args: ImportArgs) -> Result<(), CliError> {
+    let cluster = match args.cluster.as_deref() {
+        Some(text) => parse_cluster(text)?,
+        None => {
+            let master = load_master(args.key_file.as_deref())?;
+            namespace_id(&master)
+        }
+    };
+    let db_path = args
+        .db
+        .clone()
+        .unwrap_or_else(|| import_database_path(&args.namespace));
+    let options = crate::client::import::ImportOptions {
+        replace: args.replace,
+        seed: args.seed,
+    };
+    let report = crate::client::import::import_tree(&args.from, &db_path, cluster, options)
+        .map_err(|error| CliError::Startup(format!("import: {error}")))?;
+
+    println!(
+        "imported {} objects / {} entries ({} dirs, {} files, {} symlinks, {} hard links) \
+         and {} chunks / {} bytes into {}",
+        report.objects,
+        report.entries,
+        report.dirs,
+        report.files,
+        report.symlinks,
+        report.hardlinks,
+        report.chunks,
+        report.bytes,
+        db_path.display(),
+    );
+    if report.skipped > 0 {
+        println!("skipped {} reserved daemon names", report.skipped);
+    }
+    if report.seed_events > 0 {
+        println!(
+            "generated {} seed events; the client will upload them on its first connection",
+            report.seed_events
+        );
+    }
+    Ok(())
 }
 
-/// The one cluster identity every client uses.
-///
-/// `BLAKE3("sm/v1/cluster\0" ‖ "default")[0..16]`: no URL component enters
-/// the hash, so the key-derivation salt is fixed and the URL only chooses the
-/// connection target. The server still uses the URL path as its namespace.
-pub fn default_cluster() -> ClusterId {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(CLUSTER_DOMAIN);
-    hasher.update(b"default");
-    let digest = hasher.finalize();
-    let mut bytes = [0u8; ClusterId::LEN];
-    bytes.copy_from_slice(&digest.as_bytes()[..ClusterId::LEN]);
-    ClusterId::from_bytes(bytes)
+fn parse_cluster(text: &str) -> Result<[u8; 16], CliError> {
+    let bytes = hex::decode(text)
+        .map_err(|error| CliError::Usage(format!("invalid --cluster hex: {error}")))?;
+    let bytes: [u8; 16] = bytes
+        .try_into()
+        .map_err(|_| CliError::Usage("--cluster must be exactly 32 hex characters".to_owned()))?;
+    Ok(bytes)
 }
 
-#[cfg(feature = "fuse")]
-fn load_master(cluster: &ClusterId, key_file: Option<&Path>) -> Result<MasterKey, CliError> {
+/// `SYNCMOUNT_STATE_DIR` / XDG data directory + namespace, matching the
+/// client's own layout so `syncmount client` finds the imported database.
+fn import_database_path(namespace: &str) -> PathBuf {
+    if let Some(path) = std::env::var_os(crate::client::ENV_DB) {
+        return PathBuf::from(path);
+    }
+    let base = std::env::var_os(crate::client::ENV_STATE_DIR)
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("XDG_DATA_HOME").map(|value| PathBuf::from(value).join("syncmount"))
+        })
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .map(|value| PathBuf::from(value).join(".local/share/syncmount"))
+        })
+        .unwrap_or_else(|| PathBuf::from("/var/lib/syncmount"));
+    let trimmed = namespace.trim_matches('/');
+    let name = if trimmed.is_empty() {
+        "root".to_owned()
+    } else {
+        trimmed.replace('/', "_")
+    };
+    base.join(name).join("client.db")
+}
+
+/// `namespace_id = BLAKE3("sm/v2/namespace\0" || psk)[..16]`.
+///
+/// It guards a database against being opened with a different PSK. It is not
+/// an identity and never travels as one.
+fn namespace_id(master: &MasterKey) -> [u8; 16] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"sm/v2/namespace\0");
+    hasher.update(master.as_bytes());
+    let digest = hasher.finalize();
+    let mut id = [0u8; 16];
+    id.copy_from_slice(&digest.as_bytes()[..16]);
+    id
+}
+
+fn load_master(key_file: Option<&Path>) -> Result<MasterKey, CliError> {
     if let Some(path) = key_file {
         let password = read_password_file(path)?;
-        return MasterKey::derive_from_password(&password, cluster)
+        return MasterKey::derive_psk_from_password(&password, &PskSalt::DEFAULT)
             .map_err(|error| CliError::Startup(format!("master password: {error}")));
     }
 
@@ -563,10 +627,9 @@ fn load_master(cluster: &ClusterId, key_file: Option<&Path>) -> Result<MasterKey
         )));
     }
 
-    MasterKey::load(cluster).map_err(|error| CliError::Startup(format!("master password: {error}")))
+    MasterKey::load_psk().map_err(|error| CliError::Startup(format!("master password: {error}")))
 }
 
-#[cfg(feature = "fuse")]
 fn has_password_source() -> bool {
     if std::env::var_os(crate::client::config::ENV_MASTER_PASSWORD).is_some()
         || std::env::var_os(crate::client::config::ENV_MASTER_PASSWORD_FILE).is_some()
@@ -576,7 +639,6 @@ fn has_password_source() -> bool {
     std::io::stdin().is_terminal() || fs::OpenOptions::new().read(true).open("/dev/tty").is_ok()
 }
 
-#[cfg(feature = "fuse")]
 fn check_password_file(path: &Path) -> Result<(), CliError> {
     let metadata = fs::symlink_metadata(path).map_err(|error| {
         CliError::Startup(format!(
@@ -606,7 +668,6 @@ fn check_password_file(path: &Path) -> Result<(), CliError> {
     Ok(())
 }
 
-#[cfg(feature = "fuse")]
 fn read_password_file(path: &Path) -> Result<Zeroizing<Vec<u8>>, CliError> {
     check_password_file(path)?;
     let mut bytes = Zeroizing::new(fs::read(path).map_err(|error| {
@@ -688,12 +749,14 @@ fn run_server(args: ServerArgs) -> Result<(), CliError> {
         .map_err(|error| CliError::Usage(format!("invalid URL `{}`: {error}", args.url)))?;
 
     let listen = resolve_listen(args.listen.as_deref(), args.port)?;
+    let master = load_server_master(args.key_file.as_deref())?;
     let mut config = ServeConfig::new(listen);
     config.namespace = if endpoint.prefix.is_empty() {
         "/".to_owned()
     } else {
         endpoint.prefix.clone()
     };
+    config.db_path = args.db;
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -701,9 +764,9 @@ fn run_server(args: ServerArgs) -> Result<(), CliError> {
         .map_err(|error| CliError::Startup(format!("cannot start the async runtime: {error}")))?;
 
     runtime.block_on(async move {
-        let server = Server::bind(config.clone())
+        let server = Server::bind(config.clone(), master)
             .await
-            .map_err(|error| CliError::Startup(format!("cannot bind {listen}: {error}")))?;
+            .map_err(|error| CliError::Startup(format!("cannot start server on {listen}: {error}")))?;
         let addr = server.local_addr().map_err(|error| {
             CliError::Startup(format!("cannot read the listen address: {error}"))
         })?;
@@ -719,6 +782,29 @@ fn run_server(args: ServerArgs) -> Result<(), CliError> {
         tracing::info!(event = "stopped", "syncmount server stopped");
         Ok(())
     })
+}
+
+/// Load the server's PSK from the environment, a 0600 file, or a TTY.
+fn load_server_master(key_file: Option<&Path>) -> Result<MasterKey, CliError> {
+    if let Some(path) = key_file {
+        let password = read_password_file(path)?;
+        return MasterKey::derive_psk_from_password(&password, &PskSalt::DEFAULT)
+            .map_err(|error| CliError::Startup(format!("master password: {error}")));
+    }
+    if std::env::var_os(crate::client::config::ENV_MASTER_PASSWORD).is_none() {
+        if let Some(path) = std::env::var_os(crate::client::config::ENV_MASTER_PASSWORD_FILE) {
+            let path = PathBuf::from(path);
+            check_password_file(&path)?;
+        }
+    }
+    if !has_password_source() {
+        return Err(CliError::Startup(format!(
+            "no master password source: set {}, {} (mode 0600), or run on a terminal",
+            crate::client::config::ENV_MASTER_PASSWORD,
+            crate::client::config::ENV_MASTER_PASSWORD_FILE
+        )));
+    }
+    MasterKey::load_psk().map_err(|error| CliError::Startup(format!("master password: {error}")))
 }
 
 fn resolve_listen(listen: Option<&str>, port: Option<u16>) -> Result<SocketAddr, CliError> {
@@ -939,118 +1025,6 @@ fn run_seq_gaps(args: DebugArgs) -> Result<(), CliError> {
     Ok(())
 }
 
-fn run_manifest_diff(args: ManifestDiffArgs) -> Result<(), CliError> {
-    let cluster = match (args.cluster.as_deref(), args.url.as_deref()) {
-        (Some(text), _) => parse_cluster_hex(text)?,
-        (None, Some(url)) => {
-            let endpoint = ClientEndpoint::parse(url)
-                .map_err(|error| CliError::Usage(format!("invalid URL `{url}`: {error}")))?;
-            cluster_for(&endpoint)
-        }
-        (None, None) => {
-            return Err(CliError::Usage(
-                "debug-manifest-diff needs --url URL or --cluster HEX to identify the cluster"
-                    .to_owned(),
-            ));
-        }
-    };
-
-    let left = load_manifest(&args.mountpoint, cluster)?;
-    if let Some(other) = &args.other {
-        let right = load_manifest(other, cluster)?;
-        print_manifest_diff(&left, &right);
-    } else {
-        println!(
-            "{}: entries={} at_seq={} epoch={} cluster={}",
-            args.mountpoint.display(),
-            left.manifest.len(),
-            left.at_seq.get(),
-            left.epoch,
-            left.cluster_id
-        );
-    }
-    Ok(())
-}
-
-fn parse_cluster_hex(text: &str) -> Result<ClusterId, CliError> {
-    let bytes = hex::decode(text)
-        .map_err(|error| CliError::Usage(format!("invalid --cluster `{text}`: {error}")))?;
-    let bytes: [u8; ClusterId::LEN] = bytes.try_into().map_err(|_| {
-        CliError::Usage(format!(
-            "invalid --cluster `{text}`: require {} hex characters",
-            ClusterId::LEN * 2
-        ))
-    })?;
-    Ok(ClusterId::from_bytes(bytes))
-}
-
-fn load_manifest(mountpoint: &Path, cluster: ClusterId) -> Result<LocalManifest, CliError> {
-    let root = RootFd::open_before_mount(mountpoint).map_err(|error| {
-        CliError::Startup(format!("cannot open {}: {error}", mountpoint.display()))
-    })?;
-    LocalManifest::load(&root, cluster).ok_or_else(|| {
-        CliError::Unavailable(format!(
-            "no local manifest cache at {} for cluster {cluster}; the client writes it after a JOIN",
-            mountpoint.display()
-        ))
-    })
-}
-
-fn print_manifest_diff(left: &LocalManifest, right: &LocalManifest) {
-    use std::collections::BTreeMap;
-
-    let left_entries: BTreeMap<&str, _> = left
-        .manifest
-        .entries()
-        .iter()
-        .map(|entry| (entry.path.as_str(), entry))
-        .collect();
-    let right_entries: BTreeMap<&str, _> = right
-        .manifest
-        .entries()
-        .iter()
-        .map(|entry| (entry.path.as_str(), entry))
-        .collect();
-
-    let mut added = Vec::new();
-    let mut removed = Vec::new();
-    let mut changed = Vec::new();
-    for (path, entry) in &right_entries {
-        match left_entries.get(*path) {
-            None => added.push(*path),
-            Some(old) if *old != *entry => changed.push(*path),
-            Some(_) => {}
-        }
-    }
-    for path in left_entries.keys() {
-        if !right_entries.contains_key(*path) {
-            removed.push(*path);
-        }
-    }
-
-    println!(
-        "added={} removed={} changed={} (left at_seq={} right at_seq={})",
-        added.len(),
-        removed.len(),
-        changed.len(),
-        left.at_seq.get(),
-        right.at_seq.get()
-    );
-    print_paths("added", &added);
-    print_paths("removed", &removed);
-    print_paths("changed", &changed);
-}
-
-fn print_paths(label: &str, paths: &[&str]) {
-    const LIMIT: usize = 20;
-    for path in paths.iter().take(LIMIT) {
-        println!("{label}\t{path}");
-    }
-    if paths.len() > LIMIT {
-        println!("{label}\t… {} more", paths.len() - LIMIT);
-    }
-}
-
 fn read_instances(filter: Option<&str>) -> Result<Vec<Instance>, CliError> {
     let base = base_dir();
     let entries = match fs::read_dir(&base) {
@@ -1181,43 +1155,6 @@ mod tests {
         assert_eq!(args[1], "status");
     }
 
-    #[test]
-    fn u_legacy_cluster_id_is_stable_and_url_scoped() {
-        let first = ClientEndpoint::parse("http://127.0.0.1:8080/sync").unwrap();
-        let same = ClientEndpoint::parse("http://127.0.0.1:8080/sync").unwrap();
-        let other = ClientEndpoint::parse("http://127.0.0.1:8080/other").unwrap();
-        assert_eq!(cluster_for(&first), cluster_for(&same));
-        assert_ne!(cluster_for(&first), cluster_for(&other));
-    }
-
-    /// Every client uses one fixed id: no URL component enters the hash, so
-    /// scheme, host, port, and prefix only pick the connection target. The
-    /// value is pinned because any change would silently move every existing
-    /// cluster to a new identity.
-    #[test]
-    fn u_default_cluster_is_fixed_and_url_independent() {
-        assert_eq!(
-            default_cluster().to_string(),
-            "60ce80b3c33bdf8b763af7464ad131da"
-        );
-        let plain = ClientEndpoint::parse("http://127.0.0.1:8080/sync").unwrap();
-        let tls = ClientEndpoint::parse("https://edge.example:8443/other").unwrap();
-        // The legacy derivation still tracks the URL, which is why the client
-        // no longer uses it.
-        assert_ne!(cluster_for(&plain), cluster_for(&tls));
-        assert_ne!(default_cluster(), cluster_for(&plain));
-    }
-
-    /// The URL-derived id survives only for `debug-manifest-diff --url`,
-    /// which reads caches written before the fixed-identity cutover.
-    #[test]
-    fn u_legacy_cluster_for_is_pinned() {
-        let endpoint = ClientEndpoint::parse("http://127.0.0.1:8080/sync").unwrap();
-        assert_eq!(
-            cluster_for(&endpoint).to_string(),
-            "208d2aa1f256c95fcfa7e455337b46dc"
-        );
-    }
 
     #[test]
     fn u_cluster_name_flag_is_rejected() {

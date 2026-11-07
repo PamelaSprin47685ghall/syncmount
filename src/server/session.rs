@@ -1,44 +1,60 @@
-//! Per-connection tasks: uplink reader, downlink writer, handshake pairing.
+//! Per-connection tasks: PSK handshake, uplink reader, downlink writer, replay.
 //!
-//! One session is two independent HTTP requests (42 §7). This module owns the
-//! four tasks that make them one logical session:
+//! One session is two independent HTTP requests. This module owns the
+//! connection state machine:
 //!
 //! ```text
-//! rpc    read body → FrameDecoder → SeqCmd::{Ordered,Watermark,Leave,...}
-//! events park the downlink under X-SM-Nonce (the actor binds it)
-//! writer select ctrl first, then data; KICK is deferred until data drains
-//! detach one SeqCmd::Detach, exactly once, from the uplink task
+//! rpc     HELLO(plain) -> WELCOME(plain+proof) -> AUTH(sealed) -> ACCEPT(sealed)
+//!         then ORDERED/PING/LEAVE/RELAY frames sealed under the PSK enc key
+//! events  park under X-SM-Nonce; the handshake writes WELCOME/ACCEPT through it
+//! writer  control first, then data; KICK is deferred until data drains
+//! replay  reads events from SQLite and pushes them before live broadcasts
 //! ```
 //!
-//! No task reads `enc_body`: a `FrameBuf` is moved, never inspected. The only
-//! header field the server touches is `seq` (42 I4/I6).
+//! An unauthenticated connection never enters the online table. `client_id`
+//! is decoded because the wire still carries it, but it is never trusted:
+//! routing and broadcast identity are the server-assigned `SessionId`.
 
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use hyper::body::Incoming;
 use tokio::sync::{mpsc, oneshot};
 
-use crate::protocol::{
-    ClientId, ErrorMessage, FrameBuf, FrameDecoder, HEADER_LEN, MAGIC, Message, MsgType, Prefix,
-    PrefixKind, ProtoVersion, Seq, TrnReason, decode_plain, negotiate,
+use crate::crypto::secret::MasterKey;
+use crate::protocol::crypto::{NonceMinter, Opener, PskSalt, Sealer};
+use crate::protocol::handshake::{HelloInput, NonceReplayGuard, ServerHandshake};
+use crate::protocol::messages::{
+    Message, Pong, WcpWriter, WelcomeLimits, decode_plain, decode_sealed,
 };
+use crate::protocol::{
+    ErrorMessage, Flags, FrameBuf, FrameDecoder, FrameHeader, FrameRef, MsgType, Prefix,
+    PrefixKind, RoutePrefix, Seq, SessionId, StreamId, TrnReason, encode_frame,
+};
+use crate::store::sqlite::EventPayload;
 use crate::transport::{AcceptedHttp, BodyStream, MpscSender, PeerId};
 
 use super::config::ServeConfig;
 use super::online::{Outbox, QueueStats};
 use super::sequencer::{
-    DetachCause, HelloReply, HelloRequest, Sequencer, WatermarkReport, encode_control, server_caps,
+    AttachRequest, DetachCause, ReplayStep, Sequencer, WatermarkReport, encode_control, now_secs,
+    server_caps, wall_clock_us,
 };
+use super::wire::WireOp;
 
 /// Shared handles for every connection task.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub(crate) struct SessionContext {
     /// Actor handle.
     pub sequencer: Sequencer,
     /// Server configuration.
     pub config: Arc<ServeConfig>,
+    /// Master key; per-connection rings are derived from it (HKDF only).
+    pub master: Arc<MasterKey>,
+    /// Server-wide HELLO nonce replay window.
+    pub guard: Arc<tokio::sync::Mutex<NonceReplayGuard>>,
 }
 
 /// Spawn the task that owns one accepted HTTP half.
@@ -47,11 +63,11 @@ pub(crate) fn spawn(accepted: AcceptedHttp, context: SessionContext) {
         AcceptedHttp::Rpc {
             peer,
             nonce,
-            client_id,
             body,
             end,
+            ..
         } => {
-            tokio::spawn(run_rpc(context, peer, nonce, client_id, body, end));
+            tokio::spawn(run_rpc(context, peer, nonce, body, end));
         }
         AcceptedHttp::Events { nonce, out, .. } => {
             tokio::spawn(run_events(context, nonce, out));
@@ -60,17 +76,7 @@ pub(crate) fn spawn(accepted: AcceptedHttp, context: SessionContext) {
 }
 
 async fn run_events(context: SessionContext, nonce: u64, out: MpscSender) {
-    // The actor keeps `out`; this task has nothing left to own. A rejection
-    // drops `out`, which closes the HTTP response body.
     let _ = context.sequencer.events(nonce, out).await;
-}
-
-/// What the uplink task learned about the session.
-struct RpcSession {
-    client_id: ClientId,
-    generation: u64,
-    ctrl_tx: mpsc::Sender<Bytes>,
-    detach: DetachCause,
 }
 
 /// Whether the reader loop continues.
@@ -79,19 +85,153 @@ enum Flow {
     Close,
 }
 
+/// One authenticated, attached session.
+struct RpcSession {
+    session_id: SessionId,
+    generation: u64,
+    ctrl_tx: mpsc::Sender<Bytes>,
+    detach: DetachCause,
+    /// Steady-state PSK ring, derived once after `ACCEPT`.
+    ring: Arc<crate::protocol::crypto::PskKeyRing>,
+    streams: HashMap<(SessionId, StreamId), DataStream>,
+    assembled: HashMap<SessionId, Vec<u8>>,
+}
+
+/// Server-side reassembly of one `OP_DATA` stream.
+///
+/// The protocol [`crate::protocol::fragment::Reassembler`] holds a
+/// `Box<dyn ChunkSink>`, which is not `Send`; a connection task must be
+/// `Send`, so the server keeps this small ordered buffer instead. The wire
+/// invariants are the same: `index < total`, every non-final fragment is
+/// exactly 64 KiB, duplicates are dropped, and completion is exactly once.
+struct DataStream {
+    total: u32,
+    next: u32,
+    received: u32,
+    reorder: BTreeMap<u32, Vec<u8>>,
+    buffer: Vec<u8>,
+}
+
+/// Largest assembled `OP_DATA` stream the server buffers.
+const MAX_CONTENT_BYTES: usize = 64 << 20;
+
+/// Largest out-of-order window for one stream, matching the protocol layer.
+const MAX_REORDER_CHUNKS: usize = 8;
+
+impl DataStream {
+    fn new(total: u32) -> Option<Self> {
+        (total > 0).then_some(Self {
+            total,
+            next: 0,
+            received: 0,
+            reorder: BTreeMap::new(),
+            buffer: Vec::new(),
+        })
+    }
+
+    /// Returns `Ok(true)` when this fragment completed the stream.
+    fn push(&mut self, index: u32, total: u32, data: &[u8]) -> Result<bool, ()> {
+        if total != self.total || index >= self.total {
+            return Err(());
+        }
+        if data.len() > crate::protocol::CHUNK_PLAIN {
+            return Err(());
+        }
+        if index + 1 < self.total && data.len() != crate::protocol::CHUNK_PLAIN {
+            return Err(());
+        }
+        if index < self.next || self.reorder.contains_key(&index) {
+            return Ok(false);
+        }
+        if self.buffer.len().saturating_add(data.len()) > MAX_CONTENT_BYTES {
+            return Err(());
+        }
+        if index == self.next {
+            self.buffer.extend_from_slice(data);
+            self.next += 1;
+            self.received += 1;
+            while let Some(chunk) = self.reorder.remove(&self.next) {
+                self.buffer.extend_from_slice(&chunk);
+                self.next += 1;
+            }
+        } else {
+            if self.reorder.len() >= MAX_REORDER_CHUNKS {
+                return Err(());
+            }
+            self.reorder.insert(index, data.to_vec());
+            self.received += 1;
+        }
+        Ok(self.received == self.total && self.next == self.total)
+    }
+}
+
+/// Uplink state before the session is attached.
+enum Phase {
+    Hello,
+    Auth {
+        handshake: Box<ServerHandshake>,
+        downlink: Option<MpscSender>,
+        session_id: SessionId,
+        epoch_seen: u64,
+        applied_seq: Seq,
+        deadline: Instant,
+    },
+    Steady(RpcSession),
+}
+
 async fn run_rpc(
     context: SessionContext,
     peer: PeerId,
     nonce: u64,
-    claimed: Option<[u8; 16]>,
     mut body: BodyStream<Incoming>,
     end: oneshot::Sender<()>,
 ) {
     let mut decoder = FrameDecoder::new(context.config.limits);
-    let mut session: Option<RpcSession> = None;
+    let mut phase = Phase::Hello;
     let mut writer_closed: Option<oneshot::Receiver<()>> = None;
 
     'session: loop {
+        if let Phase::Auth { deadline, .. } = &phase {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                break 'session;
+            }
+            match tokio::time::timeout(left, body.next_bytes()).await {
+                Ok(Ok(Some(chunk))) => {
+                    if let Err(error) = decoder.push(&chunk) {
+                        let reason = error.to_wire().unwrap_or(TrnReason::BadFrame);
+                        send_error(&phase, reason, &[]);
+                        break 'session;
+                    }
+                    loop {
+                        match decoder.next_frame_owned() {
+                            Ok(Some(frame)) => match advance(
+                                &context,
+                                &mut phase,
+                                &mut writer_closed,
+                                peer,
+                                nonce,
+                                frame,
+                            )
+                            .await
+                            {
+                                Ok(Flow::Continue) => {}
+                                Ok(Flow::Close) => break 'session,
+                                Err(()) => break 'session,
+                            },
+                            Ok(None) => break,
+                            Err(error) => {
+                                let reason = error.to_wire().unwrap_or(TrnReason::BadFrame);
+                                send_error(&phase, reason, &[]);
+                                break 'session;
+                            }
+                        }
+                    }
+                    continue;
+                }
+                Ok(Ok(None)) | Ok(Err(_)) | Err(_) => break 'session,
+            }
+        }
         let next = match writer_closed.as_mut() {
             Some(closed) => {
                 tokio::select! {
@@ -106,31 +246,31 @@ async fn run_rpc(
             Ok(Some(chunk)) => {
                 if let Err(error) = decoder.push(&chunk) {
                     let reason = error.to_wire().unwrap_or(TrnReason::BadFrame);
-                    send_error(session.as_ref(), reason);
+                    send_error(&phase, reason, &[]);
                     break 'session;
                 }
                 loop {
                     match decoder.next_frame_owned() {
                         Ok(Some(frame)) => {
-                            if session.is_none() {
-                                match start_session(&context, peer, nonce, claimed, frame).await {
-                                    Ok((established, closed)) => {
-                                        session = Some(established);
-                                        writer_closed = Some(closed);
-                                    }
-                                    Err(_) => break 'session,
-                                }
-                            } else if let Some(active) = session.as_mut() {
-                                match handle_frame(&context, active, frame).await {
-                                    Flow::Continue => {}
-                                    Flow::Close => break 'session,
-                                }
+                            match advance(
+                                &context,
+                                &mut phase,
+                                &mut writer_closed,
+                                peer,
+                                nonce,
+                                frame,
+                            )
+                            .await
+                            {
+                                Ok(Flow::Continue) => {}
+                                Ok(Flow::Close) => break 'session,
+                                Err(()) => break 'session,
                             }
                         }
                         Ok(None) => break,
                         Err(error) => {
                             let reason = error.to_wire().unwrap_or(TrnReason::BadFrame);
-                            send_error(session.as_ref(), reason);
+                            send_error(&phase, reason, &[]);
                             break 'session;
                         }
                     }
@@ -141,204 +281,503 @@ async fn run_rpc(
         }
     }
 
-    if let Some(active) = session {
+    if let Phase::Steady(session) = phase {
         let _ = context
             .sequencer
-            .detach(active.client_id, active.generation, active.detach)
+            .detach(session.session_id, session.generation, session.detach)
             .await;
     }
     let _ = end.send(());
 }
 
-/// Why the uplink could not be established.
-#[derive(Debug)]
-enum StartError {
-    Protocol,
-    Version,
-    Rejected,
-    NoDownlink,
-}
-
-async fn start_session(
+async fn advance(
     context: &SessionContext,
+    phase: &mut Phase,
+    writer_closed: &mut Option<oneshot::Receiver<()>>,
     peer: PeerId,
     nonce: u64,
-    claimed: Option<[u8; 16]>,
     frame: FrameBuf,
-) -> Result<(RpcSession, oneshot::Receiver<()>), StartError> {
-    if frame.header.msg_type != MsgType::HELLO || frame.header.seq != Seq::UNSEQUENCED {
-        return Err(StartError::Protocol);
+) -> Result<Flow, ()> {
+    match phase {
+        Phase::Hello => start_hello(context, phase, peer, nonce, frame).await,
+        Phase::Auth {
+            handshake,
+            downlink,
+            session_id,
+            epoch_seen,
+            applied_seq,
+            deadline: _,
+        } => {
+            let epoch_seen = *epoch_seen;
+            let applied_seq = *applied_seq;
+            let session_id = *session_id;
+            let downlink = downlink.take().ok_or(())?;
+            let now_ms = now_millis();
+            let accepted = match handshake.open_auth(&frame.header, &frame.body, now_ms) {
+                Ok(accepted) => accepted,
+                Err(_) => return Err(()),
+            };
+            let mut accept_header =
+                FrameHeader::new(MsgType::ACCEPT, Flags::ENC, 0, Seq::UNSEQUENCED);
+            let nonces = NonceMinter::new(&mut rand::rng());
+            let sealed = accepted
+                .keys
+                .seal(
+                    &mut accept_header,
+                    &Prefix::None,
+                    &accepted.accept.encode(),
+                    &nonces,
+                )
+                .map_err(|_| ())?;
+            let accept = encode_frame(&FrameRef::new(
+                &accept_header,
+                &Prefix::None,
+                sealed.as_bytes(),
+            ))
+            .map_err(|_| ())?;
+            if downlink.send(Bytes::from(accept)).await.is_err() {
+                return Err(());
+            }
+
+            let (outbox, data, ctrl) = Outbox::new(&context.config.outbox);
+            let request = AttachRequest {
+                session_id,
+                nonce,
+                peer,
+                outbox,
+                epoch_seen,
+                applied_seq,
+            };
+            let reply = match context.sequencer.attach(request).await {
+                Ok(reply) => reply,
+                Err(_) => return Err(()),
+            };
+            let (closed_tx, closed_rx) = oneshot::channel();
+            tokio::spawn(run_writer(
+                downlink,
+                data,
+                ctrl,
+                Arc::clone(&reply.queued),
+                closed_tx,
+            ));
+            if reply.replay_from <= reply.current_seq {
+                tokio::spawn(run_replay(
+                    context.clone(),
+                    session_id,
+                    reply.generation,
+                    reply.replay_from,
+                    reply.current_seq,
+                    reply.replay_tx.clone(),
+                ));
+            }
+            *writer_closed = Some(closed_rx);
+            let ring = Arc::new(
+                context
+                    .master
+                    .derive_psk_keyring(&PskSalt::DEFAULT)
+                    .map_err(|_| ())?,
+            );
+            *phase = Phase::Steady(RpcSession {
+                session_id,
+                generation: reply.generation,
+                ctrl_tx: reply.ctrl_tx,
+                detach: DetachCause::Disconnected,
+                ring,
+                streams: HashMap::new(),
+                assembled: HashMap::new(),
+            });
+            Ok(Flow::Continue)
+        }
+        Phase::Steady(session) => handle_frame(context, session, frame).await,
     }
-    let ctrl = frame.prefix.as_ctrl().ok_or(StartError::Protocol)?;
-    ctrl.validate().map_err(|_| StartError::Protocol)?;
-    let Message::Hello(hello) = decode_plain(MsgType::HELLO, &frame.body, &context.config.limits)
-        .map_err(|_| StartError::Protocol)?
-    else {
-        return Err(StartError::Protocol);
+}
+
+async fn start_hello(
+    context: &SessionContext,
+    phase: &mut Phase,
+    _peer: PeerId,
+    nonce: u64,
+    frame: FrameBuf,
+) -> Result<Flow, ()> {
+    if frame.header.msg_type != MsgType::HELLO || frame.header.seq != Seq::UNSEQUENCED {
+        return Err(());
+    }
+    let Some(ctrl) = frame.prefix.as_ctrl() else {
+        return Err(());
     };
-    let _ = negotiate(
-        ProtoVersion::CURRENT,
-        hello.proto,
-        server_caps(),
-        hello.caps,
-    )
-    .map_err(|_| StartError::Version)?;
-    // The HTTP header is a declaration, never a credential. When present it
-    // must agree with the plaintext HELLO, or the two halves disagree about
-    // who is joining.
-    if let Some(claimed) = claimed {
-        if ClientId::from_bytes(claimed) != hello.client_id {
-            return Err(StartError::Protocol);
+    if ctrl.validate().is_err() {
+        return Err(());
+    }
+    let hello = match decode_plain(MsgType::HELLO, &frame.body, &context.config.limits) {
+        Ok(Message::Hello(hello)) => hello,
+        _ => return Err(()),
+    };
+    let now_ms = now_millis();
+    {
+        let mut guard = context.guard.lock().await;
+        if guard.check_and_record(hello.client_nonce, now_ms).is_err() {
+            return Err(());
         }
     }
-
-    let (outbox, data, ctrl_rx) = Outbox::new(&context.config.outbox);
-    let request = HelloRequest {
-        nonce,
-        client_id: hello.client_id,
-        epoch_seen: ctrl.epoch_seen,
-        applied_seq: ctrl.applied_seq,
-        peer,
-        outbox,
-        data,
-        ctrl: ctrl_rx,
+    let ring = context
+        .master
+        .derive_psk_keyring(&PskSalt::DEFAULT)
+        .map_err(|_| ())?;
+    let epoch = context.sequencer.epoch().get();
+    let current_seq = context.sequencer.current_seq();
+    let limits = WelcomeLimits {
+        max_frame: context.config.limits.effective_cap(),
+        credit_bytes: context.config.welcome.credit_bytes,
+        session_ttl_s: context.config.welcome.session_ttl_s,
+        max_sessions: context.config.welcome.max_sessions,
     };
-    let mut reply = context
-        .sequencer
-        .hello_with_caps(request, hello.caps)
-        .await
-        .map_err(|_| StartError::Rejected)?;
-    let generation = reply.generation;
-    let events = match reply.events.take() {
-        Some(out) => out,
-        None => {
-            let wait = reply.wait.take().ok_or(StartError::Protocol)?;
+    let mut handshake = ServerHandshake::new(ring, epoch, current_seq, limits, server_caps());
+
+    let session_id = random_session_id();
+    let server_nonce = random_32();
+    let proof_nonce = random_12();
+    let input = HelloInput {
+        session_id,
+        server_nonce,
+        proof_nonce,
+        server_time: now_secs().max(0) as u64,
+        resync: if ctrl.epoch_seen != epoch || ctrl.applied_seq > current_seq {
+            crate::protocol::ResyncMode::Full
+        } else {
+            crate::protocol::ResyncMode::None
+        },
+    };
+    let reply = match handshake.on_hello(&hello, input, now_ms) {
+        Ok(reply) => reply,
+        Err(_) => return Err(()),
+    };
+
+    let pair = match context.sequencer.pair(nonce).await {
+        Ok(pair) => pair,
+        Err(_) => return Err(()),
+    };
+    let downlink = match (pair.events, pair.wait) {
+        (Some(out), _) => out,
+        (None, Some(wait)) => {
             match tokio::time::timeout(context.config.hello_timeout, wait).await {
                 Ok(Ok(out)) => out,
                 _ => {
-                    // The actor already attached this session. Without this
-                    // detach it would sit in `AwaitingDownstream` forever.
-                    let _ = context
+                    context.sequencer.cancel_pair(nonce).await;
+                    return Err(());
+                }
+            }
+        }
+        (None, None) => return Err(()),
+    };
+    let welcome = encode_control(
+        MsgType::WELCOME,
+        Prefix::None,
+        &reply.body,
+        Seq::UNSEQUENCED,
+    )
+    .map_err(|_| ())?;
+    if downlink.send(welcome).await.is_err() {
+        return Err(());
+    }
+    *phase = Phase::Auth {
+        handshake: Box::new(handshake),
+        downlink: Some(downlink),
+        session_id,
+        epoch_seen: ctrl.epoch_seen,
+        applied_seq: ctrl.applied_seq,
+        deadline: Instant::now()
+            + std::time::Duration::from_millis(crate::protocol::handshake::AUTH_TIMEOUT_MS),
+    };
+    Ok(Flow::Continue)
+}
+
+async fn handle_frame(
+    context: &SessionContext,
+    session: &mut RpcSession,
+    frame: FrameBuf,
+) -> Result<Flow, ()> {
+    if frame.header.seq != Seq::UNSEQUENCED {
+        send_error_steady(session, TrnReason::Protocol);
+        session.detach = DetachCause::Protocol;
+        return Ok(Flow::Close);
+    }
+    let msg_type = frame.header.msg_type;
+    match msg_type {
+        MsgType::ORDERED => {
+            if frame.prefix.kind() != PrefixKind::None {
+                return protocol_close(session);
+            }
+            match decode_ordered(context, session, &frame).await {
+                Ok(Some(wire_op)) => {
+                    if wire_op.class.is_leave() {
+                        let wire =
+                            encode_frame(&FrameRef::new(&frame.header, &frame.prefix, &frame.body))
+                                .map_err(|_| ())?;
+                        let _ = context.sequencer.leave(session.session_id, wire).await;
+                        session.detach = DetachCause::ClientLeft;
+                        return Ok(Flow::Close);
+                    }
+                    let content = match wire_op.data {
+                        Some(data) => match session.assembled.remove(&data.session) {
+                            Some(bytes) => {
+                                if bytes.len() as u64 != data.total_len
+                                    || blake3::hash(&bytes).as_bytes() != &data.data_hash
+                                {
+                                    send_error_steady(session, TrnReason::BadFrame);
+                                    session.detach = DetachCause::Protocol;
+                                    return Ok(Flow::Close);
+                                }
+                                Some(bytes)
+                            }
+                            None => {
+                                send_error_detail_steady(
+                                    session,
+                                    TrnReason::Protocol,
+                                    b"data stream missing",
+                                );
+                                return Ok(Flow::Continue);
+                            }
+                        },
+                        None => None,
+                    };
+                    let wire =
+                        encode_frame(&FrameRef::new(&frame.header, &frame.prefix, &frame.body))
+                            .map_err(|_| ())?;
+                    let request = super::store::CommitRequest {
+                        session: session.session_id.to_le_bytes(),
+                        op: wire_op,
+                        content,
+                        wire,
+                        created_at: now_secs(),
+                    };
+                    if context
                         .sequencer
-                        .detach(hello.client_id, generation, DetachCause::Disconnected)
-                        .await;
-                    return Err(StartError::NoDownlink);
+                        .ordered(session.session_id, request)
+                        .await
+                        .is_err()
+                    {
+                        return Ok(Flow::Close);
+                    }
+                    Ok(Flow::Continue)
+                }
+                Ok(None) => Ok(Flow::Continue),
+                Err(()) => protocol_close(session),
+            }
+        }
+        MsgType::PING => {
+            let Some(ctrl) = frame.prefix.as_ctrl() else {
+                return protocol_close(session);
+            };
+            if ctrl.validate().is_err() {
+                return protocol_close(session);
+            }
+            let plain = match open_steady(session, &frame) {
+                Ok(plain) => plain,
+                Err(()) => {
+                    send_error_steady(session, TrnReason::BadFrame);
+                    session.detach = DetachCause::Protocol;
+                    return Ok(Flow::Close);
+                }
+            };
+            let ping = match decode_sealed(MsgType::PING, plain.as_slice(), &context.config.limits)
+            {
+                Ok(Message::Ping(ping)) => ping,
+                _ => return protocol_close(session),
+            };
+            let _ = ping;
+            let report = WatermarkReport {
+                session: session.session_id,
+                applied_seq: ctrl.applied_seq,
+                epoch_seen: ctrl.epoch_seen,
+                rtt_ms: None,
+                at: Instant::now(),
+            };
+            let _ = context.sequencer.watermark(report).await;
+            if let Some(pong) = encode_pong(session, wall_clock_us()) {
+                let _ = session.ctrl_tx.try_send(pong);
+            }
+            Ok(Flow::Continue)
+        }
+        MsgType::LEAVE => {
+            if frame.prefix.kind() != PrefixKind::None {
+                return protocol_close(session);
+            }
+            let wire = encode_frame(&FrameRef::new(&frame.header, &frame.prefix, &frame.body))
+                .map_err(|_| ())?;
+            let _ = context.sequencer.leave(session.session_id, wire).await;
+            session.detach = DetachCause::ClientLeft;
+            Ok(Flow::Close)
+        }
+        MsgType::ACK | MsgType::RESPONSE => {
+            let _ = context.sequencer.seen(session.session_id).await;
+            Ok(Flow::Continue)
+        }
+        MsgType::RELAY | MsgType::FLOW | MsgType::SYNC_END | MsgType::STREAM_DATA => {
+            if frame.prefix.kind() != PrefixKind::Route {
+                return protocol_close(session);
+            }
+            let Some(prefix) = frame.prefix.as_route().copied() else {
+                return protocol_close(session);
+            };
+            if msg_type == MsgType::STREAM_DATA && prefix.stream == StreamId::OP_DATA {
+                return handle_stream_data(context, session, &frame, prefix).await;
+            }
+            // The `RELAY{CTRL}` open and `SYNC_END` that bracket an OP_DATA
+            // stream are local to the content path; forwarding the close to
+            // the relay hub would answer with `SessionUnknown`.
+            let content_session = session.assembled.contains_key(&prefix.session_id)
+                || session
+                    .streams
+                    .keys()
+                    .any(|(id, _)| *id == prefix.session_id);
+            if content_session {
+                return Ok(Flow::Continue);
+            }
+            if msg_type == MsgType::RELAY
+                && prefix.stream == StreamId::CTRL
+                && prefix.total_chunks == 0
+            {
+                // Opening a relay session for OP_DATA is handled locally;
+                // other streams still go through the relay hub.
+                if let Ok(plain) = open_steady(session, &frame) {
+                    if plain.is_empty() {
+                        return Ok(Flow::Continue);
+                    }
+                }
+            }
+            if context
+                .sequencer
+                .relay(session.session_id, frame)
+                .await
+                .is_err()
+            {
+                return Ok(Flow::Close);
+            }
+            Ok(Flow::Continue)
+        }
+        _ => protocol_close(session),
+    }
+}
+
+async fn decode_ordered(
+    context: &SessionContext,
+    session: &mut RpcSession,
+    frame: &FrameBuf,
+) -> Result<Option<WireOp>, ()> {
+    let plain = open_steady(session, frame).map_err(|_| {
+        send_error_steady(session, TrnReason::BadFrame);
+        session.detach = DetachCause::Protocol;
+    })?;
+    let ordered = match decode_sealed(MsgType::ORDERED, plain.as_slice(), &context.config.limits) {
+        Ok(Message::Ordered(ordered)) => ordered,
+        _ => return Err(()),
+    };
+    match WireOp::from_ordered(&ordered) {
+        Ok(op) => Ok(Some(op)),
+        Err(reject) => {
+            let op_id = ordered.op_id.to_bytes();
+            let detail = super::wire::reject_body(op_id, reject);
+            send_error_detail_steady(session, TrnReason::Protocol, &detail);
+            Ok(None)
+        }
+    }
+}
+
+async fn handle_stream_data(
+    context: &SessionContext,
+    session: &mut RpcSession,
+    frame: &FrameBuf,
+    prefix: RoutePrefix,
+) -> Result<Flow, ()> {
+    let plain = open_steady(session, frame).map_err(|_| {
+        send_error_steady(session, TrnReason::BadFrame);
+        session.detach = DetachCause::Protocol;
+    })?;
+    let key = (prefix.session_id, prefix.stream);
+    let entry = match session.streams.entry(key) {
+        std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+        std::collections::hash_map::Entry::Vacant(entry) => {
+            match DataStream::new(prefix.total_chunks) {
+                Some(stream) => entry.insert(stream),
+                None => {
+                    send_error_steady(session, TrnReason::BadFrame);
+                    session.detach = DetachCause::Protocol;
+                    return Ok(Flow::Close);
                 }
             }
         }
     };
-    let client_id = reply.client_id;
-    let HelloReply {
-        data,
-        ctrl,
-        ctrl_tx,
-        queued,
-        ..
-    } = reply;
-    let (closed_tx, closed_rx) = oneshot::channel();
-    tokio::spawn(run_writer(events, data, ctrl, queued, closed_tx));
-    Ok((
-        RpcSession {
-            client_id,
-            generation,
-            ctrl_tx,
-            detach: DetachCause::Disconnected,
-        },
-        closed_rx,
-    ))
+    match entry.push(prefix.chunk_index, prefix.total_chunks, plain.as_slice()) {
+        Ok(false) => {
+            // Live readers need the same fragment; the actor fans out the
+            // original sealed bytes to every Online session except the author.
+            let _ = context
+                .sequencer
+                .relay(session.session_id, frame.clone())
+                .await;
+            Ok(Flow::Continue)
+        }
+        Ok(true) => {
+            let data = std::mem::take(&mut entry.buffer);
+            session.assembled.insert(prefix.session_id, data);
+            session.streams.remove(&key);
+            let _ = context
+                .sequencer
+                .relay(session.session_id, frame.clone())
+                .await;
+            Ok(Flow::Continue)
+        }
+        Err(()) => {
+            session.streams.remove(&key);
+            send_error_steady(session, TrnReason::BadFrame);
+            session.detach = DetachCause::Protocol;
+            Ok(Flow::Close)
+        }
+    }
 }
 
-async fn handle_frame(context: &SessionContext, session: &mut RpcSession, frame: FrameBuf) -> Flow {
-    if frame.header.seq != Seq::UNSEQUENCED {
-        send_error(Some(session), TrnReason::Protocol);
-        session.detach = DetachCause::Protocol;
-        return Flow::Close;
-    }
-    let msg_type = frame.header.msg_type;
-    if msg_type == MsgType::ORDERED {
-        if frame.prefix.kind() != PrefixKind::None {
-            send_error(Some(session), TrnReason::Protocol);
-            session.detach = DetachCause::Protocol;
-            return Flow::Close;
-        }
-        return match context.sequencer.ordered(session.client_id, frame).await {
-            Ok(()) => Flow::Continue,
-            Err(_) => Flow::Close,
-        };
-    }
-    if msg_type == MsgType::PING {
-        let Some(ctrl) = frame.prefix.as_ctrl() else {
-            send_error(Some(session), TrnReason::Protocol);
-            session.detach = DetachCause::Protocol;
-            return Flow::Close;
-        };
-        if ctrl.validate().is_err() {
-            send_error(Some(session), TrnReason::Protocol);
-            session.detach = DetachCause::Protocol;
-            return Flow::Close;
-        }
-        let report = WatermarkReport {
-            client: session.client_id,
-            applied_seq: ctrl.applied_seq,
-            epoch_seen: ctrl.epoch_seen,
-            rtt_ms: None,
-            at: Instant::now(),
-        };
-        return match context.sequencer.watermark(report).await {
-            Ok(()) => Flow::Continue,
-            Err(_) => Flow::Close,
-        };
-    }
-    if msg_type == MsgType::LEAVE {
-        if frame.prefix.kind() != PrefixKind::None {
-            send_error(Some(session), TrnReason::Protocol);
-            session.detach = DetachCause::Protocol;
-            return Flow::Close;
-        }
-        let _ = context
-            .sequencer
-            .leave(session.client_id, Some(frame))
-            .await;
-        session.detach = DetachCause::ClientLeft;
-        return Flow::Close;
-    }
-    if msg_type == MsgType::ACK || msg_type == MsgType::RESPONSE {
-        // No replay window and no per-frame acknowledgement in v1: both are
-        // counted as liveness only, never sequenced (42 §7.2). The actor
-        // records the arrival so the diagnostic timestamp stays current.
-        return match context.sequencer.seen(session.client_id).await {
-            Ok(()) => Flow::Continue,
-            Err(_) => Flow::Close,
-        };
-    }
-    if msg_type == MsgType::RELAY
-        || msg_type == MsgType::FLOW
-        || msg_type == MsgType::SYNC_END
-        || msg_type == MsgType::STREAM_DATA
-    {
-        if frame.prefix.kind() != PrefixKind::Route {
-            send_error(Some(session), TrnReason::Protocol);
-            session.detach = DetachCause::Protocol;
-            return Flow::Close;
-        }
-        return match context.sequencer.relay(session.client_id, frame).await {
-            Ok(()) => Flow::Continue,
-            Err(_) => Flow::Close,
-        };
-    }
-    send_error(Some(session), TrnReason::Protocol);
+fn open_steady(
+    session: &RpcSession,
+    frame: &FrameBuf,
+) -> Result<crate::protocol::crypto::Opened, ()> {
+    Opener::with_session_key(&session.ring.session_key())
+        .open(&frame.header, &frame.prefix, &frame.body)
+        .map_err(|_| ())
+}
+
+fn encode_pong(session: &RpcSession, server_time: u64) -> Option<Bytes> {
+    let body = (Pong { server_time }).encode().ok()?;
+    let mut header = FrameHeader::new(MsgType::PONG, Flags::ENC, 0, Seq::UNSEQUENCED);
+    let nonces = NonceMinter::new(&mut rand::rng());
+    let sealed = Sealer::with_session_key(&session.ring.session_key(), &nonces)
+        .seal(&mut header, &Prefix::None, &body)
+        .ok()?;
+    let bytes = encode_frame(&FrameRef::new(&header, &Prefix::None, sealed.as_bytes())).ok()?;
+    Some(Bytes::from(bytes))
+}
+
+fn protocol_close(session: &mut RpcSession) -> Result<Flow, ()> {
+    send_error_steady(session, TrnReason::Protocol);
     session.detach = DetachCause::Protocol;
-    Flow::Close
+    Ok(Flow::Close)
 }
 
-fn send_error(session: Option<&RpcSession>, reason: TrnReason) {
-    let Some(session) = session else {
+fn send_error(phase: &Phase, reason: TrnReason, detail: &[u8]) {
+    let Phase::Steady(session) = phase else {
         return;
     };
+    send_error_detail_steady(session, reason, detail);
+}
+
+fn send_error_steady(session: &RpcSession, reason: TrnReason) {
+    send_error_detail_steady(session, reason, &[]);
+}
+
+fn send_error_detail_steady(session: &RpcSession, reason: TrnReason, detail: &[u8]) {
     let Ok(body) = (ErrorMessage {
         reason,
-        detail: &[],
-        session_id: None,
+        detail,
+        session_id: Some(session.session_id),
     })
     .encode() else {
         return;
@@ -348,13 +787,6 @@ fn send_error(session: Option<&RpcSession>, reason: TrnReason) {
     }
 }
 
-/// Write queued frames to the HTTP response body.
-///
-/// Control frames go first, but a `KICK` is deferred until every already
-/// queued data frame has been written: the client must not observe a kick
-/// sequence before the frames that precede it (42 I9). The sender halves are
-/// dropped by the actor when it detaches, so both channels end and the task
-/// exits.
 async fn run_writer(
     out: MpscSender,
     mut data: mpsc::Receiver<Bytes>,
@@ -392,7 +824,222 @@ async fn run_writer(
 }
 
 fn is_kick(frame: &Bytes) -> bool {
-    frame.len() >= HEADER_LEN && frame[0] == MAGIC && frame[2] == MsgType::KICK.get()
+    frame.len() >= crate::protocol::HEADER_LEN
+        && frame[0] == crate::protocol::MAGIC
+        && frame[2] == MsgType::KICK.get()
+}
+
+/// Replay `(replay_from ..= current)` from SQLite, then switch to live.
+async fn run_replay(
+    context: SessionContext,
+    session_id: SessionId,
+    generation: u64,
+    replay_from: Seq,
+    current_seq: Seq,
+    tx: mpsc::Sender<Bytes>,
+) {
+    let store = context.sequencer.store();
+    let epoch = context.sequencer.epoch().get() as i64;
+    let ring = match context.master.derive_psk_keyring(&PskSalt::DEFAULT) {
+        Ok(ring) => ring,
+        Err(_) => return,
+    };
+    let nonces = NonceMinter::new(&mut rand::rng());
+    let mut next = replay_from.get();
+    let mut target = current_seq.get();
+    loop {
+        while next <= target {
+            let page = match store
+                .events(
+                    epoch,
+                    next.saturating_sub(1) as i64,
+                    context.config.replay_batch,
+                )
+                .await
+            {
+                Ok(page) => page,
+                Err(error) => {
+                    tracing::error!(%error, "replay read failed");
+                    return;
+                }
+            };
+            if page.is_empty() {
+                break;
+            }
+            for event in page {
+                let seq = event.seq.max(0) as u64;
+                if seq > target {
+                    break;
+                }
+                let content = replay_content(&store, &event).await;
+                if let Some((data, replay)) = &content {
+                    if send_replay_content(&tx, &ring, &nonces, replay, data)
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+                // A stored wire carries the sender's random data session id.
+                // When content is replayed, the stream uses the event-derived
+                // session, so the ORDERED frame must be synthesized with the
+                // same id; the stored ciphertext would name a different one.
+                // Synthesized frames are unsequenced and must be stamped.
+                let frame = if content.is_some() {
+                    super::wire::replay_ordered_with_content(
+                        &event,
+                        &ring,
+                        &nonces,
+                        content.as_ref().map(|(data, _)| data.as_slice()),
+                    )
+                    .and_then(|bytes| super::wire::with_seq(&bytes, Seq(seq)))
+                } else {
+                    match store.wire(event.seq).await {
+                        Ok(Some(bytes)) => super::wire::with_seq(&bytes, Seq(seq)),
+                        _ => super::wire::replay_ordered_with_content(
+                            &event,
+                            &ring,
+                            &nonces,
+                            None,
+                        )
+                        .and_then(|bytes| super::wire::with_seq(&bytes, Seq(seq))),
+                    }
+                };
+                match frame {
+                    Ok(bytes) => {
+                        if tx.send(Bytes::from(bytes)).await.is_err() {
+                            return;
+                        }
+                    }
+                    Err(error) => {
+                        tracing::error!(?error, seq, "cannot synthesize replay frame");
+                        return;
+                    }
+                }
+                next = seq.saturating_add(1);
+            }
+        }
+        match context
+            .sequencer
+            .replay_done(session_id, generation, Seq(next.saturating_sub(1)))
+            .await
+        {
+            Ok(ReplayStep::Online) => return,
+            Ok(ReplayStep::Continue { target: new_target }) => {
+                target = new_target.get();
+            }
+            Err(_) => return,
+        }
+    }
+}
+
+async fn replay_content(
+    store: &super::store::StoreHandle,
+    event: &crate::store::sqlite::EventRow,
+) -> Option<(Vec<u8>, super::wire::ReplayContent)> {
+    let EventPayload::Write { chunks, size, .. } = event.decode().ok()? else {
+        return None;
+    };
+    if chunks.is_empty() {
+        return None;
+    }
+    let mut data = Vec::with_capacity(usize::try_from(size).unwrap_or(0).min(4 << 20));
+    for chunk in chunks {
+        let bytes = store.chunk_data(chunk.hash).await.ok()??;
+        data.extend_from_slice(&bytes);
+    }
+    Some((
+        data.clone(),
+        super::wire::ReplayContent {
+            session: super::wire::replay_data_session(event),
+            total_len: data.len() as u64,
+            data,
+        },
+    ))
+}
+
+async fn send_replay_content(
+    tx: &mpsc::Sender<Bytes>,
+    ring: &crate::protocol::crypto::PskKeyRing,
+    nonces: &NonceMinter,
+    content: &super::wire::ReplayContent,
+    data: &[u8],
+) -> Result<(), ()> {
+    let open_body = WcpWriter::new().finish().map_err(|_| ())?;
+    let open_prefix = Prefix::Route(RoutePrefix::new(content.session, StreamId::CTRL, 0, 0));
+    let open = seal_frame(
+        MsgType::RELAY,
+        Flags::ENC.with(Flags::ROUTED),
+        open_prefix,
+        &open_body,
+        ring,
+        nonces,
+    )?;
+    if tx.send(Bytes::from(open)).await.is_err() {
+        return Err(());
+    }
+    let total_chunks = data.len().div_ceil(crate::protocol::CHUNK_PLAIN).max(1) as u32;
+    for index in 0..total_chunks {
+        let start = index as usize * crate::protocol::CHUNK_PLAIN;
+        let end = (start + crate::protocol::CHUNK_PLAIN).min(data.len());
+        let prefix = Prefix::Route(RoutePrefix::new(
+            content.session,
+            StreamId::OP_DATA,
+            index,
+            total_chunks,
+        ));
+        let frame = seal_frame(
+            MsgType::STREAM_DATA,
+            Flags::ENC.with(Flags::ROUTED),
+            prefix,
+            &data[start..end],
+            ring,
+            nonces,
+        )?;
+        if tx.send(Bytes::from(frame)).await.is_err() {
+            return Err(());
+        }
+    }
+    Ok(())
+}
+
+fn seal_frame(
+    msg_type: MsgType,
+    flags: Flags,
+    prefix: Prefix,
+    body: &[u8],
+    ring: &crate::protocol::crypto::PskKeyRing,
+    nonces: &NonceMinter,
+) -> Result<Vec<u8>, ()> {
+    let mut header = FrameHeader::new(msg_type, flags, 0, Seq::UNSEQUENCED);
+    let sealed = Sealer::with_session_key(&ring.session_key(), nonces)
+        .seal(&mut header, &prefix, body)
+        .map_err(|_| ())?;
+    encode_frame(&FrameRef::new(&header, &prefix, sealed.as_bytes())).map_err(|_| ())
+}
+
+fn random_session_id() -> SessionId {
+    loop {
+        let id = SessionId(rand::random::<u128>());
+        if id != SessionId::ZERO {
+            return id;
+        }
+    }
+}
+
+fn random_32() -> [u8; 32] {
+    rand::random()
+}
+
+fn random_12() -> [u8; 12] {
+    rand::random()
+}
+
+fn now_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -403,7 +1050,10 @@ mod tests {
 
     #[test]
     fn server_kick_detection_reads_only_the_plaintext_header() {
-        let kick = encode_control(MsgType::KICK, Prefix::None, &[0; 5], Seq::UNSEQUENCED).unwrap();
+        let mut header = FrameHeader::new(MsgType::KICK, Flags::ENC, 0, Seq::UNSEQUENCED);
+        header.len = 30;
+        let kick =
+            Bytes::from(encode_frame(&FrameRef::new(&header, &Prefix::None, &[0; 30])).unwrap());
         assert!(is_kick(&kick));
         let ordered = encode_control(MsgType::ORDERED, Prefix::None, &[0; 30], Seq(1)).unwrap();
         assert!(!is_kick(&ordered));

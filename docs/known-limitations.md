@@ -1,352 +1,257 @@
 # Known limitations
 
-Status: normative design boundary for syncmount v1. This document states the
-guarantees the design makes, the guarantees it weakens, and the behaviour it
-refuses. It describes the design, not a particular build; implementation
-status belongs in release notes.
+Status: normative design boundary for syncmount v2 (protocol 2.0). This
+document states the guarantees the design makes, the guarantees it weakens,
+and the behaviour it refuses. It describes the design, not a particular build.
 
 Where this document says **best effort**, the operation is accepted and does
 not fail because of the weak semantics. The result is whatever local execution
 and convergence produce. A limitation is a deliberate trade-off, not a bug.
 
 Related documents: [`threat-model.md`](threat-model.md),
-[`../README.md`](../README.md), `man/syncmount.1`, and the design records
-`39-s1-spec.md`, `49-arbitration-list.md`, `50-client-signing.md` and
-`36-known-limitations.md`.
+[`../README.md`](../README.md) and `man/syncmount.1`.
 
 ## 1. Consistency, durability and recovery
 
-### 1.1 Eventual consistency, not POSIX or ACID
+### 1.1 The server is authoritative
 
-syncmount is an eventually consistent distributed filesystem. The sequencer
-assigns a total order to encrypted operations; every client replays that order
-and converges to the same tree. It is not a POSIX filesystem and not an ACID
-store.
+The server owns the authoritative tree. It decrypts each accepted operation,
+plans it against the in-memory mirror, commits the object/name/chunk rows and
+one event in a single SQLite transaction, and only then broadcasts the event.
+Every client replays the same `seq` order and converges to the server's tree.
 
-- A data write, `truncate`, `setattr` and `xattr` change is applied to the
-  local backing tree first and queued in an in-memory outbox. The call returns
-  before the sequencer has assigned a sequence number.
-- Reads use the local backing tree only. During the convergence window a
-  reader can see old data, an old directory listing or old attributes. The
-  design target is about 100 ms on a LAN and about 1 s on a public network;
-  no latency is guaranteed.
-- Concurrent writes to the same offset are resolved by last-writer-wins in
-  sequence order. Concurrent writes to non-overlapping ranges are merged.
-- Namespace operations (`mkdir`, `rmdir`, `unlink`, `rename`, `symlink`,
-  `link`, `O_CREAT|O_EXCL`) and `fcntl` lock changes are the exception: they
-  are ordered operations, and the caller waits for the sequencer's verdict
-  before the callback returns (one round trip). A client that loses such a
-  race receives the losing errno (`EEXIST`, `ENOENT`, `EAGAIN`) and its local
-  tree is not changed.
-- There is no multi-file transaction, no cluster-wide commit point and no
-  rollback. Atomicity is per operation, and a large write may be split into
-  several operations. Durability is the local backing filesystem.
+The server is the only writer of its database. A semantic rejection consumes
+no sequence and is sent to the author alone; the client marks the outbox row
+`failed`. A duplicate `op_id` receives the original sequence and does not
+create a second event.
 
-### 1.2 `fsync` and `fdatasync` are local only
+This is eventual consistency, not POSIX or ACID. There is no multi-file
+transaction, no cluster-wide commit point and no rollback. Atomicity is per
+operation. A large write may be split into several wire operations.
 
-`fsync(2)` and `fdatasync(2)` flush the local backing file and ask the uplink
-to flush the coalescer for that inode. They do **not** wait for a cluster
-acknowledgement and do not make the data visible to other clients. The remote
-copy remains volatile until the sequencer broadcasts it.
+### 1.2 Every mutation is local-first
 
-There is no durable outbox. The outbox and coalescer live in memory. If the
-client process crashes, is killed, loses its transport or is kicked,
-operations that were queued but not yet broadcast are lost, even if the
-application had already received a successful return from `write(2)` or
-`fsync(2)`. The bytes that reached the local backing file remain on local
-disk, but a later remount is cluster-wins and may delete or replace them.
+`write`, `truncate`, `setattr`, `create`, `mkdir`, `unlink`, `rmdir`,
+`rename`, `symlink`, `link` and lock operations commit one client SQLite
+transaction that updates the replica and appends the matching outbox row
+before the FUSE callback returns. The network is not consulted on the write
+path. There is no synchronous arbitration round trip.
 
-`syncfs(2)` is not a cluster barrier. It flushes the local backing filesystem
-only.
+Reads use the local replica only. During the convergence window a reader can
+see old data, an old directory listing or old attributes. The design target is
+about 100 ms on a LAN and about 1 s on a public network; no latency is
+guaranteed.
 
-### 1.3 Disconnect means unmount
+Concurrent writes to the same offset are resolved by last-writer-wins in
+server sequence order. Concurrent writes to non-overlapping ranges are merged
+by the client coalescer before they reach the server.
 
-A transport failure, heartbeat timeout, protocol violation or kick moves the
-client through unmounting: it quiesces the mount, flushes local state for at
-most two seconds, unmounts and exits with status 10. There is no offline mode,
-no grace period, no pending-operation replay and no durable outbox. Network
-recovery does not resume the session; the user must mount again.
+A server rejection does **not** roll back the local SQLite effect. The outbox
+row becomes `failed` and keeps the errno. A rejected namespace operation (for
+example a create that lost a race) leaves the local name and object graph as
+the local transaction wrote it; the server's create event for the winner does
+not overwrite an existing local name. The replica can stay diverged until an epoch
+change or a new import. Writes to an existing path are last-writer-wins and do
+converge.
 
-If every unmount attempt fails, the client enters a read-only degraded mode:
-reads keep working and writes return `EROFS`. This is fail-safe, not fail-stop:
-a dead session must not keep accepting writes.
+### 1.3 The outbox is durable
 
-### 1.4 Remount is cluster-wins
+The outbox lives in `client.db`, in the same transaction as the local effect.
+It has four states:
 
-A remount reconciles the local tree against the cluster in one direction:
+| State | Meaning |
+|---|---|
+| `pending` | Not yet handed to the uplink. |
+| `sent` | Written to the socket; no acknowledgement yet. |
+| `acked` | The server's event for this `op_id` was applied; the row is deleted. |
+| `failed` | The server rejected the operation; the errno is kept. |
 
-- a path present in the cluster but absent locally is fetched;
-- a path present locally but absent in the cluster is deleted;
-- differing content is replaced by the cluster version;
-- differing attributes are replaced by the cluster version.
+A new session resets `sent` back to `pending` and resends it. A `sent` row is
+**not** retried within the same session: there is no acknowledgement timeout
+and no in-session retransmit. A lost frame is recovered only after the
+connection ends and the next session resets the row.
 
-There is no merge, no confirmation prompt, no `--force` and no local-wins
-option. The audit log records the manifest snapshot and the
-`discarded_local_only` / `overwritten` counts. Local-only work that was never
-broadcast is therefore lost by design.
+The server deduplicates by `op_id`. A resend after a lost acknowledgement
+receives the original sequence; the client applies its own echo, marks the row
+`acked` and does not apply the local effect a second time.
 
-### 1.5 JOIN reads can be stale
+The outbox has a soft resident-memory budget of 1 GiB and one million
+operations. Crossing it logs one warning and admission continues. A lagging
+replay or a stalled network never turns a local write into `ENOSPC`; `ENOSPC`
+means the client's SQLite disk is full.
 
-Writes are refused with `EROFS` while the client is joining, but reads are not
-blocked. The cluster-wins step deletes and replaces entries in place before
-the write gate opens. A reader during this window can therefore observe a mix
-of pre-JOIN local files and cluster content, or a path that disappears and
-reappears. Each file is replaced atomically, but the tree as a whole may be
-old or mixed. The window ends when the lifecycle publishes `STEADY`.
+### 1.4 `fsync` is local only
 
-Blocking reads instead would make a large JOIN look like a hung mount. The
-design accepts a read-only, possibly stale view.
+`fsync(2)` and `fdatasync(2)` run `PRAGMA wal_checkpoint(TRUNCATE)` on the
+client database. They make the local SQLite file durable; they do not wait for
+a cluster acknowledgement and do not make the data visible to other clients.
+The remote copy becomes visible when the server commits and broadcasts the
+event.
 
-Above sequence zero, a JOIN pulls the current manifest from an online holder
-and uses a manifest diff plus an rsync difference pass. The only case in which
-every file is transferred is a local tree with no non-empty file and no usable
-baseline; there is no baseline to diff against. A single missing file is still
-a normal rsync difference: that file is transferred in full, but the rest of
-the tree is not. See §1.8 for the holder and self-view conditions.
+The client database uses WAL and `synchronous=FULL`, so a committed
+transaction survives a crash even before the checkpoint. `syncfs(2)` is not a
+cluster barrier.
 
-### 1.6 Watermark health is not content verification
+### 1.5 Disconnect, remount and replay
 
-The server's watermark check answers liveness and trust questions: is
-`applied_seq` advancing, did it go backwards, is it beyond `current_seq`, is
-the client still sending heartbeats. It does **not** verify file content,
-block hashes or replay correctness. A client can be healthy while its local
-tree is stale or wrong.
+A transport failure, kick or protocol violation unmounts the client and exits
+with status 10. There is no in-process reconnect and no offline mode. The
+replica and the outbox stay in `client.db`; the next start resends pending and
+previously sent operations.
 
-The accepted recovery path is a remount and a full cluster-wins
-resynchronisation. There is no independent fsck tool and no content-level
-verification pass in v1.
+A reconnect above `applied_seq == 0` replays the server's event log from
+`applied_seq + 1`. A different epoch clears the replica tables, resets
+`applied_seq` to zero and replays the compacted log from the beginning;
+pending outbox rows survive the reset and are sent after the replay.
 
-### 1.7 Server order, restart and reordering
+A JOIN is a pure event-log replay; the v1 join and identity machinery has
+been removed.
 
-The server assigns `seq`; it is the only total order. Client clocks do not
-participate in ordering, and a client clock that is wrong cannot change an
-arbitration result.
+Writes return `EROFS` while the client is `JOINING`, but reads are allowed.
+A reader can therefore see a mixed tree while replay is filling it. The write
+gate opens at `STEADY`.
 
-The server can rewrite `seq`, delay, drop, duplicate or reorder frames. Clients
-detect their own `local_seq` gaps, rollback and epoch changes. They cannot
-prove a cross-client reorder: the server can put one client's operation before
-another's as long as each client's own sequence is monotonic. Preventing that
-requires client-to-client consensus or a global hash chain, which v1 does not
-have.
+The first client to reach an empty server (`seq == 0`) with a non-empty,
+never-synced database seeds the cluster from that database. This is the only
+path that uploads a whole local tree. A later client replays the resulting
+events; it does not receive a bulk tree image.
 
-The server keeps no durable state. A server restart draws a new epoch and
-resets the sequence. Every client is disconnected, unmounts and exits 10; it
-must resynchronise on the next mount, and frames from the old epoch are
-rejected. There is one sequencer, no leader election and no high availability.
+### 1.6 Watermarks, kicks and health
 
-### 1.8 Manifest-only JOIN and self view
+The client sends a sealed `PING` every second carrying its `applied_seq`. The
+server uses that watermark for drain, for regression/overclaim checks and for
+diagnostics.
 
-Above sequence zero a JOIN needs a view of the current tree. The v1 path is
-manifest-only: the server names one online holder in `WELCOME`, the joiner
-opens a relay session to that holder, and pulls the holder's manifest at the
-declared sequence, the blockmap, and the blocks its diff needs. The local
-cluster-wins step then deletes local-only paths and replaces differing content.
-There is no snapshot transfer, no replay log and no server-side history on
-this path.
+The server kicks a session when:
 
-Both endpoints must advertise `VIEW_SOURCE` for the server to name a view; a
-self view additionally requires `VIEW_SELF` on both sides.
+- its outbound queue exceeds 32 MiB or 512 data frames and does not drain
+  (`QueueOverflow`);
+- its reported watermark goes backwards (`Regression`);
+- its reported watermark exceeds `current_seq` (`Overclaim`);
+- the server compacts or shuts down (`EpochMismatch` or `ServerShutdown`).
 
-A holder is eligible only when it is another client, `Online`, has both outbox
-channels open, and reports `applied_seq == current_seq`. Among eligible
-holders the smallest `client_id` wins, so the choice is deterministic. A
-holder that is even one operation behind cannot serve.
+A kick unmounts the client with status 10; the next start replays and resends.
+Lag diagnostics are not a kick: a slow but progressing client may stay slow
+for as long as it keeps making progress.
 
-A self view is the solo-member recovery path. The server grants it only when:
+Watermarks prove liveness and replay position, not content correctness. There
+is no independent fsck and no content-level verification pass. A client can be
+healthy while its local tree is wrong; a full replay is the recovery path.
 
-- `current_seq` is sequenced;
-- the client reports the current epoch;
-- the client's applied watermark is `current_seq`, or one behind it and the
-  missing sequence is a `LEAVE` pseudo-operation, not an `ORDERED` operation;
-- no other identity is attached to the cluster;
-- both endpoints advertised `VIEW_SELF`.
+The server can delay, drop, duplicate or reorder frames. Clients detect their
+own sequence gaps and epoch changes, but cannot prove a cross-client reorder:
+the server can put B's operation before A's as long as each client's own
+stream stays monotonic.
 
-The one-sequence gap is the `LEAVE` that a disconnect while `Online` injects;
-it consumes a sequence but carries no content.
+### 1.7 Drain, compaction and epoch
 
-The client then loads its persisted local manifest and requires it to cover
-the accepted watermark (`current_seq`, or the one-behind `LEAVE` gap) and to
-describe the disk exactly. A manifest with any transfer or local-only path is
-refused before a byte is deleted or pulled.
+`SIGTERM` or `SIGINT` stops the accept loop and starts a graceful shutdown:
 
-By default, if no holder and no self view is available above sequence zero,
-the client retries the JOIN after 1, 2, 4, 8 and 16 seconds and then exits 2.
-Cluster-wins has not run at that point, so no local file is deleted. A
-multi-member cluster cannot use a self view: as soon as another identity is
-attached, only a caught-up holder can serve, and a cluster with no such holder
-fails the same way.
+1. **Drain.** Wait up to 30 seconds for every attached session's applied
+   watermark to reach `current_seq`. A caught-up session does not delay the
+   shutdown. On timeout the server logs the lagging sessions and compacts
+   anyway.
+2. **Compact.** In one transaction: clear `events`, `event_chunks`, `op_ids`
+   and the `replay_wire` sidecar; advance `epoch` by one; reset `seq` to 0 and
+   `replay_floor` to 1; emit a minimal replayable log for the live tree (one
+   `create_*` per object in path order, a `write` carrying the current chunk
+   list for non-empty files, a full `setattr`, and a `link` for every extra
+   hard-link name); refresh chunk refcounts and `meta.state_hash`. The object,
+   name and chunk tables are not rewritten, so the state digest is unchanged.
+3. **Kick.** Every session receives `EpochMismatch` and stops. Clients exit 10.
 
-Sequence zero has its own path. The first identity on an empty cluster is
-offered a bootstrap view (`F_VIEW_BOOTSTRAP`, `0x5D`, an optional `u8` in
-`WELCOME`) when both endpoints advertise `VIEW_SOURCE`, the server's watermark
-is zero, and no other identity is attached. The client then scans its own
-disk, uses that manifest and blockmap as the sequence-zero cluster view, and
-becomes the holder for later joiners through the normal manifest-only path.
-No server state is added: the bootstrap decision is derived from the current
-online table and is recomputed on every reconnect.
+A crash skips compaction. The next start resumes `epoch` and `seq` from
+`meta`, replays the existing event log, and clients continue from their
+`applied_seq + 1`. Compaction is idempotent for the live tree: running it twice
+produces the same state digest.
 
-A non-empty disk is adopted only when it carries a valid
-`.syncmount-manifest`. A missing cache means "new mount"; a cache that does
-not decode means "damaged state". Both are refused with exit 2 and the disk
-is left byte-for-byte unchanged. An empty disk proceeds with an exact empty
-view. `--allow-empty-view` is the explicit opt-in to the loss: at sequence
-zero it accepts the empty view for a non-empty disk, and cluster-wins then
-deletes local-only paths.
+`replay_floor` is the oldest sequence still replayable. Compaction always
+leaves it at 1 because the synthetic log starts at 1. There is no incremental
+catch-up beyond the event log: a client that has been offline replays every
+event after its watermark.
 
-The bootstrap source lives only as long as the server process. The server
-keeps no durable state, so a restart draws a new epoch and a new sequence
-zero. If the bootstrap client is offline when another client connects, that
-client becomes the new bootstrap source; when the original returns it sees a
-cluster whose initial content is already defined and its local-only paths are
-deleted. The first client to connect therefore defines the cluster's initial
-content. That is the same trust-on-first-use boundary as key bootstrapping
-(§4.6), not a separate authorization.
+### 1.8 State hashes are local diagnostics
 
-An old client ignores the unknown `0x5D` field and still takes its old
-sequence-zero empty-view path, which deletes local-only files. No protocol
-change can repair that client; the protection exists only in clients that
-understand the flag.
-
-The limits follow: a new client cannot recover history while every holder is
-offline or behind; a solo restart recovers only from a manifest that matches
-the disk; and a holder disconnect invalidates its view route, so the joiner
-must retry against a new holder.
+`state_hash` is a BLAKE3 digest of the object table, including the 128-bit
+inode ids. It is written on compaction and on a clean shutdown; during normal
+operation it shows the value from the last close. It is useful for comparing
+two databases that were built from the same import, but it is not a
+cross-cluster consensus value and two independently written databases need not
+agree.
 
 ## 2. POSIX surface
 
-### 2.1 Locks
+### 2.1 Names and paths
 
-**`flock(2)` is local to one mount.** The client does not negotiate
-`FUSE_FLOCK_LOCKS`, so the kernel handles `flock` locally. Two clients do not
-exclude each other, and a lock is not visible in any cluster state. This is
-the intended v1 behaviour, not a bug.
+File names must be valid UTF-8, at most 255 bytes, and free of `/` and NUL.
+A non-UTF-8 name is refused with `EINVAL`; an over-long name returns
+`ENAMETOOLONG`. The whole path is capped at 4096 bytes. There is no encoding
+translation: a name that is not UTF-8 cannot be stored or synchronized.
 
-**`fcntl` record locks are cross-client.** A cluster mount negotiates
-`FUSE_POSIX_LOCKS`; `getlk` and `setlk` reach the adapter. Every lock change is
-an ordered `FCNTL_LOCK` operation, every client replays it into the same
-deterministic byte-range table, and the caller waits for its own verdict.
-`F_GETLK` returns the first conflicting lock held by another client, and
-`F_SETLK` returns `EAGAIN` when the replay verdict rejects the range.
-`F_GETLK` reads the table at the client's applied sequence, so it can be stale
-by the convergence window.
+### 2.2 Supported object types
 
-Lock release is part of the security boundary. The server's plaintext `LEAVE`
-is only a hint; it must not release a lock. A lock is released by a signed
-client `LEAVE` operation or by lease expiry. The exact lease rule is an open
-v1 design point (`50-client-signing.md` §11.5), so reclamation of a crashed
-holder's locks is not guaranteed to be immediate.
+Regular files, directories, symbolic links and hard links have real
+cross-client semantics. `mknod` accepts only regular files; character devices,
+block devices, FIFOs and Unix sockets are refused with `EPERM`. A hard link is
+a second name for one inode id, and `nlink` is maintained by replay.
 
-Locks are advisory and depend on all participants being online and replayed.
-Do not use them as the only defence for a distributed mutex.
+### 2.3 Extended attributes and ACLs
 
-### 2.2 `mmap`, device nodes, sockets, FIFOs and `O_APPEND`
+Extended attributes are not stored. `getxattr` returns `ENODATA`, `listxattr`
+returns an empty list, and `setxattr`/`removexattr` return `ENOTSUP`. POSIX
+ACLs are xattr-based and are therefore not supported either. Tools that
+depend on `system.posix_acl_*` or `security.*` xattrs will not preserve them.
 
-These operations are **best effort**: they are allowed and do not fail because
-of the weak cross-client semantics. Their results converge like any other
-operation, but the runtime semantics are weaker than on a local filesystem.
+### 2.4 Locks
 
-**`mmap(MAP_SHARED)` writes.** Shared writable mappings are allowed. Dirty
-pages are written back through the ordinary WRITE path and participate in LWW.
-The semantics are weak:
+`flock(2)` is handled by the local kernel and is local to one mount. Two
+clients do not exclude each other through `flock`.
 
-- the kernel chooses the writeback time; the application has no flush point;
-- `msync(2)` only triggers local writeback, not a cluster acknowledgement;
-- a remote invalidation can raise `SIGBUS` in the mapping;
-- concurrent mapping writes on two clients are an uncontrolled LWW race;
-- a read-only mapping can serve stale pages during the convergence window.
+`fcntl(2)` record locks are not implemented: `getlk` and `setlk` return
+`ENOSYS`. There is no cross-client byte-range lock table and no lock lease.
+Applications that need a distributed mutex must build it at the application
+layer.
 
-Programs that depend on `MAP_SHARED` (some databases, JVM heaps) can run, but
-they get weaker durability and coherence than on a local filesystem. For
-critical data, use `pread`/`pwrite` plus `fsync`.
+### 2.5 `mmap`, `O_APPEND` and special I/O
 
-**Device nodes.** `mknod` may create a character or block device node, and its
-metadata may be broadcast. The endpoint is always a local kernel object: the
-same path on two clients does not refer to the same device, and access remains
-subject to the local mount policy. A device node is not a cross-host device
-passthrough.
+Files are opened with `FOPEN_DIRECT_IO` and reads use the SQLite chunk table.
+There is no page-cache coherence protocol. `mmap(MAP_SHARED)` is not a
+supported path: on most kernels a direct-I/O file cannot be mapped, and a
+mapping that does succeed has no cross-client invalidation. Use
+`pread`/`pwrite` for shared data.
 
-**Unix sockets.** `bind(2)` may create a socket node, and its metadata may be
-broadcast. The socket endpoint belongs to the local network stack; two clients
-bind their own local sockets and do not interoperate through the shared path.
+`O_APPEND` is anchored at the local EOF by the kernel and then applied as an
+ordinary write at that offset. Two clients appending concurrently can
+interleave or overwrite each other; POSIX's atomic append is not preserved
+across clients.
 
-**FIFOs.** `mkfifo` creates a local kernel object; metadata may be broadcast,
-but writes do not cross clients. Two clients see two independent FIFOs.
+`ioctl(2)` is not implemented. `fallocate` accepts only mode 0 or
+`FALLOC_FL_KEEP_SIZE`; `PUNCH_HOLE`, `COLLAPSE_RANGE`, `INSERT_RANGE` and
+`UNSHARE_RANGE` return `ENOTSUP`. `copy_file_range` falls back to
+read/write. `lseek` reports `SEEK_DATA`/`SEEK_HOLE` from the stored size, not
+from a sparse extent map.
 
-Only regular files, directories and symbolic links have real cross-client
-semantics.
+### 2.6 Attributes and time
 
-**`O_APPEND`.** `O_APPEND` is allowed and does not fail because of the weak
-cross-client semantics. The daemon anchors the write at the local EOF even if
-the kernel supplies offset 0, so a single client sees normal append behaviour.
-Across clients the EOF is a moving target: two appends can interleave or
-overwrite each other, and POSIX's "atomic seek to EOF plus write" is not
-preserved. Use explicit offsets and application-level coordination when
-appending from multiple clients.
+Only `mode`, `uid`, `gid`, `mtime` and `size` are stored. `atime` and `ctime`
+are reported as `mtime`; birth time is the Unix epoch. There is no separate
+`ctime` assigned by the server.
 
-### 2.3 Hard links are strongly consistent
+`uid` and `gid` are metadata labels, not a cross-host permission model. The
+mount ACL (`RootAndOwner` by default, `All` with `--allow-other`) controls
+local access. If two machines use different uid/gid assignments, `ls -l` shows
+the raw numbers.
 
-Hard links are not best effort. `link(2)`/`linkat(2)` create a directory entry
-that references an existing global inode id. `nlink` is maintained
-deterministically by sequence order, and the operation is ordered and
-synchronous: the caller waits for the replay verdict. A concurrent unlink that
-wins at replay returns `ENOENT` to the caller instead of leaving a link that is
-later removed.
+### 2.7 Other deviations
 
-All clients converge to the same inode identity, the same directory entries
-and the same link count. There is no cross-device refusal for a link within the
-cluster.
-
-### 2.4 atime, ctime, mtime, uid, gid and birth time
-
-- **atime** is not part of the synchronized metadata. The mount requests
-  `noatime`; the daemon never broadcasts an atime change and never uses atime
-  in conflict resolution. A local read can still update the local backing
-  filesystem's atime, but no other client sees it. POSIX atime semantics are
-  therefore lost.
-- **ctime** is written by the state machine at apply time from the server's
-  order time. It is consistent across clients and cannot be supplied by a
-  client.
-- **mtime** is carried in the operation payload and is client-supplied. A
-  client can set an arbitrary mtime with `utimensat(2)`; LWW uses the
-  sequencer's sequence number, not mtime, so a forged mtime cannot win an
-  arbitration by itself. mtime is display and diff metadata, not a trusted
-  clock. It reflects the author machine's clock and can look inconsistent with
-  ctime if that clock is wrong.
-- **uid/gid** are carried as metadata and are not mapped between hosts. If two
-  machines use different uid/gid assignments, `ls -l` shows the raw numbers and
-  can look wrong. Permission checks are not based on these values: the FUSE
-  mount uses the daemon's local credentials and the mount ACL (`RootAndOwner`
-  by default, `All` with `--allow-other`). Treat uid/gid as author labels, not
-  access control. When the replay engine applies a `SETATTR`, the backing file
-  takes the local client's effective uid/gid; the author's uid/gid remain
-  manifest metadata.
-- **birth time** is not provided. `statx` `STATX_BTIME` is absent from the FUSE
-  `getattr` surface.
-
-### 2.5 Other POSIX deviations
-
-- `rename` is one ordered operation. The calling client waits for its verdict,
-  so it sees either success or the errno. Other clients apply it when it
-  reaches them, so during the convergence window they see the old name or the
-  new name, never a half-renamed entry.
-- `readdir` and `seekdir` use the local tree. A remote change can arrive
-  between two calls and shift directory offsets.
-- `statvfs` reports the local backing filesystem's capacity, not a cluster
-  quota or a globally accurate free-space figure.
-- `O_CREAT|O_EXCL` and `mkdir`-EEXIST are arbitrated at replay and the caller
-  waits for the verdict. This costs one sequencer round trip; a loser sees
-  `EEXIST`.
-- `RENAME_NOREPLACE` is supported. `RENAME_EXCHANGE` is not supported.
-- `ioctl(2)` supports only a small `FS_IOC_GETFLAGS`/`SETFLAGS` subset mapped
-  to setattr; other commands and `FICLONE` are not supported.
-- `fallocate` `COLLAPSE_RANGE`, `INSERT_RANGE` and `UNSHARE_RANGE` are not
-  supported. `PUNCH_HOLE`/`ZERO_RANGE` are passed to the backing filesystem, so
-  their guarantees are the backing filesystem's, not syncmount's.
-- `copy_file_range`, `sendfile` and `splice` fall back to read/write when the
-  backing filesystem cannot do the operation.
-- `fanotify` is not supported. `inotify` reports local VFS events at the time
-  the local view changes, not the source client's event time; it is not a
-  cross-client event order or audit log.
+- `rename` supports `RENAME_NOREPLACE`; `RENAME_EXCHANGE` returns
+  `EOPNOTSUPP`.
+- `statvfs` reports the SQLite filesystem's capacity, not a cluster quota.
+- `readdir` and `seekdir` use the local replica; a replay can shift directory
+  offsets between calls.
+- `inotify` reports local VFS events at the time the replica changes, not the
+  source client's event time.
+- `fanotify` is not supported.
 
 ## 3. Scale and performance envelope
 
@@ -355,190 +260,98 @@ set the practical envelope.
 
 | Constraint | Effect |
 |---|---|
-| Server outbound bandwidth × online clients | The hard bottleneck. Aggregate write throughput is roughly link bandwidth / (N−1). 1 Gbps with 20 clients is about 6 MB/s; 20 MB/s with 20 clients needs about 4 Gbps. |
-| Manifest memory | About 80–150 bytes per file. One million files is roughly 100–300 MB; five million is roughly 0.5–1 GB. The server keeps only routing state; each client holds its manifest. |
-| Full-sync time | A 1 TiB tree at 1 Gbps is about 2.4 hours on one stream; 100 Mbps public is about 24 hours. New large nodes take hours. There is no incremental replay log; a join pulls the holder's manifest and uses rsync differences. |
-| Small-message overhead | Coalescing (128 KiB or a 2–5 ms window, forced by `fsync`) is required. Without it, 4 KiB random writes can saturate one HTTP/1.1 connection. |
+| Server outbound bandwidth × online clients | The hard bottleneck. The server sends every event to every client, so aggregate write throughput is roughly link bandwidth / (N−1). |
+| Full local copy | Every client keeps the full tree and chunk bytes in `client.db`; the server keeps the same data plus the event log. Plan disk for both. |
+| Join replay | A new client replays every event after its watermark. After compaction the log is minimal but still one create, one write and one setattr per live object. A large tree takes time to join; there is no bulk tree transfer. |
+| SQLite single writer | The client serialises FUSE writers through one connection; the server runs one store thread. Commit latency is dominated by `synchronous=FULL` fsync. |
+| Event log growth | Events accumulate until a graceful shutdown compacts them. A long-running server needs disk headroom for the log plus the live tree. |
+| Whole-file buffering | `PWRITE` and `TRUNCATE` need the complete post-operation file bytes. The server refuses a result above 4 GiB. |
+| Payload ceiling | One wire write aggregate and one event payload are capped at 4 MiB. A larger write is split by the client. |
+| Coalescing | Adjacent writes are merged up to 128 KiB immediately, a 2 ms quiet window, or a 5 ms hard ceiling. Without coalescing, small random writes can saturate one HTTP/1.1 connection. |
 | Path depth | `PATH_MAX` (4096 bytes) is the real limit; deep-tree optimisation is not attempted. |
-| Local full copy | Every client keeps a full local copy. Disk space equal to the dataset is required before mounting. |
-| Signature overhead | Every `ORDERED` carries a 75-byte Ed25519 AUTH block; an inline public key adds 32 bytes on the first frame and at least every 64 frames. At 2,000 signed operations per second the sign-and-verify cost is roughly 0.15–0.25 of one modern x86_64 core. For a 200-byte operation the relative overhead is about 37%. |
 
-The v1 design point is about 20 online clients, one million files and 4 GiB per
-file. Larger deployments are not promised. Degradation beyond the design point
-is a physical bandwidth and memory consequence, not a bug.
-
-### 3.1 `librsync_oxide` and 16 MiB segments
-
-The rsync difference engine uses `librsync_oxide` 0.3.0 (Apache-2.0, pure Rust,
-librsync 2.2.1 wire format). The crate has a full-memory API, so every call is
-bounded to a 16 MiB segment. The segment size is also the inline threshold:
-`RSYNC_INLINE_MAX = RSYNC_SEGMENT = 16 MiB`. Peak memory is about 48 MiB per
-worker (basis, new file and delta); four workers is about 192 MiB. A join
-checks available memory before starting.
-
-Rolling matching works inside a segment, not across a segment boundary. Each
-boundary can lose at most one block match. For a 4 GiB file with 64 KiB rsync
-blocks that is at most 256 blocks, about 16 MiB or 0.4% of the file,
-transferred as literal data. The loss is bounded and accepted; it does not
-change correctness.
-
-The crate is new: a single published version and low download volume. The
-project pins it and locks the wire format with fixed golden vectors; it does
-not use the C `librsync` library as a test oracle. If the crate turns out to be
-incompatible or unmaintained, the allowed remedies are to replace the backend
-or accept whole-block transfer. Re-implementing the rolling matcher is not an
-option.
-
-If a segment fails (parse error, memory limit, timeout), that file falls back
-to a full transfer with a recorded reason. The fallback still uses `chunk_id`
-deduplication and the file-level `file_root` verification.
+The reference deployment has 12 clients and a design point of about one
+million files and 4 GiB per file. Larger deployments are not promised.
+Degradation beyond the design point is a physical bandwidth, memory and
+SQLite consequence, not a bug.
 
 ## 4. Security limits
 
 The full adversary model is in [`threat-model.md`](threat-model.md). This
 section states the limits that users and operators must plan for.
 
-### 4.1 No forward secrecy and no revocation
+### 4.1 The server holds the password and reads plaintext
 
-The master key is derived from a fixed password and cluster id. A leaked
-password decrypts all recorded traffic, past and future. The default wire
-cipher is ChaCha8-Poly1305; ChaCha20-Poly1305 can be selected, but neither adds
-forward secrecy.
+The server requires the master password. It derives the PSK, decrypts every
+operation, plans it against the authoritative state and stores plaintext file
+data in `server.db`. It can read, modify or delete everything, and it can forge
+events or kicks. The PSK protects the link against an eavesdropper who does not
+know the password; it does not make the server unable to read the data.
 
-There is no in-band password rotation, no per-client key revocation and no
-revocation list. Changing the password derives a new cluster key and requires
-every client to change it; it is not a rolling rotation. Deleting a client's
-Ed25519 key file creates a new identity (`client_id` changes); v1 does not
-rotate a key under one id.
+This is not end-to-end encryption and not a zero-knowledge design.
 
-A leaked PSK is a full compromise: the attacker can decrypt all traffic, join
-as a new client, send its own operations, replay within the dedup window and
-refuse to serve snapshot data. The only remedy is to rebuild the cluster with a
-new password. There is no per-client permission model; every PSK holder is
-equal.
+### 4.2 A leaked password is a full compromise
 
-### 4.2 The server can rewrite `seq` and reorder
+A leaked PSK or master password lets an attacker decrypt recorded traffic,
+open both server and client databases, join as a new client, send valid
+operations and deny service. There is no per-client credential, no ACL, no
+role and no read restriction: every password holder is equal.
 
-The server is the ordering authority. It can rewrite `seq`, delay, drop,
-duplicate or reorder frames. Signatures deliberately exclude `seq` because the
-sender does not know it when signing and the server must be able to assign it.
+There is no perfect forward secrecy. A leaked password decrypts past and
+future traffic. ChaCha8-Poly1305 (default) and ChaCha20-Poly1305 (selectable)
+both have this property.
 
-Clients detect their own sequence gaps, rollback and epoch changes. They cannot
-prove a cross-client reorder. The server can put B's operation before A's as
-long as each client's own `local_seq` is monotonic; no client can distinguish
-that from a legitimate arrival order. Preventing it requires client-to-client
-consensus or a global hash chain, which v1 does not have.
+There is no in-band password rotation and no revocation list. Changing the
+password derives a new namespace id, so existing client databases refuse to
+open and the cluster must be rebuilt or re-imported under the new password.
+Old recordings remain decryptable with the old password.
 
-The server can also inject plaintext `WELCOME`, `PONG`, `KICK`, `ERROR`,
-`FLOW`, `SYNC_END` and `LEAVE` frames. These are hints, not authority. A forged
-`KICK` can force an unmount (availability denial); a forged `LEAVE` cannot
-release a lock. State changes require a signed `ORDERED` operation. A signed
-client `LEAVE` is the authoritative release for that client's locks.
+### 4.3 Plaintext at rest
 
-### 4.3 Plaintext chunk index equality leak
+Both `client.db` and `server.db` contain plaintext paths, file data, chunk
+bytes and metadata. The client creates its database with mode 0600 in a
+directory set to 0700. The server database is created by SQLite under the
+process umask, so a server unit must set `UMask=0077` (or pre-create the file
+0600) and keep it in a 0700 directory. File permissions are not encryption: a
+local user who can read the file, a backup, a disk image or a volume image can
+read everything.
 
-Content chunks are addressed by `chunk_id = BLAKE3(256 KiB plaintext)`. The
-manifest, `DataMap`, `BLOCK_REQ` and the local chunk cache are keyed by this
-plaintext hash. A peer that holds the index can therefore tell whether two
-blocks are byte-identical, including blocks in different files or snapshots,
-and can confirm a guessed block by hashing it.
+Use full-disk or volume encryption when the host disk is not trusted. Protect
+backups at least as strictly as the live database. There is no separate
+client key file in v2; the password file and the databases are equivalent
+secrets.
 
-The server does not see `chunk_id`: it is inside the encrypted WCP payload.
-The leak is limited to cluster members, who already hold the PSK and can
-decrypt the payloads. It is the inherent cost of plaintext addressing, not an
-implementation defect.
+### 4.4 The link
 
-Each 64 KiB envelope of a chunk is sealed with a fresh random nonce, so equal
-plaintext produces different ciphertext. Deduplication happens before
-encryption, by `chunk_id`; the design does not use deterministic or
-content-derived nonces. `blob_id = BLAKE3(ciphertext)` is a separate
-physical-integrity identifier and does not replace `chunk_id` as the logical
-identity.
+The client speaks plain HTTP/1.1 and rejects an `https://` URL with
+`TlsUnsupported`. Without a TLS tunnel, a network attacker sees frame headers,
+frame sizes, timing, connection pairs and the number of clients. Paths and
+payloads are sealed, so the attacker cannot read them without the PSK. The
+attacker can drop, delay, duplicate or inject garbage; AEAD and the handshake
+proof reject modified or forged frames.
 
-### 4.4 Signature boundary
+If transport protection is required, terminate TLS in a local tunnel that
+accepts plain HTTP on loopback. TLS protects the wire metadata; it does not
+change the server's trust status, because the server already holds the
+password.
 
-Every `ORDERED` operation is signed by its author with Ed25519. The signature
-covers `client_id`, `op_id` (`iid` and `local_seq`), `op_class`, `epoch`,
-frame type, flags and a BLAKE3 hash of the plaintext payload. It does **not**
-cover `seq`, `req_id`, `len`, the nonce, the ciphertext or the tag.
+### 4.5 Denial of service
 
-The signature therefore proves who wrote an operation and what it contains. It
-does not prove where the server placed it in the order. Replay protection is
-stateful: `op_id` deduplication, the per-client `local_seq` window, the epoch
-check and snapshot watermarks. The server neither sees nor verifies the
-signature. A stolen client key allows impersonation of that `client_id` if the
-attacker also has the PSK; there is no revocation, so the only global response
-is to rebuild the cluster.
+The server accepts unauthenticated connections; garbage is dropped at AEAD
+decryption or at the handshake proof. Rate limiting, connection quotas and a
+reverse proxy are operational controls, not protocol guarantees.
 
-A signature failure is fail-closed: the frame is dropped, it is not applied,
-and `applied_seq` does not advance. An authorized member can therefore use
-invalid signatures to stall a receiver. This is an accepted denial-of-service
-risk, not a confidentiality or integrity break.
+A queue overflow, a watermark regression/overclaim or a server shutdown kicks
+a client. A malicious server can force an unmount; that affects availability,
+not the stored data.
 
-### 4.5 Traffic analysis and transport
+### 4.6 Local users and the mount
 
-The server and network see frame headers, frame sizes, timing, connection
-pairs, client identifiers and the number of clients. The frame header is 21
-bytes; a routed frame also carries a 25-byte route prefix (`session_id`,
-`stream`, `chunk_index`, `total_chunks`), and a control frame carries an
-18-byte control prefix. Payloads, paths, operation arguments, manifests and
-chunk contents are encrypted. The server holds no key and cannot decrypt or
-forge them. No plaintext path hash is sent to the server.
-
-There is no built-in TLS termination, and the client rejects an `https://` URL
-with `TlsUnsupported` before mounting. The protocol is HTTP/1.1 with chunked
-request and event streams. A conventional TLS-terminating reverse proxy cannot
-be dialed by this client; if transport protection is required, use a local
-tunnel that accepts plain HTTP on loopback and carries it over TLS. This
-deployment is plain HTTP on port 80. TLS protects frame headers, control
-frames and traffic metadata on the wire. It is not a trust root: the server is
-still not trusted, and TLS does not make its control frames authoritative. The
-payload remains end-to-end encrypted even without TLS.
-
-Server-side denial of service is not cryptographically prevented. The server
-accepts unauthenticated connections; garbage is dropped at AEAD decryption.
-Rate limiting, connection quotas and a reverse proxy are operational controls,
-not protocol guarantees.
-
-### 4.6 Bootstrap and key distribution
-
-The first client in an empty cluster has no peer verifier. It bootstraps on its
-own self-certified key. A wrong PSK cannot be detected in that state and
-creates an isolated cluster; a later correctly-keyed client cannot join while
-the wrong-key client is the only online member.
-
-The same first client also defines the cluster's initial file view when it is
-the only identity at sequence zero (§1.8). A wrong-key or wrong-content first
-client is therefore authoritative until the cluster is rebuilt.
-
-Key distribution is peer-mediated: `JOIN_PROOF`, `JOIN_ACCEPT`, the snapshot
-`keys[]` section, inline public keys on ordered frames, and `KEY_REQ`/
-`KEY_RESP`. A member that has not learned a peer's key cannot verify that
-peer's frames; it drops them and requests the key. The server's key directory,
-if one is deployed, is a cache and never authoritative. Trust-on-first-use is
-optional and is not a trust root.
-
-### 4.7 Other security limits
-
-- **ChaCha8 margin.** ChaCha8-Poly1305 has no known practical attack and is
-  suitable for personal, internal and mid-value data. For high-value or
-  long-lived secrets, select ChaCha20-Poly1305. The cipher choice does not add
-  forward secrecy.
-- **No per-client ACLs or roles.** Every PSK holder can read every path and
-  payload, join as a new client, send valid operations, replay within the dedup
-  window and deny service. The PSK is the tenant boundary.
-- **Control frames are not authoritative.** `WELCOME`, `PONG`, `KICK`,
-  `ERROR`, `FLOW`, `SYNC_END` and the server's `LEAVE` are plaintext and
-  unauthenticated. They may affect availability; they do not change locks,
-  membership or file state.
-- **A `client_id` claim in `HELLO` is not a credential.** A malicious client
-  can claim another `client_id` and trigger the duplicate-session kick against
-  the real owner. This is a denial of service, not impersonation of signed
-  operations.
-- **Snapshot providers are members.** A malicious provider can withhold data
-  or supply a bad baseline, causing a denial of service or a wrong starting
-  point. Snapshot content is content-addressed and the ordered replay still
-  converges; a provider cannot forge a signed operation.
+The default mount ACL is `RootAndOwner`; `--allow-other` widens it to every
+local user and requires `user_allow_other` in `/etc/fuse.conf`. The password
+file must be owned by the effective user and mode 0600 or stricter. A local
+user who can read the password file or the database has the same access as the
+mount owner.
 
 ## 5. Compatibility and deployment
 
@@ -548,74 +361,98 @@ optional and is not a trust root.
   only root can mount.
 - `/dev/fuse` must exist and be readable/writable by the user. Containers need
   `--device /dev/fuse` (and usually `--cap-add SYS_ADMIN` for the mount).
-- The FUSE adapter negotiates `DO_READDIRPLUS` and `PARALLEL_DIROPS`. A
-  cluster mount also negotiates `POSIX_LOCKS`; `FLOCK_LOCKS`, writeback cache,
-  direct I/O and passthrough are never negotiated. Kernels without a requested
-  opcode degrade the corresponding feature.
-- The release binary can be static musl, but FUSE is not: the host still needs
-  `fusermount3` and `/dev/fuse`. A scratch container also needs
-  `/etc/resolv.conf` and `/etc/hosts` for DNS.
-- One identity per running mount. Two mounts on one host need distinct
-  `XDG_STATE_HOME` values; the server treats a second session with the same
-  `client_id` as a duplicate and kicks the older one.
-- One sequencer, no leader election and no HA. A server restart draws a new
-  epoch and resets the sequence to zero; every client is disconnected, exits
-  10 and must resynchronise on the next mount.
+- One process per client database. Two mounts on one host need distinct
+  `--db` paths or distinct `SYNCMOUNT_STATE_DIR` values. The client takes an
+  exclusive `flock` on the database file; a second process fails at startup.
+- One server process per namespace. There is no leader election, no failover
+  and no multi-server consensus. A graceful shutdown compacts and kicks every
+  client; a crash resumes `epoch` and `seq` from the database.
+- The reference deployment runs two namespaces on one host, on loopback ports
+  8081 and 8082, with separate server databases and one shared password file.
+  Caddy must forward the namespace prefix unchanged and must disable
+  `read_body_idle`/`write_idle` for the two long-lived streams.
+- The server database defaults to `syncmount-server.db` in the current
+  directory. A unit should pass an absolute `--db`, set `UMask=0077` and keep
+  the file in a 0700 directory.
+- The client database path defaults to
+  `SYNCMOUNT_STATE_DIR/<namespace>/client.db`, then
+  `XDG_DATA_HOME/syncmount/<namespace>/client.db`, then
+  `$HOME/.local/share/syncmount/<namespace>/client.db`.
+- The password file must be a regular file, owned by the effective user, mode
+  0600 or stricter. A root-owned `/etc/syncmount/master.pass` cannot be read by
+  a non-root client; give the mount user its own file.
+- The SQLite schema is versioned (`user_version` and `meta.schema_version`).
+  A build that does not understand the schema refuses to open the database
+  rather than migrating silently.
 
-## 6. Explicitly not in v1
+## 6. Explicitly not in v2
 
 These are scope exclusions, not bugs and not promises:
 
+- end-to-end encryption, a zero-knowledge server or server-side opacity;
+- perfect forward secrecy, password rotation, revocation or per-client
+  credentials;
+- per-client ACLs, roles or read restrictions;
+- the v1 join and identity machinery (removed);
+- delta transfer, bulk tree install and incremental catch-up
+  beyond the event log;
 - offline mode, local-wins merge, journal replay or pending-operation replay;
-- a durable outbox, broadcast log, replay buffer or incremental catch-up;
 - independent fsck or content-level verification tools;
-- multi-tenant or multi-cluster routing (one process, one cluster);
-- peer-to-peer data transfer (all sync traffic goes through the sequencer);
+- multi-tenant or multi-cluster routing (one process, one namespace);
+- peer-to-peer data transfer (all traffic goes through the server);
 - multi-server consensus, leader election or op-log replication;
 - built-in TLS termination;
 - Prometheus metrics listener, `readyz`, config file, `--daemon`, `--verbose`
   or `genkey`;
 - keyring or any credential cache; a password in argv is refused;
-- server-side opaque block cache, zstd compression or payload padding;
-- per-client ACLs or roles (every PSK holder is equal).
+- xattrs, POSIX ACLs, `fcntl` record locks, device nodes, FIFOs, Unix sockets
+  or non-UTF-8 names;
+- files above 4 GiB or wire payloads above 4 MiB;
+- built-in encryption at rest.
 
 ## 7. User notice
 
-> syncmount is eventually consistent, not a POSIX filesystem and not an ACID
-> store.
+> syncmount is a server-authoritative, eventually consistent filesystem, not
+> a POSIX filesystem, not an ACID store and not an end-to-end encrypted
+> system.
 >
-> A write returns after it reaches the local disk and the in-memory outbox; a
-> crash, disconnect or kick loses operations that were not broadcast. `fsync`
-> only guarantees the local disk, not that other devices have the data. A
-> remount is cluster-wins: local-only paths are deleted and differing content
-> is replaced.
+> The server holds the master password, decrypts every operation and stores
+> plaintext file data. A leaked password is a full compromise: it opens the
+> databases, decrypts recorded traffic and allows new clients to join. There is
+> no forward secrecy, no rotation and no revocation. Use full-disk encryption
+> when the host disk is not trusted.
+>
+> Every write commits to the local SQLite database and the durable outbox
+> before it returns. A crash or disconnect keeps the outbox; the next session
+> resends it. `fsync` only guarantees the local SQLite file, not that other
+> clients have the data. A row marked `sent` is not retried until the next
+> session resets it to `pending`.
 >
 > Other clients see changes after a convergence delay (about 0.1 s on a LAN,
 > about 1 s on a public network); reads during that window can return old
-> data. A JOIN allows reads while it replaces the tree, so a reader can see a
-> stale or mixed tree; writes return `EROFS` until the JOIN completes.
+> data. A JOIN allows reads while it replays, so a reader can see a stale or
+> mixed tree; writes return `EROFS` until the replay completes.
 >
-> `mmap(MAP_SHARED)`, device nodes, Unix sockets, FIFOs and `O_APPEND` are best
-> effort: they are accepted but their cross-client semantics are weak. `flock`
-> is local to one mount. `fcntl` record locks are cross-client, but a departed
-> holder's locks are released by a signed `LEAVE` or a lease, not by a server
-> hint. Hard links are strongly consistent. atime is not synchronized; uid/gid
-> are not mapped.
+> A server rejection marks the outbox row `failed` but does not roll back the
+> local effect. A rejected namespace operation can leave the replica diverged
+> until an epoch change or a new import; writes to an existing path converge by
+> last-writer-wins.
 >
-> The server sees ciphertext and traffic shape, not payloads or paths. It can
-> rewrite sequence numbers, delay, drop or reorder frames; clients detect their
-> own gaps but cannot prove cross-client reordering. Do not treat server
-> control frames as authority. Use TLS in front of the sequencer on an
-> untrusted network.
+> Names must be valid UTF-8 and at most 255 bytes. xattrs, POSIX ACLs, `fcntl`
+> record locks, device nodes, FIFOs and Unix sockets are not supported.
+> `flock` is local to one mount. `mmap(MAP_SHARED)` is not a supported path.
+> One wire write and one event payload are capped at 4 MiB; the server refuses
+> a file above 4 GiB.
 >
-> The encryption has no forward secrecy and no key revocation. A leaked
-> password requires rebuilding the cluster. A leaked client private key allows
-> impersonation of that client if the attacker also has the password.
+> The server can delay, drop, duplicate or reorder frames; clients detect their
+> own gaps and epoch changes but cannot prove a cross-client reorder. A
+> graceful shutdown drains for at most 30 seconds, compacts the event log,
+> advances the epoch and kicks every client; a client then clears its replica
+> and replays from zero. A crash resumes the previous epoch and sequence.
 >
-> A plaintext chunk index lets a cluster member tell whether two blocks are
-> identical. The server does not see the index. This is the accepted cost of
-> plaintext addressing.
+> The client speaks plain HTTP/1.1 and rejects `https://`. Without a TLS
+> tunnel, the link metadata is visible to the network. The PSK hides paths and
+> payloads from an eavesdropper, not from the server.
 >
-> Only Linux is supported. The design point is about 20 online clients, one
-> million files and 4 GiB per file; larger deployments are not promised. rsync
-> uses 16 MiB segments, so a segment boundary can lose one block match.
+> Only Linux is supported. The reference deployment has 12 clients and two
+> namespaces; the design point is about one million files and 4 GiB per file.

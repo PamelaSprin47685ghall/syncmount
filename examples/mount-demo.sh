@@ -28,7 +28,7 @@ BIN=${SYNCMOUNT_BIN:-syncmount}
 ROOT=$(mktemp -d "${TMPDIR:-/tmp}/syncmount-demo.XXXXXX")
 MNT="$ROOT/mnt"
 export SYNCMOUNT_RUN_DIR="$ROOT/run"
-export XDG_STATE_HOME="$ROOT/state"
+export XDG_DATA_HOME="$ROOT/data"
 export SYNCMOUNT_MASTER_PASSWORD="$PASSWORD"
 
 SERVER_PID=
@@ -64,7 +64,7 @@ require fusermount3
     exit 2
 }
 
-mkdir -p "$MNT" "$SYNCMOUNT_RUN_DIR" "$XDG_STATE_HOME"
+mkdir -p "$MNT" "$SYNCMOUNT_RUN_DIR" "$XDG_DATA_HOME"
 
 echo "== start sequencer on $URL"
 "$BIN" server "$URL" --listen "127.0.0.1:${PORT}" --log-format json \
@@ -93,7 +93,8 @@ done
 }
 
 echo "== mount $MNT"
-"$BIN" client "$URL" "$MNT" --log-format json >"$ROOT/client.log" 2>&1 &
+"$BIN" client "$URL" "$MNT" --db "$ROOT/client.db" \
+    --log-format json >"$ROOT/client.log" 2>&1 &
 CLIENT_PID=$!
 
 for _ in $(seq 1 100); do

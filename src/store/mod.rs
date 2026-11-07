@@ -20,11 +20,13 @@
 //! | [`chunk_store`] | content-addressed chunk cache (`chunk_id` + `blob_id`) |
 //! | [`node_table`] | [`InodeId`] and the inode/path/name index |
 //! | [`runtime_dir`] | `/run/syncmount/<mount_id>`: status file and instance lock |
+//! | [`sqlite`] | shared SQLite state store for the SQLite-backed architecture |
 
 pub mod backing;
 pub mod chunk_store;
 pub mod node_table;
 pub mod runtime_dir;
+pub mod sqlite;
 
 pub use backing::{BackingStore, DirEntry, DirSink, Effect, PosixBacking, RootFd};
 pub use node_table::{InodeId, Node, NodeTable};

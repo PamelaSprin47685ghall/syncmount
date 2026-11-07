@@ -1,8 +1,9 @@
 //! Online table, session state, watermark and the per-session outbound queue.
 //!
-//! The table is keyed by `client_id`, never by address (42 I7): NAT rebinding
-//! and Wi-Fi roaming produce a new connection, not a new identity. `PeerId` is
-//! a diagnostic handle and appears in logs only; no branch reads it.
+//! The table is keyed by the server-assigned `SessionId`, never by address:
+//! NAT rebinding and Wi-Fi roaming produce a new connection, not a new
+//! identity. `PeerId` is a diagnostic handle and appears in logs only; no
+//! branch reads it.
 //!
 //! # Watermarks
 //!
@@ -20,7 +21,7 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use tokio::sync::mpsc;
 
-use crate::protocol::{ClientId, KickReason, Seq};
+use crate::protocol::{KickReason, Seq, SessionId};
 use crate::transport::PeerId;
 
 use super::config::OutboxConfig;
@@ -28,12 +29,11 @@ use super::config::OutboxConfig;
 /// Lifecycle of one attached session (42 §4.2).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum SessionState {
-    /// `HELLO` seen, downlink not yet paired.
-    AwaitingDownstream,
-    /// Both halves paired; the session receives broadcasts.
+    /// Authenticated and catching up from the event log. Live broadcasts are
+    /// withheld so replay and live frames cannot interleave.
+    Replaying,
+    /// Caught up; the session receives broadcasts.
     Online,
-    /// The client reported an epoch mismatch and must resynchronize.
-    Resyncing,
     /// Removed from the broadcast set; the writer drains and closes.
     Kicking,
 }
@@ -44,7 +44,7 @@ impl SessionState {
     /// `Kicking` is the only exclusion: the whole point of the state is that
     /// no `ORDERED` frame follows the `KICK` (42 I9).
     pub const fn receives_broadcast(self) -> bool {
-        !matches!(self, Self::Kicking)
+        matches!(self, Self::Online)
     }
 }
 
@@ -200,6 +200,20 @@ impl Outbox {
             Err(mpsc::error::TrySendError::Full(_)) => PushOutcome::Overflow,
             Err(mpsc::error::TrySendError::Closed(_)) => PushOutcome::Closed,
         }
+    }
+
+    /// Enqueue one data frame with backpressure.
+    ///
+    /// Replay uses this path: the actor must not block, and the bounded
+    /// channel already caps memory. The frame is charged to the queue
+    /// counters so `healthz` and the overflow policy still see it.
+    pub async fn send_data(&self, frame: Bytes) -> bool {
+        let len = frame.len();
+        if self.data.send(frame).await.is_err() {
+            return false;
+        }
+        self.queued.add(len);
+        true
     }
 
     /// Try to enqueue one control frame.
@@ -398,8 +412,8 @@ impl Watermark {
 /// Everything needed to construct a [`Session`].
 #[derive(Debug)]
 pub struct SessionInit {
-    /// Identity.
-    pub client_id: ClientId,
+    /// Server-assigned connection identity.
+    pub session_id: SessionId,
     /// Pairing token of the two HTTP halves.
     pub nonce: u64,
     /// Diagnostic connection handle.
@@ -420,12 +434,12 @@ pub struct SessionInit {
 
 /// One attached session.
 ///
-/// No address field: identity is `client_id`, and a diagnostic `PeerId` is
-/// the only connection-shaped value the server keeps.
+/// No address field: identity is the server-assigned `session_id`, and a
+/// diagnostic `PeerId` is the only connection-shaped value the server keeps.
 #[derive(Debug)]
 pub struct Session {
-    /// Persistent identity.
-    pub client_id: ClientId,
+    /// Server-assigned connection identity.
+    pub session_id: SessionId,
     /// Connection generation assigned by the sequencer at attach.
     ///
     /// A detach names the generation it belongs to, so a late detach from a
@@ -464,13 +478,13 @@ impl Session {
             Seq::UNSEQUENCED
         };
         Self {
-            client_id: init.client_id,
+            session_id: init.session_id,
             // The actor overwrites this at attach. Using the pairing nonce as
             // the default keeps direct constructors (tests) distinct.
             generation: init.nonce,
             nonce: init.nonce,
             peer: init.peer,
-            state: SessionState::AwaitingDownstream,
+            state: SessionState::Replaying,
             outbox: init.outbox,
             watermark: Watermark::new(applied, init.epoch_seen, init.now),
             opened_at: init.now,
@@ -486,8 +500,8 @@ impl Session {
 /// actor use the atomic mirrors in [`super::sequencer::Metrics`].
 #[derive(Debug, Default)]
 pub struct OnlineTable {
-    by_client: HashMap<ClientId, Session>,
-    by_nonce: HashMap<u64, ClientId>,
+    by_session: HashMap<SessionId, Session>,
+    by_nonce: HashMap<u64, SessionId>,
 }
 
 impl OnlineTable {
@@ -502,18 +516,18 @@ impl OnlineTable {
     /// before attaching the new one); the table only keeps both indices
     /// consistent.
     pub fn insert(&mut self, session: Session) -> Option<Session> {
-        let old = self.by_client.remove(&session.client_id);
+        let old = self.by_session.remove(&session.session_id);
         if let Some(old) = &old {
             self.by_nonce.remove(&old.nonce);
         }
-        self.by_nonce.insert(session.nonce, session.client_id);
-        self.by_client.insert(session.client_id, session);
+        self.by_nonce.insert(session.nonce, session.session_id);
+        self.by_session.insert(session.session_id, session);
         old
     }
 
     /// Remove one session and its nonce index.
-    pub fn remove(&mut self, client: &ClientId) -> Option<Session> {
-        let session = self.by_client.remove(client)?;
+    pub fn remove(&mut self, session_id: &SessionId) -> Option<Session> {
+        let session = self.by_session.remove(session_id)?;
         self.by_nonce.remove(&session.nonce);
         Some(session)
     }
@@ -522,16 +536,20 @@ impl OnlineTable {
     ///
     /// A detach from a replaced connection names the old generation and
     /// leaves the successor untouched.
-    pub fn remove_generation(&mut self, client: &ClientId, generation: u64) -> Option<Session> {
-        if self.by_client.get(client)?.generation != generation {
+    pub fn remove_generation(
+        &mut self,
+        session_id: &SessionId,
+        generation: u64,
+    ) -> Option<Session> {
+        if self.by_session.get(session_id)?.generation != generation {
             return None;
         }
-        self.remove(client)
+        self.remove(session_id)
     }
 
     /// Whether an identity is attached.
-    pub fn contains(&self, client: &ClientId) -> bool {
-        self.by_client.contains_key(client)
+    pub fn contains(&self, session_id: &SessionId) -> bool {
+        self.by_session.contains_key(session_id)
     }
 
     /// Whether a nonce already belongs to an attached session.
@@ -540,50 +558,38 @@ impl OnlineTable {
     }
 
     /// Resolve a nonce to its attached identity.
-    pub fn nonce_of(&self, nonce: u64) -> Option<ClientId> {
+    pub fn nonce_of(&self, nonce: u64) -> Option<SessionId> {
         self.by_nonce.get(&nonce).copied()
     }
 
     /// Borrow one session.
-    pub fn get(&self, client: &ClientId) -> Option<&Session> {
-        self.by_client.get(client)
+    pub fn get(&self, session_id: &SessionId) -> Option<&Session> {
+        self.by_session.get(session_id)
     }
 
     /// Mutably borrow one session.
-    pub fn get_mut(&mut self, client: &ClientId) -> Option<&mut Session> {
-        self.by_client.get_mut(client)
+    pub fn get_mut(&mut self, session_id: &SessionId) -> Option<&mut Session> {
+        self.by_session.get_mut(session_id)
     }
 
     /// Iterate every attached session.
-    pub fn iter(&self) -> impl Iterator<Item = (&ClientId, &Session)> {
-        self.by_client.iter()
+    pub fn iter(&self) -> impl Iterator<Item = (&SessionId, &Session)> {
+        self.by_session.iter()
     }
 
     /// Iterate every attached session mutably.
-    pub fn iter_mut(&mut self) -> impl Iterator<Item = (&ClientId, &mut Session)> {
-        self.by_client.iter_mut()
+    pub fn iter_mut(&mut self) -> impl Iterator<Item = (&SessionId, &mut Session)> {
+        self.by_session.iter_mut()
     }
 
     /// Number of attached sessions.
     pub fn len(&self) -> usize {
-        self.by_client.len()
-    }
-
-    /// Whether no identity other than `client` is attached.
-    ///
-    /// Every state counts: a session that is still pairing its downlink, a
-    /// session resynchronizing, and a session being kicked all belong to
-    /// someone else. The self-view decision must see the conservative answer,
-    /// because any other member may hold history this client lacks.
-    pub fn is_alone(&self, client: &ClientId) -> bool {
-        self.by_client
-            .keys()
-            .all(|other| other.as_bytes() == client.as_bytes())
+        self.by_session.len()
     }
 
     /// Whether no session is attached.
     pub fn is_empty(&self) -> bool {
-        self.by_client.is_empty()
+        self.by_session.is_empty()
     }
 }
 
@@ -598,14 +604,14 @@ mod tests {
         Instant::now() + Duration::from_secs(seconds)
     }
 
-    fn client(byte: u8) -> ClientId {
-        ClientId::from_bytes([byte; 16])
+    fn session_id(byte: u8) -> SessionId {
+        SessionId(u128::from_le_bytes([byte; 16]))
     }
 
-    fn session(id: ClientId, nonce: u64) -> Session {
+    fn session(id: SessionId, nonce: u64) -> Session {
         let (outbox, _data, _ctrl) = Outbox::new(&OutboxConfig::default());
         Session::new(SessionInit {
-            client_id: id,
+            session_id: id,
             nonce,
             peer: PeerId::from_serial(nonce),
             outbox,
@@ -694,13 +700,13 @@ mod tests {
     #[test]
     fn server_online_table_reindexes_replacement() {
         let mut table = OnlineTable::new();
-        assert!(table.insert(session(client(1), 10)).is_none());
-        let old = table.insert(session(client(1), 11));
+        assert!(table.insert(session(session_id(1), 10)).is_none());
+        let old = table.insert(session(session_id(1), 11));
         assert!(old.is_some());
         assert!(!table.contains_nonce(10));
         assert!(table.contains_nonce(11));
         assert_eq!(table.len(), 1);
-        assert!(table.remove(&client(1)).is_some());
+        assert!(table.remove(&session_id(1)).is_some());
         assert!(table.is_empty());
     }
 }

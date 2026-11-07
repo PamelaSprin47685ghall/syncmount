@@ -191,7 +191,7 @@ impl fmt::Debug for Flags {
     }
 }
 
-/// One of the 14 defined message types (44 §3.1).
+/// One of the 16 defined message types (44 §3.1).
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct MsgType(u8);
 
@@ -200,6 +200,10 @@ impl MsgType {
     pub const HELLO: Self = Self(0x01);
     /// Server welcome; plain WCP.
     pub const WELCOME: Self = Self(0x02);
+    /// Client handshake authentication; sealed under the handshake key.
+    pub const AUTH: Self = Self(0x03);
+    /// Server handshake acceptance; sealed under the handshake key.
+    pub const ACCEPT: Self = Self(0x04);
     /// Sequenced operation; sealed WCP.
     pub const ORDERED: Self = Self(0x10);
     /// Operation response; sealed WCP.
@@ -210,25 +214,27 @@ impl MsgType {
     pub const ACK: Self = Self(0x13);
     /// Client heartbeat; sealed WCP with a control prefix.
     pub const PING: Self = Self(0x14);
-    /// Server heartbeat reply; plain WCP.
+    /// Server heartbeat reply; sealed WCP.
     pub const PONG: Self = Self(0x15);
     /// Transport-level error; plain WCP.
     pub const ERROR: Self = Self(0x16);
-    /// Server kick; plain WCP.
+    /// Server kick; sealed WCP.
     pub const KICK: Self = Self(0x17);
-    /// Flow-control grant; plain WCP with a route prefix.
+    /// Flow-control grant; sealed WCP with a route prefix.
     pub const FLOW: Self = Self(0x18);
-    /// End of a sync session; plain WCP with a route prefix.
+    /// End of a sync session; sealed WCP with a route prefix.
     pub const SYNC_END: Self = Self(0x19);
     /// Raw sealed stream chunk with a route prefix.
     pub const STREAM_DATA: Self = Self(0x1A);
-    /// Server-injected leave notice; plain WCP.
+    /// Server-injected leave notice; sealed WCP.
     pub const LEAVE: Self = Self(0x1B);
 
     /// Every defined type, in wire order. Used by table-driven tests.
-    pub const ALL: [Self; 14] = [
+    pub const ALL: [Self; 16] = [
         Self::HELLO,
         Self::WELCOME,
+        Self::AUTH,
+        Self::ACCEPT,
         Self::ORDERED,
         Self::RESPONSE,
         Self::RELAY,
@@ -253,6 +259,8 @@ impl MsgType {
         match raw {
             0x01 => Ok(Self::HELLO),
             0x02 => Ok(Self::WELCOME),
+            0x03 => Ok(Self::AUTH),
+            0x04 => Ok(Self::ACCEPT),
             0x10 => Ok(Self::ORDERED),
             0x11 => Ok(Self::RESPONSE),
             0x12 => Ok(Self::RELAY),
@@ -274,6 +282,8 @@ impl MsgType {
         matches!(
             raw,
             0x01 | 0x02
+                | 0x03
+                | 0x04
                 | 0x10
                 | 0x11
                 | 0x12
@@ -299,9 +309,12 @@ impl MsgType {
     }
 
     /// Body encoding this type requires.
+    ///
+    /// Plain frames are exactly the ones a peer must read before it holds a
+    /// key: `HELLO`, `WELCOME` and `ERROR`. Everything else is sealed.
     pub const fn body_encoding(self) -> BodyEncoding {
         match self.0 {
-            0x01 | 0x02 | 0x15 | 0x16 | 0x17 | 0x18 | 0x19 | 0x1B => BodyEncoding::Plain,
+            0x01 | 0x02 | 0x16 => BodyEncoding::Plain,
             _ => BodyEncoding::Sealed,
         }
     }
@@ -311,6 +324,8 @@ impl MsgType {
         match self.0 {
             0x01 => "HELLO",
             0x02 => "WELCOME",
+            0x03 => "AUTH",
+            0x04 => "ACCEPT",
             0x10 => "ORDERED",
             0x11 => "RESPONSE",
             0x12 => "RELAY",
@@ -1320,6 +1335,53 @@ mod tests {
             MsgType::from_u8(0x1c),
             Err(ProtocolError::UnknownType(0x1c))
         ));
+    }
+
+    #[test]
+    fn frame_table_is_exactly_the_psk_table() {
+        for msg_type in [MsgType::HELLO, MsgType::WELCOME, MsgType::ERROR] {
+            assert_eq!(
+                msg_type.body_encoding(),
+                BodyEncoding::Plain,
+                "{} must stay plain",
+                msg_type.name()
+            );
+        }
+        for msg_type in [
+            MsgType::AUTH,
+            MsgType::ACCEPT,
+            MsgType::ORDERED,
+            MsgType::RESPONSE,
+            MsgType::RELAY,
+            MsgType::ACK,
+            MsgType::PING,
+            MsgType::PONG,
+            MsgType::KICK,
+            MsgType::FLOW,
+            MsgType::SYNC_END,
+            MsgType::STREAM_DATA,
+            MsgType::LEAVE,
+        ] {
+            assert_eq!(
+                msg_type.body_encoding(),
+                BodyEncoding::Sealed,
+                "{} must be sealed",
+                msg_type.name()
+            );
+            let mut flags = Flags::EMPTY.with(Flags::ENC);
+            match msg_type.prefix_kind() {
+                PrefixKind::Route => flags = flags.with(Flags::ROUTED),
+                PrefixKind::Ctrl => flags = flags.with(Flags::CTRL),
+                PrefixKind::None => {}
+            }
+            flags.validate(msg_type).expect("sealed flags are valid");
+            assert!(Flags::EMPTY.validate(msg_type).is_err());
+        }
+        assert_eq!(MsgType::ALL.len(), 16);
+        assert_eq!(MsgType::AUTH.get(), 0x03);
+        assert_eq!(MsgType::ACCEPT.get(), 0x04);
+        assert_eq!(MsgType::AUTH.name(), "AUTH");
+        assert_eq!(MsgType::ACCEPT.name(), "ACCEPT");
     }
 
     #[test]

@@ -60,8 +60,10 @@ pub struct ProtoVersion {
 impl ProtoVersion {
     /// Version 1.0.
     pub const V1_0: Self = Self { major: 1, minor: 0 };
+    /// Version 2.0: PSK handshake, clean break from 1.x.
+    pub const V2_0: Self = Self { major: 2, minor: 0 };
     /// The version this crate speaks.
-    pub const CURRENT: Self = Self::V1_0;
+    pub const CURRENT: Self = Self::V2_0;
 }
 
 /// WCP field-stream version carried in `F_WCP_VER`.
@@ -130,8 +132,9 @@ impl Caps {
     pub const SESSION_KEYS: Self = Self(1 << 3);
     /// Snapshot + rsync join path. On in v1.
     pub const SNAPSHOT_RSYNC: Self = Self(1 << 4);
-    /// Ed25519 operation signatures. Mandatory in v1.
-    pub const OP_SIGNATURE: Self = Self(1 << 5);
+    /// PSK handshake support. Mandatory in v2. Reuses bit 5, which carried
+    /// `OP_SIGNATURE` in v1.
+    pub const PSK_AUTH: Self = Self(1 << 5);
     /// The server names the holder, sequence and session of a view snapshot
     /// in `WELCOME` (`F_VIEW_HOLDER`, `F_VIEW_SEQ`, `F_VIEW_SESSION`).
     /// Off in v1; a peer that does not set it must not send those fields.
@@ -140,8 +143,8 @@ impl Caps {
     /// (`F_VIEW_SELF`); the view sequence is `current_seq`. Off in v1.
     pub const VIEW_SELF: Self = Self(1 << 7);
 
-    /// Capabilities without which v1 cannot operate.
-    pub const REQUIRED: Self = Self(Self::CHACHA8_POLY1305.0 | Self::OP_SIGNATURE.0);
+    /// Capabilities without which v2 cannot operate.
+    pub const REQUIRED: Self = Self(Self::CHACHA8_POLY1305.0 | Self::PSK_AUTH.0);
 
     /// No bits set.
     pub const EMPTY: Self = Self(0);
@@ -224,9 +227,9 @@ impl fmt::Display for Caps {
             sep(f)?;
             f.write_str("SNAPSHOT_RSYNC")?;
         }
-        if self.contains(Self::OP_SIGNATURE) {
+        if self.contains(Self::PSK_AUTH) {
             sep(f)?;
-            f.write_str("OP_SIGNATURE")?;
+            f.write_str("PSK_AUTH")?;
         }
         if self.contains(Self::VIEW_SOURCE) {
             sep(f)?;
@@ -304,8 +307,8 @@ impl std::error::Error for VersionError {}
 ///
 /// Rules (44 §6): majors must match, the minor is the lower of the two, caps
 /// are intersected, and both [`Caps::CHACHA8_POLY1305`] and
-/// [`Caps::OP_SIGNATURE`] must survive the intersection. There is no
-/// unencrypted or unsigned compatibility mode in v1.
+/// [`Caps::PSK_AUTH`] must survive the intersection. There is no
+/// unencrypted or unauthenticated compatibility mode in v2.
 pub fn negotiate(
     local: ProtoVersion,
     remote: ProtoVersion,
@@ -369,8 +372,8 @@ mod tests {
 
     #[test]
     fn negotiate_takes_lower_minor_and_capability_intersection() {
-        let local = ProtoVersion { major: 1, minor: 5 };
-        let remote = ProtoVersion { major: 1, minor: 2 };
+        let local = ProtoVersion { major: 2, minor: 5 };
+        let remote = ProtoVersion { major: 2, minor: 2 };
         let caps = Caps::REQUIRED.union(Caps::SNAPSHOT_RSYNC).union(Caps::ZSTD);
         let got = negotiate(
             local,
@@ -379,7 +382,7 @@ mod tests {
             Caps::REQUIRED.union(Caps::SNAPSHOT_RSYNC),
         )
         .expect("negotiation succeeds");
-        assert_eq!(got.proto, ProtoVersion { major: 1, minor: 2 });
+        assert_eq!(got.proto, ProtoVersion { major: 2, minor: 2 });
         assert_eq!(got.caps, Caps::REQUIRED.union(Caps::SNAPSHOT_RSYNC));
         assert!(!got.caps.contains(Caps::ZSTD));
     }
@@ -403,15 +406,15 @@ mod tests {
     }
 
     #[test]
-    fn negotiate_requires_cipher_and_signature() {
+    fn negotiate_requires_cipher_and_psk_auth() {
         let err = negotiate(
             ProtoVersion::CURRENT,
             ProtoVersion::CURRENT,
-            Caps::REQUIRED.without(Caps::OP_SIGNATURE),
+            Caps::REQUIRED.without(Caps::PSK_AUTH),
             Caps::REQUIRED,
         )
-        .expect_err("missing signature must fail");
-        assert_eq!(err, VersionError::MissingCapability(Caps::OP_SIGNATURE));
+        .expect_err("missing PSK capability must fail");
+        assert_eq!(err, VersionError::MissingCapability(Caps::PSK_AUTH));
 
         let err = negotiate(
             ProtoVersion::CURRENT,
@@ -428,9 +431,37 @@ mod tests {
         let caps = Caps::REQUIRED.union(Caps::SNAPSHOT_RSYNC);
         let text = caps.to_string();
         assert!(text.contains("CHACHA8_POLY1305"));
-        assert!(text.contains("OP_SIGNATURE"));
+        assert!(text.contains("PSK_AUTH"));
         assert!(text.contains("SNAPSHOT_RSYNC"));
         assert!(!text.contains("ZSTD"));
+    }
+
+    #[test]
+    fn proto_current_is_major_two_and_rejects_v1() {
+        assert_eq!(ProtoVersion::CURRENT.major, 2);
+        assert_eq!(ProtoVersion::CURRENT.minor, 0);
+        let err = negotiate(
+            ProtoVersion::CURRENT,
+            ProtoVersion::V1_0,
+            Caps::REQUIRED,
+            Caps::REQUIRED,
+        )
+        .expect_err("v1 is not compatible with v2");
+        assert_eq!(
+            err,
+            VersionError::MajorMismatch {
+                local: 2,
+                remote: 1
+            }
+        );
+    }
+
+    #[test]
+    fn psk_auth_reuses_bit_five() {
+        assert_eq!(Caps::PSK_AUTH.bits(), 1 << 5);
+        assert_eq!(Caps::PSK_AUTH.bits(), 0x20);
+        assert!(Caps::REQUIRED.contains(Caps::PSK_AUTH));
+        assert_eq!(Caps::REQUIRED, Caps::CHACHA8_POLY1305.union(Caps::PSK_AUTH));
     }
 
     #[test]
@@ -447,7 +478,11 @@ mod tests {
         assert_eq!(Caps::VIEW_SELF.bits(), 1 << 7);
         assert_eq!(Caps::VIEW_SELF.bits(), 0x80);
         assert!(!Caps::REQUIRED.contains(Caps::VIEW_SELF));
-        assert!(!Caps::VIEW_SELF.intersect(Caps::VIEW_SOURCE).contains(Caps::VIEW_SOURCE));
+        assert!(
+            !Caps::VIEW_SELF
+                .intersect(Caps::VIEW_SOURCE)
+                .contains(Caps::VIEW_SOURCE)
+        );
         assert!(Caps::VIEW_SELF.to_string().contains("VIEW_SELF"));
     }
 }

@@ -15,7 +15,7 @@
 //! * `SYNCMOUNT_MASTER_PASSWORD` — the secret itself;
 //! * `SYNCMOUNT_MASTER_PASSWORD_FILE` — a path whose file must be mode 0600;
 //! * a TTY prompt, which belongs to the CLI/identity layer and is represented
-//!   here only as [`PasswordSource::Tty`].
+//!   the CLI, so this module never reads a secret.
 //!
 //! Setting both environment variables is a configuration error: a silent
 //! precedence rule would hide a stale secret.
@@ -23,13 +23,10 @@
 use std::env;
 use std::fmt;
 use std::fs;
-use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use zeroize::Zeroizing;
 
-use crate::protocol::frame::ClientId;
 
 /// Environment variable carrying the master password.
 pub const ENV_MASTER_PASSWORD: &str = "SYNCMOUNT_MASTER_PASSWORD";
@@ -198,113 +195,16 @@ fn normalize_prefix(path: &str) -> Result<String, ConfigError> {
     Ok(prefix)
 }
 
-/// A process-start identity; the left half of every `op_id`.
-///
-/// It is fresh on every start, so a restarted client never reuses an
-/// `op_id` that the cluster has already sequenced (44 V12).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct InstanceId(pub u64);
-
-impl InstanceId {
-    /// Generate a fresh instance id.
-    pub fn fresh() -> Self {
-        let bytes = uuid::Uuid::new_v4().into_bytes();
-        let mut raw = [0u8; 8];
-        raw.copy_from_slice(&bytes[..8]);
-        Self(u64::from_le_bytes(raw))
-    }
-}
-
-impl fmt::Display for InstanceId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{:016x}", self.0)
-    }
-}
-
-/// Where the master password comes from.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum PasswordSource {
-    /// `SYNCMOUNT_MASTER_PASSWORD`.
-    Env,
-    /// `SYNCMOUNT_MASTER_PASSWORD_FILE`, mode 0600.
-    File(PathBuf),
-    /// An interactive prompt, owned by the CLI layer.
-    Tty,
-}
-
-impl PasswordSource {
-    /// Detect the configured source, rejecting an ambiguous environment.
-    pub fn detect() -> Result<Self, ConfigError> {
-        Self::detect_from(|key| env::var_os(key))
-    }
-
-    /// Detection with an injectable environment reader (tests).
-    pub fn detect_from<F>(mut get: F) -> Result<Self, ConfigError>
-    where
-        F: FnMut(&str) -> Option<std::ffi::OsString>,
-    {
-        let inline = get(ENV_MASTER_PASSWORD);
-        let file = get(ENV_MASTER_PASSWORD_FILE);
-        match (inline, file) {
-            (Some(_), Some(_)) => Err(ConfigError::PasswordConflict),
-            (Some(_), None) => Ok(Self::Env),
-            (None, Some(path)) => {
-                let path = PathBuf::from(path);
-                check_password_file(&path)?;
-                Ok(Self::File(path))
-            }
-            (None, None) => Ok(Self::Tty),
-        }
-    }
-
-    /// Read the secret.
-    ///
-    /// [`PasswordSource::Tty`] has no implementation here: reading a terminal
-    /// needs the CLI's prompt, and inventing one in `client` would create a
-    /// second password path.
-    pub fn read(&self) -> Result<Zeroizing<Vec<u8>>, ConfigError> {
-        match self {
-            Self::Env => match env::var(ENV_MASTER_PASSWORD) {
-                Ok(value) if !value.is_empty() => Ok(Zeroizing::new(value.into_bytes())),
-                Ok(_) => Err(ConfigError::PasswordMissing),
-                Err(_) => Err(ConfigError::PasswordMissing),
-            },
-            Self::File(path) => {
-                check_password_file(path)?;
-                let data = fs::read(path)
-                    .map_err(|_| ConfigError::PasswordFileUnreadable(path.clone()))?;
-                let mut secret = data;
-                while matches!(secret.last(), Some(b'\n' | b'\r')) {
-                    secret.pop();
-                }
-                if secret.is_empty() {
-                    return Err(ConfigError::PasswordMissing);
-                }
-                Ok(Zeroizing::new(secret))
-            }
-            Self::Tty => Err(ConfigError::TtyUnavailable),
-        }
-    }
-}
-
-fn check_password_file(path: &Path) -> Result<(), ConfigError> {
-    let meta = fs::metadata(path).map_err(|_| ConfigError::PasswordFileUnreadable(path.into()))?;
-    if !meta.is_file() {
-        return Err(ConfigError::PasswordFileUnreadable(path.into()));
-    }
-    if meta.mode() & 0o077 != 0 {
-        return Err(ConfigError::PasswordFileUnsafe(path.into()));
-    }
-    Ok(())
-}
-
 /// Timing and capacity knobs, with the values fixed by 39 §2.1/§2.3 and 41.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Tuning {
-    /// Outbox byte ceiling (`ENOSPC` above it).
-    pub outbox_max_bytes: usize,
-    /// Outbox operation ceiling.
-    pub outbox_max_ops: usize,
+    /// Outbox soft byte budget.
+    ///
+    /// Crossing it logs one warning and never rejects a write; the network
+    /// must not turn a successful local write into `ENOSPC`.
+    pub outbox_soft_bytes: usize,
+    /// Outbox soft operation budget, with the same advisory semantics.
+    pub outbox_soft_ops: usize,
     /// Aggregate size that forces an immediate send (39: 128 KiB).
     pub aggregate_bytes: usize,
     /// Quiet window after which a partial aggregate is sent (39: 2–5 ms).
@@ -332,8 +232,8 @@ pub struct Tuning {
 impl Default for Tuning {
     fn default() -> Self {
         Self {
-            outbox_max_bytes: 64 * 1024 * 1024,
-            outbox_max_ops: 65_536,
+            outbox_soft_bytes: 1024 * 1024 * 1024,
+            outbox_soft_ops: 1 << 20,
             aggregate_bytes: 128 * 1024,
             aggregate_window: Duration::from_millis(2),
             aggregate_hard: Duration::from_millis(5),
@@ -356,27 +256,12 @@ pub struct Config {
     pub endpoint: Endpoint,
     /// Absolute mountpoint.
     pub mountpoint: PathBuf,
-    /// Persistent client identity (derived by the identity layer, W7).
-    pub client_id: ClientId,
-    /// Process-start identity.
-    pub instance: InstanceId,
     /// Stable id of this mountpoint, used for the runtime directory.
     pub mount_id: String,
     /// Tunables.
     pub tuning: Tuning,
-    /// Password source.
-    pub password: PasswordSource,
     /// Runtime directory base.
     pub run_dir: PathBuf,
-    /// Accept a JOIN with no remote view above sequence zero.
-    ///
-    /// The default is `false`. A cluster that reports `current_seq > 0` but
-    /// offers no view (no `WELCOME.view_seq`, no snapshot and no injected
-    /// [`crate::sync::JoinView`]) cannot be joined safely: the only view the
-    /// client could build is empty, and cluster-wins would delete every
-    /// local-only path. Such a JOIN is refused unless this flag is set
-    /// explicitly, which records that the operator accepts the loss.
-    pub allow_empty_view: bool,
 }
 
 impl Config {
@@ -384,11 +269,9 @@ impl Config {
     pub fn new(
         endpoint: Endpoint,
         mountpoint: impl Into<PathBuf>,
-        client_id: ClientId,
     ) -> Result<Self, ConfigError> {
         let mountpoint = mountpoint.into();
         validate_mountpoint(&mountpoint)?;
-        let password = PasswordSource::detect()?;
         let run_dir = env::var_os(ENV_RUN_DIR)
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(DEFAULT_RUN_DIR));
@@ -396,34 +279,14 @@ impl Config {
             mount_id: mount_id_for(&mountpoint),
             endpoint,
             mountpoint,
-            client_id,
-            instance: InstanceId::fresh(),
             tuning: Tuning::default(),
-            password,
             run_dir,
-            allow_empty_view: false,
         })
     }
 
     /// Replace the tunables (tests, benchmarks).
     pub fn with_tuning(mut self, tuning: Tuning) -> Self {
         self.tuning = tuning;
-        self
-    }
-
-    /// Replace the password source (tests, CLI prompts).
-    pub fn with_password(mut self, password: PasswordSource) -> Self {
-        self.password = password;
-        self
-    }
-
-    /// Accept a JOIN that has no remote view above sequence zero.
-    ///
-    /// Setting this is an explicit opt-in to cluster-wins over an empty view:
-    /// local-only paths are deleted. The CLI flag is wired separately; tests
-    /// and embedders use this builder.
-    pub fn with_allow_empty_view(mut self, allow: bool) -> Self {
-        self.allow_empty_view = allow;
         self
     }
 
@@ -489,16 +352,6 @@ pub enum ConfigError {
     MountpointMissing(PathBuf),
     /// The mountpoint is not a directory.
     MountpointNotDirectory(PathBuf),
-    /// Both password environment variables are set.
-    PasswordConflict,
-    /// The password source is empty.
-    PasswordMissing,
-    /// The password file is unreadable or not a regular file.
-    PasswordFileUnreadable(PathBuf),
-    /// The password file is not mode 0600.
-    PasswordFileUnsafe(PathBuf),
-    /// No TTY prompt is available in this layer.
-    TtyUnavailable,
 }
 
 impl fmt::Display for ConfigError {
@@ -522,20 +375,6 @@ impl fmt::Display for ConfigError {
             Self::MountpointNotDirectory(path) => {
                 write!(f, "mountpoint `{}` is not a directory", path.display())
             }
-            Self::PasswordConflict => write!(
-                f,
-                "set only one of {ENV_MASTER_PASSWORD} and {ENV_MASTER_PASSWORD_FILE}"
-            ),
-            Self::PasswordMissing => f.write_str("master password is empty"),
-            Self::PasswordFileUnreadable(path) => {
-                write!(f, "cannot read password file `{}`", path.display())
-            }
-            Self::PasswordFileUnsafe(path) => write!(
-                f,
-                "password file `{}` must be mode 0600 (no group/other bits)",
-                path.display()
-            ),
-            Self::TtyUnavailable => f.write_str("no terminal prompt available"),
         }
     }
 }
@@ -545,8 +384,6 @@ impl std::error::Error for ConfigError {}
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
-
-    use std::ffi::OsString;
 
     use super::*;
 
@@ -613,67 +450,11 @@ mod tests {
         assert_eq!(endpoint.prefix, "/ns");
     }
 
-    /// 39 §2.1, 37
-    #[test]
-    fn u_config_password_source_detection() {
-        let source = PasswordSource::detect_from(|key| match key {
-            ENV_MASTER_PASSWORD => Some(OsString::from("secret")),
-            _ => None,
-        })
-        .unwrap();
-        assert_eq!(source, PasswordSource::Env);
-
-        let source = PasswordSource::detect_from(|_| None).unwrap();
-        assert_eq!(source, PasswordSource::Tty);
-        assert_eq!(source.read(), Err(ConfigError::TtyUnavailable));
-
-        assert_eq!(
-            PasswordSource::detect_from(|key| match key {
-                ENV_MASTER_PASSWORD => Some(OsString::from("a")),
-                ENV_MASTER_PASSWORD_FILE => Some(OsString::from("/tmp/x")),
-                _ => None,
-            }),
-            Err(ConfigError::PasswordConflict)
-        );
-    }
-
-    /// 37: a password file with group/other bits is refused.
-    #[test]
-    fn u_config_password_file_requires_0600() {
-        use std::io::Write;
-        use std::os::unix::fs::PermissionsExt;
-
-        let dir = tempdir();
-        let path = dir.path().join("secret");
-        let mut file = fs::File::create(&path).unwrap();
-        file.write_all(b"hunter2\n").unwrap();
-        drop(file);
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
-        assert_eq!(
-            PasswordSource::File(path.clone()).read(),
-            Err(ConfigError::PasswordFileUnsafe(path.clone()))
-        );
-
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
-        assert_eq!(
-            PasswordSource::File(path.clone())
-                .read()
-                .unwrap()
-                .as_slice(),
-            b"hunter2"
-        );
-    }
-
     /// 39 §2.1
     #[test]
     fn u_config_mountpoint_validation_and_mount_id() {
         let dir = tempdir();
-        let config = Config::new(
-            Endpoint::parse("http://h").unwrap(),
-            dir.path(),
-            ClientId::from_bytes([7; 16]),
-        )
-        .unwrap();
+        let config = Config::new(Endpoint::parse("http://h").unwrap(), dir.path()).unwrap();
         assert_eq!(config.mount_id.len(), 16);
         assert_eq!(config.runtime_dir(), config.run_dir.join(&config.mount_id));
         assert!(config.status_path().ends_with("status.json"));
@@ -695,14 +476,14 @@ mod tests {
         );
     }
 
-    /// 39 §2.1: 128 KiB / 2–5 ms, 64 MiB outbox.
+    /// 39 §2.1: 128 KiB / 2–5 ms, 1 GiB soft outbox budget.
     #[test]
     fn u_config_tuning_matches_the_spec() {
         let tuning = Tuning::default();
         assert_eq!(tuning.aggregate_bytes, 128 * 1024);
         assert_eq!(tuning.aggregate_window, Duration::from_millis(2));
         assert_eq!(tuning.aggregate_hard, Duration::from_millis(5));
-        assert_eq!(tuning.outbox_max_bytes, 64 * 1024 * 1024);
+        assert_eq!(tuning.outbox_soft_bytes, 1024 * 1024 * 1024);
         assert_eq!(tuning.reorder_frames, 1024);
         assert_eq!(tuning.resync_budget, 3);
         assert_eq!(tuning.steady_window, Duration::from_secs(60));

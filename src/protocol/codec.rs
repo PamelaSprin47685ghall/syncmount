@@ -762,7 +762,10 @@ mod tests {
             bytes[2] = value;
             if let Ok(header) = FrameHeader::decode(&bytes) {
                 assert!(
-                    matches!(header.msg_type, MsgType::RELAY | MsgType::STREAM_DATA),
+                    matches!(
+                        header.msg_type,
+                        MsgType::RELAY | MsgType::STREAM_DATA | MsgType::FLOW | MsgType::SYNC_END
+                    ),
                     "type {value:#04x} survived with incompatible flags"
                 );
             }

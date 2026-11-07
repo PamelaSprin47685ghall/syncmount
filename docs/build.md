@@ -22,8 +22,8 @@ release command uses `--locked`.
 |---|---|---|
 | `reduced-round` | on | ChaCha8-Poly1305 on the wire (`alg=0`); off selects ChaCha20-Poly1305 (`alg=1`). |
 | `fuse` | on | Builds the FUSE client. `--no-default-features` produces a server-only binary whose `client` command fails with an explicit message. |
-| `testkit` | off | Test infrastructure; never part of a release. |
-| `fuse-tests`, `chaos-tests`, `perf-tests`, `slow-tests` | off | Opt-in test layers. |
+| `fuse-tests` | off | FUSE integration tests; require a mounted filesystem. |
+| `slow-tests` | off | Opt-in long-running tests. |
 | `pure-blake3` | off | Disables blake3's C/asm build. |
 
 Release builds use the default feature set (`reduced-round` + `fuse`).
@@ -35,8 +35,8 @@ rustup toolchain install 1.85.0
 rustup target add x86_64-unknown-linux-musl
 
 cargo +1.85.0 build --locked --release
-cargo +1.85.0 test --locked --features testkit
-cargo +1.85.0 clippy --locked --all-targets --features testkit -- -D warnings
+cargo +1.85.0 test --locked
+cargo +1.85.0 clippy --locked --all-targets -- -D warnings
 cargo +1.85.0 fmt --all -- --check
 ```
 
@@ -141,7 +141,7 @@ server mode does not need FUSE.
 
 `.github/workflows/ci.yml` runs:
 
-- `cargo fmt --check`, `clippy -D warnings`, `cargo test --features testkit`;
+- `cargo fmt --check`, `clippy -D warnings`, `cargo test`;
 - a FUSE job when `/dev/fuse` is usable, with `SYNCMOUNT_REQUIRE_FUSE=1`;
 - an MSRV/musl job that builds `profile dist`, asserts static linking and the
   15 MiB ceiling, and runs `--version`.
@@ -159,19 +159,21 @@ asset that fails them.
 | `no master password source` | no env var, no `--key-file`, no terminal | set `SYNCMOUNT_MASTER_PASSWORD` or `SYNCMOUNT_MASTER_PASSWORD_FILE` |
 | `master password file … has mode 0644` | credential file is readable by others | `chmod 0600` |
 | DNS fails in a scratch container | musl has no NSS; `/etc/resolv.conf` and `/etc/hosts` are missing | bind-mount both files |
-| `cluster is at seq … but offers no view` | no online holder is exactly caught up and the client is not a solo caught-up member | the JOIN retries after 1, 2, 4, 8 and 16 s and exits 2 without deleting local files; start a caught-up holder or recover the solo member |
+| `master password rejected` / exit 4 | the client and server use different passwords | use the same password for the server and every client; a changed password derives a new namespace id and needs new databases |
+| `another process holds the lock` | a second client opened the same `client.db` | use a distinct `--db` or `SYNCMOUNT_STATE_DIR` for each mount |
+| `database belongs to a different cluster` | the database was created under another password | re-import or recreate the database under the current password |
 
 ## Source layout
 
 ```
 src/cli.rs          argv, exit codes, implicit aliases
 src/bin/syncmount.rs  five lines from argv to lib::run
-src/client/         lifecycle, outbox, replay, status
-src/server/         HTTP, sequencer, relay, health
-src/protocol/       frame, crypto, messages, identity
-src/sync/           snapshot, manifest, rsync differences
-src/store/          backing tree, node table, runtime directory
-src/fuse/           FUSE callbacks and write path
+src/client/         FUSE-over-SQLite client, durable outbox, replay, status
+src/server/         HTTP, sequencer, authoritative store, health
+src/protocol/       frame, crypto, handshake, messages
+src/state/          pure operation planner and conflict rules
+src/store/          shared SQLite schema, backing helpers, runtime directory
+src/fuse/           FUSE callbacks over the client database
 man/                man page source
 examples/           runnable demonstrations
 install.sh          verified release installer

@@ -18,7 +18,7 @@ use super::config::DEGRADED_CLIENTS;
 #[derive(Debug)]
 pub struct Metrics {
     /// Server epoch.
-    pub epoch: Epoch,
+    pub epoch: AtomicU64,
     /// Process start instant.
     pub started_at: Instant,
     /// Current sequence.
@@ -39,7 +39,7 @@ impl Metrics {
     /// Fresh counters for one process start.
     pub fn new(epoch: Epoch) -> Self {
         Self {
-            epoch,
+            epoch: AtomicU64::new(epoch.get()),
             started_at: Instant::now(),
             seq: AtomicU64::new(0),
             clients: AtomicU64::new(0),
@@ -48,6 +48,11 @@ impl Metrics {
             pending_ops: AtomicU64::new(0),
             dropped_frames: AtomicU64::new(0),
         }
+    }
+
+    /// Publish a new epoch after compaction.
+    pub fn publish_epoch(&self, epoch: u64) {
+        self.epoch.store(epoch, Ordering::Release);
     }
 
     /// Publish the actor-owned sequence.
@@ -88,7 +93,7 @@ impl Metrics {
             clients,
             self.started_at.elapsed().as_secs(),
             self.seq.load(Ordering::Relaxed),
-            self.epoch.get(),
+            self.epoch.load(Ordering::Relaxed),
             self.sync_sessions.load(Ordering::Relaxed),
         )
     }

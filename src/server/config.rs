@@ -6,6 +6,7 @@
 //! timeouts, never a semantic ratio.
 
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use crate::protocol::Limits;
@@ -37,6 +38,15 @@ pub const HELLO_TIMEOUT: Duration = PAIR_TIMEOUT;
 
 /// Clients above which `healthz` reports `degraded` (42 §7.4).
 pub const DEGRADED_CLIENTS: u64 = 8000;
+
+/// Default SQLite file name used by `syncmount server URL`.
+pub const DEFAULT_DB_FILE: &str = "syncmount-server.db";
+
+/// How long a graceful shutdown waits for every session to catch up.
+pub const DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Events read per replay page.
+pub const REPLAY_BATCH: u32 = 256;
 
 /// Per-session outbound queue budget.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -104,6 +114,12 @@ pub struct ServeConfig {
     pub pair_timeout: Duration,
     /// How long an uplink may wait for its downlink.
     pub hello_timeout: Duration,
+    /// SQLite database file owned by this server.
+    pub db_path: PathBuf,
+    /// Graceful-shutdown drain budget.
+    pub drain_timeout: Duration,
+    /// Event page size used by replay.
+    pub replay_batch: u32,
 }
 
 impl ServeConfig {
@@ -119,6 +135,9 @@ impl ServeConfig {
             tick_interval: TICK_INTERVAL,
             pair_timeout: PAIR_TIMEOUT,
             hello_timeout: HELLO_TIMEOUT,
+            db_path: PathBuf::from(DEFAULT_DB_FILE),
+            drain_timeout: DRAIN_TIMEOUT,
+            replay_batch: REPLAY_BATCH,
         }
     }
 
@@ -142,8 +161,15 @@ impl ServeConfig {
             },
             command_capacity: 4096,
             tick_interval: Duration::from_millis(10),
-            pair_timeout: Duration::from_millis(50),
-            hello_timeout: Duration::from_millis(200),
+            pair_timeout: Duration::from_millis(500),
+            hello_timeout: Duration::from_millis(1_000),
+            db_path: std::env::temp_dir().join(format!(
+                "syncmount-server-test-{}-{}.db",
+                std::process::id(),
+                rand::random::<u64>()
+            )),
+            drain_timeout: Duration::from_secs(2),
+            replay_batch: 64,
             ..Self::loopback()
         }
     }

@@ -23,7 +23,7 @@
 //! errors <- version <- frame <- codec
 //! ```
 //!
-//! `codec` is a leaf. `crypto`, `messages`, `identity` and `fragment` are
+//! `codec` is a leaf. `crypto`, `messages`, `handshake` and `fragment` are
 //! owned by other modules and depend on this one, never the other way round.
 //! That is why [`ProtocolError`] carries no crypto or WCP variant: each
 //! upper layer wraps its own error at its own boundary.
@@ -33,11 +33,15 @@ pub mod crypto;
 pub mod errors;
 pub mod fragment;
 pub mod frame;
-pub mod identity;
+pub mod handshake;
 pub mod messages;
 pub mod version;
 
 pub use codec::{FrameDecoder, FrameEncoder, FrameReader, FrameRef, FrameWriter, encode_frame};
+pub use crypto::{
+    HandshakeKeys, KeyRing, PSK_SALT, PSK_SALT_LEN, PskKeyRing, PskSalt, SessionKey,
+    WELCOME_PROOF_LEN,
+};
 pub use errors::{KickReason, ProtocolError, SyncEndReason, TrnReason};
 pub use fragment::{
     CHUNK_PLAIN, ChunkSink, Credit, Fragment, FragmentError, FragmentKey, Fragmenter, Progress,
@@ -48,11 +52,16 @@ pub use frame::{
     HEADER_LEN, Limits, MAGIC, MIN_PLAIN_BODY, MsgType, OpId, Prefix, PrefixKind, ROUTE_PREFIX_LEN,
     RoutePrefix, Seq, SessionId, StreamId,
 };
+pub use handshake::{
+    AUTH_TIMEOUT_MS, Accepted, CLIENT_HANDSHAKE_TIMEOUT_MS, ClientHandshake, ClientPhase,
+    HandshakeError, HelloInput, MAX_RECENT_NONCES, NONCE_REPLAY_WINDOW_MS, NonceReplayGuard,
+    ServerHandshake, WelcomeReply,
+};
 pub use messages::{
-    Ack, DataRef, Error as ErrorMessage, FieldMap, FileAttrs, Flow, Hello, JoinState, Kick, Leave,
-    Message, MessageError, OpArgs, OpClass, OpIdLog, OpIdVerdict, Ordered, PathError, Ping, Pong,
-    Relay, RelaySub, ResyncMode, SeqGate, SeqVerdict, SnapshotRef, StreamData, SyncEnd, WcpError,
-    WcpWriter, Welcome, WelcomeLimits, WirePath, decode_plain, decode_sealed,
+    Accept, Ack, Auth, DataRef, Error as ErrorMessage, FieldMap, FileAttrs, Flow, Hello,
+    Kick, Leave, Message, MessageError, OpArgs, OpClass, OpIdLog, OpIdVerdict, Ordered, PathError,
+    Ping, Pong, Relay, RelaySub, ResyncMode, SeqGate, SeqVerdict, SnapshotRef, StreamData, SyncEnd,
+    WcpError, WcpWriter, Welcome, WelcomeLimits, WirePath, decode_plain, decode_sealed,
 };
 pub use version::{Caps, FrameVer, Negotiated, ProtoVersion, VersionError, WcpVer, negotiate};
 

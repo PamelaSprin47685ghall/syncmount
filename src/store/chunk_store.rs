@@ -27,8 +27,8 @@
 //! (43 I9).
 //!
 //! This module stores ciphertext only. It verifies the **physical** hash
-//! (`blob_id`) but cannot verify `chunk_id` without the key; that second check
-//! belongs to [`crate::sync::chunk::VerifiedChunkStore`].
+//! (`blob_id`) but cannot verify `chunk_id` without the key; the content
+//! layer performs that second check.
 
 use std::collections::BTreeMap;
 use std::fmt;

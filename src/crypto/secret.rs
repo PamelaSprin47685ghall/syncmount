@@ -8,9 +8,9 @@
 //! 3. an interactive prompt through `rpassword`
 //!
 //! Argon2id uses the RFC 9106 second recommended profile: `m = 64 MiB`,
-//! `t = 3`, `p = 4`, version `0x13`, 32-byte output. The 16-byte cluster id is
-//! the salt, so every client in one cluster derives the same key and two
-//! clusters never share one.
+//! `t = 3`, `p = 4`, version `0x13`, 32-byte output. The 16-byte
+//! [`PskSalt`] is the salt, so every client with one password derives the same
+//! PSK. The URL never enters the derivation.
 //!
 //! The derived key is never exposed outside this crate. Callers derive a
 //! [`KeyRing`] or seal a proof.
@@ -26,7 +26,7 @@ use argon2::{Algorithm, Argon2, Params, Version};
 use thiserror::Error;
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
-use crate::protocol::crypto::{ClusterId, KeyRing};
+use crate::protocol::crypto::{ClusterId, KeyRing, PSK_SALT, PskKeyRing, PskSalt};
 
 /// Argon2id memory cost in KiB (64 MiB).
 pub const ARGON2_M_COST: u32 = 64 * 1024;
@@ -49,9 +49,10 @@ pub const ENV_MASTER_PASSWORD_FILE: &str = "SYNCMOUNT_MASTER_PASSWORD_FILE";
 /// Prompt shown on a TTY.
 pub const PASSWORD_PROMPT: &str = "syncmount master password: ";
 
-/// A 32-byte key derived from the master password.
+/// A 32-byte pre-shared key derived from the master password.
 ///
-/// The bytes are zeroized on drop. `Debug` never prints them.
+/// This is the Argon2id output and the PSK input to [`PskKeyRing`]. The bytes
+/// are zeroized on drop. `Debug` never prints them.
 #[derive(Zeroize, ZeroizeOnDrop)]
 pub struct MasterKey {
     bytes: [u8; ARGON2_OUTPUT_LEN],
@@ -72,6 +73,19 @@ impl MasterKey {
         Self::derive_from_password(password.as_slice(), cluster)
     }
 
+    /// Resolve the password and derive the PSK with [`PskSalt::DEFAULT`].
+    ///
+    /// # Errors
+    ///
+    /// As [`MasterKey::load`].
+    pub fn load_psk() -> Result<Self, SecretError> {
+        let password = resolve_password(
+            |name| env::var_os(name),
+            || rpassword::prompt_password(PASSWORD_PROMPT),
+        )?;
+        Self::derive_psk_from_password(password.as_slice(), &PskSalt::DEFAULT)
+    }
+
     /// Derive the key from explicit password bytes.
     ///
     /// Password bytes are used verbatim. This crate does not run NFKC; the
@@ -82,6 +96,20 @@ impl MasterKey {
     /// [`SecretError::EmptyPassword`] for an empty password, or
     /// [`SecretError::Argon2`] if Argon2id fails.
     pub fn derive_from_password(password: &[u8], cluster: &ClusterId) -> Result<Self, SecretError> {
+        Self::derive_argon2(password, cluster.as_bytes())
+    }
+
+    /// Derive the PSK from explicit password bytes and a salt.
+    ///
+    /// # Errors
+    ///
+    /// [`SecretError::EmptyPassword`] for an empty password, or
+    /// [`SecretError::Argon2`] if Argon2id fails.
+    pub fn derive_psk_from_password(password: &[u8], salt: &PskSalt) -> Result<Self, SecretError> {
+        Self::derive_argon2(password, salt.as_bytes())
+    }
+
+    fn derive_argon2(password: &[u8], salt: &[u8]) -> Result<Self, SecretError> {
         if password.is_empty() {
             return Err(SecretError::EmptyPassword);
         }
@@ -94,7 +122,7 @@ impl MasterKey {
         .map_err(SecretError::Argon2)?;
         let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
         let mut bytes = [0u8; ARGON2_OUTPUT_LEN];
-        if let Err(error) = argon2.hash_password_into(password, cluster.as_bytes(), &mut bytes) {
+        if let Err(error) = argon2.hash_password_into(password, salt, &mut bytes) {
             bytes.zeroize();
             return Err(SecretError::Argon2(error));
         }
@@ -104,13 +132,30 @@ impl MasterKey {
     /// Derive the payload and control keys for `cluster`.
     ///
     /// `salt = cluster_id`, `ikm = master_key`, with the info strings
-    /// `sm/v1/enc`, `sm/v1/ctrl`, and `sm/v1/keybind` (44 §4.1, 49 A13).
+    /// `sm/v2/enc` and `sm/v2/ctrl` (44 §4.1, 49 A13).
     ///
     /// # Errors
     ///
     /// [`SecretError::Kdf`] only if HKDF rejects a 32-byte output.
     pub fn derive_keyring(&self, cluster: &ClusterId) -> Result<KeyRing, SecretError> {
         KeyRing::derive(&self.bytes, cluster).map_err(|_| SecretError::Kdf)
+    }
+
+    /// Derive the PSK ring for `salt`.
+    ///
+    /// `salt = salt`, `ikm = this key`, with the info strings `sm/v2/enc`,
+    /// `sm/v2/ctrl` and `sm/v2/hs`.
+    ///
+    /// # Errors
+    ///
+    /// [`SecretError::Kdf`] only if HKDF rejects a 32-byte output.
+    pub fn derive_psk_keyring(&self, salt: &PskSalt) -> Result<PskKeyRing, SecretError> {
+        PskKeyRing::derive(&self.bytes, salt).map_err(|_| SecretError::Kdf)
+    }
+
+    /// The default PSK salt, exposed so callers can log its identity.
+    pub const fn default_salt() -> PskSalt {
+        PskSalt::from_bytes(PSK_SALT)
     }
 
     pub(crate) const fn as_bytes(&self) -> &[u8; ARGON2_OUTPUT_LEN] {
@@ -301,7 +346,47 @@ mod tests {
         let first = key.derive_keyring(&cluster(0x11)).unwrap();
         let second = key.derive_keyring(&cluster(0x11)).unwrap();
         assert_eq!(first.kid(), second.kid());
-        assert_eq!(first.keybind_key(), second.keybind_key());
         assert_eq!(first.ctrl_key(), second.ctrl_key());
+    }
+
+    #[test]
+    fn psk_derivation_is_fixed_salt_and_domain_separated() {
+        let first =
+            MasterKey::derive_psk_from_password(b"correct horse", &PskSalt::DEFAULT).unwrap();
+        let second =
+            MasterKey::derive_psk_from_password(b"correct horse", &PskSalt::DEFAULT).unwrap();
+        let wrong = MasterKey::derive_psk_from_password(b"wrong horse", &PskSalt::DEFAULT).unwrap();
+
+        let ring = first.derive_psk_keyring(&PskSalt::DEFAULT).unwrap();
+        let again = second.derive_psk_keyring(&PskSalt::DEFAULT).unwrap();
+        let other = wrong.derive_psk_keyring(&PskSalt::DEFAULT).unwrap();
+        assert_eq!(ring.kid(), again.kid());
+        assert_eq!(ring.enc_key(), again.enc_key());
+        assert_eq!(ring.ctrl_key(), again.ctrl_key());
+        assert_ne!(ring.enc_key(), other.enc_key());
+
+        let other_salt = PskSalt::from_bytes([0x11; 16]);
+        let salted = first.derive_psk_keyring(&other_salt).unwrap();
+        assert_ne!(ring.enc_key(), salted.enc_key());
+
+        assert_ne!(ring.enc_key(), ring.ctrl_key());
+        assert_eq!(MasterKey::default_salt(), PskSalt::DEFAULT);
+    }
+
+    #[test]
+    fn handshake_keys_bind_both_nonces() {
+        let master = MasterKey::derive_psk_from_password(b"handshake", &PskSalt::DEFAULT).unwrap();
+        let ring = master.derive_psk_keyring(&PskSalt::DEFAULT).unwrap();
+        let client = [0x11; 32];
+        let server = [0x22; 32];
+        let first = ring.handshake_keys(&client, &server).unwrap();
+        let again = ring.handshake_keys(&client, &server).unwrap();
+        assert_eq!(first.kid(), again.kid());
+
+        let other_server = ring.handshake_keys(&client, &[0x23; 32]).unwrap();
+        let other_client = ring.handshake_keys(&[0x12; 32], &server).unwrap();
+        assert_ne!(first.kid(), other_server.kid());
+        assert_ne!(first.kid(), other_client.kid());
+        assert_ne!(first.kid(), ring.kid());
     }
 }

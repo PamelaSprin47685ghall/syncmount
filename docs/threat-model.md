@@ -1,446 +1,298 @@
 # Threat model
 
-Status: normative security boundary for syncmount v1. This document states what
-the design protects, against whom, and what it explicitly does not protect. It
-describes the design, not a particular build. The semantic limits are in
-[`known-limitations.md`](known-limitations.md); the protocol and key decisions
-are in `39-s1-spec.md`, `49-arbitration-list.md`, `50-client-signing.md` and
-`15/21-protocol-spec`.
+Status: normative security boundary for syncmount v2 (protocol 2.0). This
+document states what the design protects, against whom, and what it explicitly
+does not protect. It describes the design, not a particular build. The
+semantic limits are in [`known-limitations.md`](known-limitations.md); the
+operational surface is in [`../README.md`](../README.md) and
+`man/syncmount.1`.
 
 ## 1. System and trust boundaries
 
 ```
-client A (PSK, Ed25519 sk) ── HTTP/1.1 ──┐
-                                        ├── sequencer (zero keys, no durable state)
-client B (PSK, Ed25519 sk) ── HTTP/1.1 ──┘
-        │                                        │
-        └── local backing tree                   └── broadcast ciphertext
+client A (PSK, client.db plaintext) ── HTTP/1.1 ──┐
+                                                  ├── server (PSK, server.db plaintext)
+client B (PSK, client.db plaintext) ── HTTP/1.1 ──┘
+        │                                              │
+        └── local SQLite replica                       └── authoritative SQLite + event log
 ```
 
-- The **server** is a stateless sequencer. It reads the 21-byte frame header,
-  `seq`, message type, lengths, route prefixes and plaintext control frames.
-  It assigns `seq`, routes frames and keeps an online-session table. It holds
-  no payload key, no control key, no join key, no signing key and no
-  authentication key, it does not verify signatures, and it keeps no durable
-  state. It is not trusted for confidentiality, authenticity or correct
-  ordering beyond the clients' ability to detect some ordering faults.
-- A **client** holds the cluster PSK (derived from the master password and the
-  cluster id), its own Ed25519 private key and a full local copy of the tree.
-  Clients are trusted to follow the protocol. An authorized member is still an
-  adversary for other members' data and for availability.
-- The **network** is untrusted. HTTP/1.1 is used without built-in TLS.
-  Payloads are end-to-end encrypted; frame headers, route prefixes and control
-  frames are not.
-- The **local host** is trusted for the client process and its backing tree.
-  The mount ACL (`RootAndOwner` by default, `All` with `--allow-other`) is a
-  local access boundary, not a cluster permission model.
+- The **server** holds the master password, derives the same PSK as every
+  client, decrypts every operation, applies it to the authoritative SQLite
+  database, stores plaintext file data and broadcasts the ordered event. It is
+  the single ordering authority. It is trusted with the confidentiality and
+  integrity of the data: it can read, modify or delete everything, and clients
+  cannot cryptographically distinguish a server-forged event from a legitimate
+  one.
+- A **client** holds the PSK and a full plaintext replica in `client.db`. It
+  trusts the server's order and applies every event the server sends. A
+  password holder is a full member.
+- The **network** is untrusted. HTTP/1.1 is used without built-in TLS. Frame
+  headers, frame sizes, timing, route prefixes and the number of connections
+  are visible; paths and payloads are sealed under the PSK.
+- The **local host** is trusted for the client process, the password file and
+  the SQLite databases. The mount ACL (`RootAndOwner` by default, `All` with
+  `--allow-other`) is a local access boundary, not a cluster permission model.
 - The **password distribution channel** is out of scope. Operators must
-  deliver the master password out of band (password manager, sealed channel,
-  secret mount). Anyone with the password is a full member.
+  deliver the master password out of band. Anyone with the password is a full
+  member and can open every database.
 
-The server is **not** trusted to be honest. It is trusted only as the single
-ordering point: clients accept its `seq` as the order in which they replay.
-That is an architectural trade-off, not an assumption of good behaviour.
+The server is **not** an untrusted sequencer in v2. It is a trusted reader and
+writer that happens to sit across a network link. This is the central
+difference from an end-to-end encrypted design: the PSK protects the link, not
+the data from the server.
 
 ## 2. Assets
 
-- confidentiality of file data, paths, operation arguments, manifests and
-  chunk contents;
-- integrity and authenticity of operations and of the resulting tree;
-- member identity and attribution;
-- the total order and the ability to detect gaps and rollback;
-- availability of the mount and of the sequencer;
-- lock state and namespace ownership;
-- the client's private key and the cluster password.
+- confidentiality of file data, paths, operation arguments and metadata on the
+  wire and at rest;
+- integrity and authenticity of the authoritative tree and the event log;
+- the total order and the clients' ability to detect their own gaps and epoch
+  changes;
+- availability of the mount and of the server;
+- the master password, the password file and the SQLite databases;
+- the namespace id and the key hierarchy.
 
 ## 3. Adversaries
 
 | ID | Adversary | Capabilities | Goal |
 |---|---|---|---|
-| A1 | Network attacker | Eavesdrop, inject, modify, drop, delay, replay, open connections; no PSK, no private key | Read data, forge or alter operations, disrupt service |
-| A2 | Malicious or compromised server | Read headers, `seq`, control frames and route prefixes; assign or rewrite `seq`; drop, delay, duplicate, reorder; inject plaintext control frames; choose join validators; refuse service; no PSK, no client private key | Read data, forge operations, split or stall clients, deny service |
-| A3 | Authorized member | Holds PSK; can decrypt all traffic, join as a new client, send its own operations, replay within the dedup window, equivocate, refuse snapshot data | Read other members' data, impersonate another member, corrupt state, deny service |
-| A4 | Private-key thief | Holds one client's Ed25519 private key; may or may not hold the PSK | Impersonate that `client_id`, sign operations as that member |
-| A5 | Local unprivileged user | Can access the mount only if `--allow-other` is on; can read the client's files only under host permissions | Read or modify the mounted tree, steal local key material |
+| A1 | Network attacker | Eavesdrop, inject, modify, drop, delay, replay, open connections; no PSK | Read data, forge or alter frames, disrupt service |
+| A2 | Malicious or compromised server | Holds the PSK; reads and writes `server.db`; assigns or rewrites `seq`; drops, delays, duplicates or reorders events; forges events and kicks; refuses service | Read or alter all data, split or stall clients, deny service |
+| A3 | Authorized password holder | Holds the PSK; can open both databases, join as a new client, send operations, replay captured frames, flood the server | Read or alter data, deny service |
+| A4 | Local unprivileged user | Can access the mount only if `--allow-other` is on; can read files only under host permissions | Read or modify the mounted tree |
+| A5 | Password or backup thief | Holds the password file, a database copy or a disk image; may or may not have a live host | Read all data, join as a client, decrypt recordings |
 
 ## 4. Protections
 
-### 4.1 Confidentiality
+### 4.1 Link confidentiality
 
-- All payloads are sealed with ChaCha8-Poly1305 (default) or
-  ChaCha20-Poly1305 (selectable). The AEAD covers data, paths, operation
-  arguments, manifests and chunk contents. At the protocol level, the server
-  sees only the frame header, routing prefix, control prefix and ciphertext
-  length.
-- The master password is stretched with Argon2id (`m=64 MiB`, `t=3`, `p=4`)
-  using a 16-byte cluster-derived salt, then expanded with HKDF-SHA256
-  (salt = cluster id) into the payload, control and join keys. The server
-  never receives the password or any derived key.
-- Each AEAD frame uses an independent nonce from the nonce minter. Nonce reuse
-  would be catastrophic for ChaCha20-Poly1305; the nonce minter is part of the
-  crypto contract and is covered by golden tests.
-- Each 64 KiB content envelope uses a fresh 96-bit random nonce. Equal
-  plaintext produces different ciphertext; the design does not use
-  deterministic or content-derived nonces.
-- Content chunks are addressed by `chunk_id = BLAKE3(256 KiB plaintext)`. The
-  chunk index is a plaintext hash, so a member holding it can tell whether two
-  blocks are identical. The server does not see `chunk_id`; it is inside the
-  encrypted WCP payload. The leak is limited to cluster members and is stated
-  in `known-limitations.md` §4.3.
-- Logs and the status document never contain payloads, keys or clear paths;
-  they publish at most a short BLAKE3 path-hash prefix for local diagnostics.
-  No plaintext path hash is sent to the server.
+- The master password is stretched with Argon2id (`m = 64 MiB`, `t = 3`,
+  `p = 4`) using the fixed 16-byte PSK salt. The 32-byte master key is
+  expanded with HKDF-SHA256, using the namespace id as the salt, into the
+  encryption, control and handshake keys.
+- The namespace id is `BLAKE3("sm/v2/namespace" || master key)[..16]`. It is
+  derived from the password, not from the URL. Every client and the server
+  must use the same password; a different password derives a different id and
+  a different key.
+- Every steady-state frame is sealed with ChaCha8-Poly1305 (default) or
+  ChaCha20-Poly1305 (selectable). Each frame uses an independent nonce from
+  the nonce minter. The AEAD covers the frame body and binds the header fields
+  except `seq`, which the server must assign.
+- Paths, file data, chunk bytes and operation arguments are inside the sealed
+  body. The server can read them because it holds the PSK; a network attacker
+  without the PSK cannot.
 
-### 4.2 Integrity and authenticity
+The link is not encrypted against the server, and there is no built-in TLS.
+On an untrusted network, use a local TLS tunnel that accepts plain HTTP on
+loopback. TLS hides frame metadata from the network; it does not change the
+server's trust status.
 
-**AEAD.** The AAD binds the frame header fields except `seq`, plus the
-routing/control prefix. It is the `V1Minimal` profile: a domain separator,
-`alg`, `kid`, the header fields, a prefix tag and the prefix bytes. `seq` is
-excluded because the sender does not know it when sealing and the server must
-be able to assign it. The AEAD tag rejects modified ciphertext.
+### 4.2 Link authentication
 
-**Client signatures.** Every `ORDERED` operation is signed by its author with
-Ed25519. The signature input is a fixed 103-byte concatenation:
+The handshake is:
 
 ```
-"sm/v1/op\0"         10 B
-sig_ver u8            1 B
-cluster_id [16]      16 B
-client_id [16]       16 B
-frame_type u8         1 B
-flags u16 LE          2 B
-iid u64 LE            8 B
-local_seq u64 LE      8 B
-op_class u8           1 B
-epoch u64 LE          8 B
-payload_hash [32]    32 B
+client  HELLO(plain) ───────────────▶ server
+        ◀──────────── WELCOME(plain body + server proof)
+        AUTH(sealed) ───────────────▶ server
+        ◀──────────── ACCEPT(sealed)
+        STEADY (sealed)
 ```
 
-`payload_hash = BLAKE3-256(plaintext payload after the AUTH block)`. The
-signature block is inside the AEAD ciphertext, before the WCP payload, so the
-server cannot see it, strip it, modify it or verify it. A receiver opens the
-AEAD, parses the AUTH block, verifies the self-certifying `client_id`,
-recomputes the payload hash and calls `verify_strict`. A signed frame must not
-be compressed in v1.
+Both sides derive handshake keys from the PSK and both nonces. The
+`WELCOME` proof covers the canonical body; a wrong PSK and a tampered body
+both fail as an authentication error. The client never sends `AUTH` after a
+failed proof, and the server closes a failed `AUTH` silently so that "wrong
+password" and "tampered transcript" are not distinguishable oracles.
 
-`STREAM_DATA` fragments are not signed individually. The whole payload is
-bound by the `ORDERED` signature and `payload_hash`; each fragment is protected
-by its own AEAD tag. This avoids one Ed25519 operation per 64 KiB fragment.
+After `ACCEPT`, the steady-state key is used. AEAD tags reject modified
+ciphertext. A replayed client nonce is rejected by the server's nonce window.
 
-**Self-certifying identity.** Each client generates a random Ed25519 key pair.
-The key is not derived from the shared PSK. The identity is:
+### 4.3 Server authority and ordering
 
-```
-client_id = BLAKE3("sm/v1/client-id" ‖ cluster_id ‖ public_key)[..16]
-skid      = BLAKE3("sm/v1/skid" ‖ public_key)[..8]
-```
+The server assigns `seq`, appends the event and only then broadcasts. A crash
+between commit and broadcast is repaired by replay; the reverse order would
+let a client apply an event the server never persisted.
 
-The private key seed is stored in a `0600` file under
-`$XDG_STATE_HOME/syncmount/keys/<cluster_id>/ed25519.key` (directory `0700`).
-The file is opened with `O_NOFOLLOW`, must be owned by the current user, and is
-rejected if group or other permissions are present. The seed is zeroized in
-memory and never appears in logs. A keyring may replace the file; the file is
-the baseline. There is no `Debug` or `Clone` implementation for the seed
-holder. The file is bound to one cluster and rejected for another.
+The server can rewrite `seq`, delay, drop, duplicate or reorder events. A
+client detects its own sequence gaps and an epoch change, but it cannot prove
+a cross-client reorder: the server can put B's operation before A's as long as
+each client's stream stays monotonic. Preventing that requires
+client-to-client consensus or a global hash chain, which v2 does not have.
 
-**Key distribution.** `JOIN_PROOF` is sealed with a join key derived from the
-master key and the two handshake nonces (`sm/v1/join`, `sm/v1/jnonce`). It
-carries the joining client's `client_id`, public key, `skid` and a
-`sm/v1/keyproof` self-signature over the cluster id, `client_id`, public key
-and handshake nonces. A member opens it only with the same cluster key, checks
-`client_id == BLAKE3(...)`, checks `skid`, and verifies the self-signature. It
-answers `JOIN_ACCEPT` with the keys it knows. The server forwards these
-messages and cannot read them.
+The server can also forge an event because it holds the PSK. Clients have no
+independent signature to check. A compromised server is therefore a full
+integrity compromise, not merely an ordering fault.
 
-Later distribution uses the snapshot `keys[]` section, inline public keys on
-ordered frames (first frame and at least every 64 frames), and
-`KEY_REQ`/`KEY_RESP`. A receiver that does not know a key caches a bounded
-number of frames, requests the key and drops the frames if the key does not
-arrive. The server's key directory, if one is deployed, is a cache and never
-authoritative. Trust-on-first-use is optional and is not a trust root.
+### 4.4 At rest
 
-**Receive path.** The order is:
+Both `client.db` and `server.db` contain plaintext paths, file data, chunk
+bytes and metadata. The client creates its database with mode 0600 in a
+directory set to 0700. The server database follows the process umask; a server
+unit must set `UMask=0077` (or pre-create the file 0600) and keep it in a 0700
+directory. File permissions are not encryption: a local user who can read the
+file, a backup, a disk image or a volume image can read everything.
 
-1. parse the 21-byte header and validate magic, version, type, flags and
-   length;
-2. AEAD open;
-3. parse the AUTH block; an unknown `auth_ver` or `auth_alg` is dropped;
-4. look up `skid`; use an inline public key if present and verify
-   `skid == H(pk)[..8]`;
-5. verify `client_id == H(cluster_id‖pk)[..16]`;
-6. recompute `payload_hash` and verify the Ed25519 signature with
-   `verify_strict`;
-7. check `epoch`;
-8. deduplicate by `op_id`;
-9. buffer or reject out-of-order `local_seq`;
-10. apply in `seq` order and advance `applied_seq` and the per-client
-    watermark.
+Use full-disk or volume encryption when the host disk is not trusted. Protect
+backups at least as strictly as the live database. The password file is
+equivalent to the databases: mode 0600, owned by the effective user, regular
+file, no symlink.
 
-A header, AEAD, self-certification or signature failure drops the frame and
-does not advance `applied_seq`. Repeated failures from one `client_id` mark it
-locally `UNTRUSTED` and raise an alert. The client does not use a server
-`KICK` as a security decision: the server is untrusted, and a forged `KICK`
-can hit any client. If a client's own operation echoes back with a failed
-signature, it stops writing, alerts and unmounts because its local state is
-not trustworthy.
+### 4.5 Availability
 
-**What the signature does not cover.** The signature does not cover `seq`,
-`req_id`, `len`, the nonce, the ciphertext or the tag. It proves who wrote an
-operation and what it contains; it does not prove where the server placed it
-in the order. Replay protection is stateful, not part of the signature.
-
-### 4.3 Replay and ordering
-
-- Each operation has `op_id = (client_id, iid, local_seq)`. Receivers
-  deduplicate on `op_id` for 1M entries or 24 hours, whichever comes first.
-  The same `op_id` under multiple `seq` values keeps the smallest `seq`.
-- Each client maintains a `local_seq` window (4096 entries). A gap is buffered
-  or triggers a `RELAY` request; a value below the window is treated as a
-  replay and dropped.
-- The server epoch is checked before apply. A server restart draws a new epoch;
-  frames from another epoch are rejected and the client resynchronises.
-- Snapshots carry per-client watermarks, so a new node can reject operations
-  older than the snapshot it installed.
-- The server keeps no replay window. A client that falls behind gets a full
-  snapshot plus rsync resynchronisation, not an incremental replay.
-
-**Residual ordering risk.** The server can reorder operations across clients.
-It can put B's operation before A's as long as each client's own `local_seq` is
-monotonic. No client can prove that this happened, because the server is the
-ordering authority and signatures deliberately exclude `seq`. Preventing
-cross-client reordering requires client-to-client consensus or a global hash
-chain, which v1 does not have. This is an accepted design boundary, not a bug.
-
-The server can also delay or drop frames. A client detects its own gaps and
-heartbeat timeouts, but cannot prove that a frame was delayed rather than
-never sent. The accepted recovery is a full resynchronisation.
-
-### 4.4 Availability
-
-- Heartbeats (`PING`/`PONG`) carry `applied_seq`. The server's watermark check
-  detects stalls, rollback, out-of-range values and duplicate `client_id`
-  sessions, and can kick a client.
-- A kick is an availability hint. A malicious server can force an unmount by
-  sending one. The client exits 10 and releases the mount; no shared state is
-  changed by the kick itself.
-- The server accepts unauthenticated connections. Garbage is dropped at AEAD;
-  rate limits, connection quotas and a reverse proxy are the operational DoS
-  controls. The protocol does not provide cryptographic DoS protection.
-- A signature failure is fail-closed: the receiver drops the frame and does
-  not advance `applied_seq`. An authorized member can use invalid signatures to
-  stall a receiver. This is an accepted denial-of-service risk.
-
-### 4.5 Transport
-
-- The protocol is HTTP/1.1 with chunked request and event streams. There is no
-  built-in TLS termination in v1.
-- On an untrusted network, terminate TLS in a reverse proxy or tunnel in front
-  of the sequencer. TLS protects frame headers, control frames and traffic
-  metadata on the wire.
-- TLS is the transport baseline, not a trust root. The server is still not
-  trusted, and TLS does not make its control frames authoritative. The payload
-  remains end-to-end encrypted even without TLS.
-- A network attacker without the PSK cannot read or forge the payload, but can
-  drop, delay, replay or inject garbage, and can observe traffic shape.
-  Without TLS, the attacker can also tamper with plaintext control frames.
+- The server has a per-session outbound budget of 32 MiB and 512 data frames.
+  A consumer that cannot drain it is kicked with `QueueOverflow`.
+- A watermark that regresses or exceeds `current_seq` is kicked as
+  `Regression` or `Overclaim`.
+- A graceful shutdown drains for at most 30 seconds, compacts the event log,
+  advances the epoch and kicks every session with `EpochMismatch`.
+- The server accepts unauthenticated connections; garbage is dropped at AEAD
+  or at the handshake proof. Rate limiting, connection quotas and a reverse
+  proxy are operational controls, not protocol guarantees.
 
 ### 4.6 Local protection
 
 - The default mount ACL is `RootAndOwner`; `--allow-other` widens it to every
   local user and requires `user_allow_other` in `/etc/fuse.conf`.
-- The master password comes from an environment variable, a `0600` file or a
+- The master password comes from a `0600` file, an environment variable or a
   TTY prompt. A password in argv is refused because argv is visible in `ps`
   and shell history. There is no keyring or credential cache.
-- The client listens on no port. The server exposes only the sync endpoint and
-  `GET /__syncmount/healthz`.
-- The Ed25519 key file is `0600` in a `0700` directory, opened with
-  `O_NOFOLLOW`, owner-checked and rejected if group or other permissions are
-  present. A local user who can read it has the client's signing key.
-- Device nodes and special files may be created, but their endpoints are local
-  kernel objects. Access remains subject to the local mount policy; a device
-  node is not a cross-host device passthrough.
+- The client listens on no port. The server exposes only the sync endpoint
+  and `GET /__syncmount/healthz`.
+- The client database is locked with an exclusive `flock`; a second process on
+  the same file fails at startup.
 
 ## 5. Adversary analysis
 
 ### 5.1 A1 — network attacker
 
-**Can:** observe frame sizes, timing, connection pairs, route prefixes and
-plaintext control frames; drop, delay, duplicate or reorder frames; inject
-garbage; open many connections; replay captured ciphertext.
+**Can:** observe frame headers, sizes, timing, connection pairs and the number
+of clients; drop, delay, duplicate or reorder frames; inject garbage; open many
+connections; replay captured ciphertext.
 
-**Cannot:** decrypt payloads or paths without the PSK; produce a valid AEAD tag
-without the key; produce a valid Ed25519 signature without a client key; read
-the master password from the protocol.
+**Cannot:** decrypt paths or payloads without the PSK; produce a valid AEAD tag
+without the key; complete the handshake without the password; read the master
+password from the protocol.
 
-**Detection:** AEAD failure, signature failure, `op_id` dedup, `local_seq`
-window, epoch mismatch, `seq` gap, heartbeat timeout.
+**Detection:** AEAD failure, handshake proof failure, nonce replay rejection,
+sequence gap, epoch mismatch, connection loss.
 
-**Residual:** traffic analysis, denial of service, and — without TLS —
-tampering with plaintext control frames. TLS mitigates the last one on the
-wire, but does not protect against a malicious server.
+**Residual:** traffic analysis and denial of service. Without a TLS tunnel the
+attacker can also observe the plaintext handshake and frame metadata. The
+payload remains sealed, but the server is still able to read it.
 
 ### 5.2 A2 — malicious or compromised server
 
-**Can:** read the 21-byte header, `seq`, message type, lengths, route prefixes
-and client identifiers; assign or rewrite `seq`; drop, delay, duplicate or
-reorder frames; replay old ciphertext; inject `WELCOME`, `PONG`, `KICK`,
-`ERROR`, `FLOW`, `SYNC_END` and `LEAVE`; choose which member validates a join;
-refuse service; lie about `epoch` or `current_seq`.
+**Can:** read every path, payload and chunk; modify or delete the authoritative
+tree; rewrite `seq`; drop, delay, duplicate or reorder events; forge events and
+kicks; roll back to an older database; refuse service; choose which clients to
+serve.
 
-**Cannot:** read payloads, paths, manifests, chunk ids, public keys or
-signatures; forge or alter an `ORDERED` payload without breaking AEAD; forge a
-client signature; read a client's private key or the PSK.
+**Cannot:** be detected by a client that has no independent copy. There is no
+client signature and no hash chain; the client trusts the server's order and
+content. Encryption does not help because the server holds the PSK.
 
-**Detection:** AEAD failure; signature failure; `op_id` dedup; `local_seq`
-window; epoch mismatch; `seq` gap; local comparison of `client_id` with the
-public key; snapshot watermarks.
+**Residual:** this is a full confidentiality and integrity compromise. The only
+mitigations are operational: restrict access to the server host and
+`server.db`, keep independent backups, and treat the server as part of the
+trusted data boundary. A compromised server can also read every client
+database it can reach, because the password is shared.
 
-**Residual:**
+### 5.3 A3 — authorized password holder
 
-- **Cross-client reordering is not detectable.** The server can put B's
-  operation before A's as long as each client's own `local_seq` is monotonic.
-  Preventing this requires client-to-client consensus or a global hash chain,
-  which v1 does not have.
-- **Delay and drop are not provable.** The server can starve a client until
-  the heartbeat/watermark path declares it unhealthy.
-- **Control-frame forgery affects availability.** A forged `KICK` can unmount
-  a client; a forged `LEAVE` cannot release locks or change state. The client
-  treats these frames as hints. A signed client `LEAVE` or a lease is required
-  to release locks.
-- **The server's `client_id` is a claim, not a credential.** A malicious
-  client can claim another `client_id` in `HELLO` and trigger the
-  duplicate-session kick against the real owner. This is a denial of service,
-  not impersonation of signed operations.
-- **A malicious server can lie about `epoch`/`current_seq`.** The affected
-  client's operations are rejected by peers or trigger a resync. This is a
-  denial of service, not a confidentiality break.
-- **A malicious server can choose a hostile or silent join validator.** The
-  validator must still hold the PSK; it can reject or delay the join, but it
-  cannot forge an acceptance or a key. This is a denial of service.
-- **A malicious snapshot provider is a member.** It can withhold data or
-  supply a bad baseline, causing a denial of service or a wrong starting point.
-  Snapshot content is content-addressed and ordered replay still converges; a
-  provider cannot forge a signed operation.
+**Can:** open `server.db` and any `client.db`; decrypt recorded traffic; join
+as a new client; send valid operations; replay captured frames; flood the
+server; withhold service.
 
-### 5.3 A3 — authorized member
+**Cannot:** be distinguished from another member by a per-client credential:
+there is no such credential. The `client_id` in a `HELLO` is a random local
+label, not an identity and not a routing key.
 
-**Can:** decrypt all traffic (the PSK is shared); read every path and payload;
-join as a new client; send its own valid operations; replay captured
-operations inside the dedup window; equivocate (two different payloads for one
-`op_id`); refuse to serve snapshot data; flood the sequencer; send invalid
-signatures to stall a fail-closed receiver; claim another `client_id` in
-`HELLO` to trigger a duplicate-session kick.
+**Residual:** every password holder is equal. There are no per-client ACLs,
+roles or read restrictions. A member can always read the cluster's plaintext
+and can always deny service. The password is the tenant boundary. Revocation
+requires a new password, new namespace id and rebuilt or re-imported
+databases; old recordings remain decryptable with the old password.
 
-**Cannot:** derive another member's Ed25519 private key from the PSK (the keys
-are independent random keys, not HKDF outputs of the PSK); forge another
-member's signature while the receiver holds that member's key; read a private
-key file on another host.
-
-**Detection:** a duplicate `op_id` with a different payload hash is
-equivocation; the receiver does not apply either version, marks the sender
-untrusted and may force a resync. An invalid signature is dropped
-(fail-closed). A member that withholds data causes a timeout or a snapshot-
-source switch.
-
-**Residual:** every PSK holder is equal. There are no per-client ACLs, roles or
-read restrictions. A member can always read the cluster's plaintext and can
-always deny service. This is a single-tenant trust model: the PSK is the
-tenant boundary. A member can also claim another `client_id` in `HELLO`; the
-server kicks the real owner (availability, not forgery).
-
-Key distribution is peer-mediated. A member that has not learned a peer's key
-cannot verify that peer's frames; it drops them and requests the key. The
-snapshot `keys[]` section, inline public keys and `KEY_REQ` are the recovery
-paths. A malicious member can refuse to answer a key request, causing a
-denial of service for that peer.
-
-### 5.4 A4 — private-key thief
-
-**Can:** sign operations as the stolen `client_id`. If the attacker also has
-the PSK, it can produce valid ciphertext and fully impersonate that member
-until the cluster is rebuilt. Without the PSK it cannot produce valid
-ciphertext.
-
-**Cannot:** sign as a different member (different key), read the PSK from the
-key file (the file contains only the Ed25519 seed), or revoke the theft.
-
-**Response:** v1 has no revocation list and no same-id key rotation. The only
-global response is to change the master password, rebuild the cluster and
-re-enrol clients with new identities. The stolen key remains able to sign
-historical-looking operations, but without the new PSK those operations cannot
-be encrypted validly.
-
-### 5.5 A5 — local unprivileged user
+### 5.4 A4 — local unprivileged user
 
 With the default `RootAndOwner` ACL, only the mounting user and root can access
 the mount. With `--allow-other`, every local user can read and write the tree
 under the daemon's credentials; uid/gid metadata is not an access-control
-mechanism. The key file is `0600`; a local user who can read it has the
-client's signing key.
+mechanism. A local user who can read the password file or `client.db` has the
+same access as the mount owner.
+
+### 5.5 A5 — password or backup thief
+
+A stolen password file, database copy or disk image gives full read access to
+the data and, with the password, the ability to join as a client. There is no
+perfect forward secrecy: recordings made before the theft remain decryptable.
+The response is to change the password, rebuild or re-import the databases and
+assume the old data was exposed.
 
 ## 6. Key lifecycle
 
 ```
 master password
-  └─ Argon2id(cluster-derived salt) → master_key
-       └─ HKDF-SHA256(salt = cluster_id) → enc_key / ctrl_key / join_key
-per client
-  └─ OsRng → Ed25519 seed → public key
-       └─ client_id = BLAKE3("sm/v1/client-id" ‖ cluster_id ‖ pk)[..16]
+  └─ Argon2id(fixed PSK salt, m=64 MiB, t=3, p=4) → 32-byte master key
+       └─ HKDF-SHA256(salt = namespace id) → enc / ctrl / handshake keys
+namespace id = BLAKE3("sm/v2/namespace" || master key)[..16]
+
+per connection
+  └─ handshake keys = KDF(PSK, client nonce, server nonce)
+       └─ ACCEPT → steady-state session key
 ```
 
-- The cluster id is derived from the normalised URL
-  (`scheme://authority/prefix`). A different URL spelling derives a different
-  key and a different cluster.
-- The server needs no password and holds no key of any kind. TLS termination,
-  if used, is external and does not give the sequencer payload or signing keys.
-- The Ed25519 key file is bound to one cluster and rejected for another. It is
-  written with a temporary file, `fsync`, `rename` and a directory `fsync`;
-  an existing key is not silently replaced. `--new-key` explicitly creates a
-  new identity.
-- Key backup is a copy of the file. Loss means a new identity (`client_id`
-  changes) and a rejoin; there is no recovery service.
-- **No rotation.** Changing the password derives a new cluster key; every
-  client must change it. There is no in-band rotation, no key epoch rollover
-  and no revocation list. Deleting a client key creates a new `client_id` and
-  a new identity.
-- **Compromise response.** PSK leak: rebuild the cluster with a new password;
-  old traffic remains decryptable to the attacker (no forward secrecy).
-  Private-key leak: rebuild the cluster and re-enrol; the old `client_id`
-  cannot be revoked individually. Both leaked: full compromise; rebuild.
-- **No forward secrecy.** A leaked password decrypts all recorded traffic,
-  past and future. ChaCha20-Poly1305 does not change that.
+- The server and every client use the same master password. There is no
+  per-client key, no client certificate and no key directory.
+- The password file must be a regular file, owned by the effective user, mode
+  0600 or stricter. One trailing newline is stripped; an empty file is
+  refused. Violations are a startup error.
+- **No rotation.** Changing the password derives a new namespace id, so
+  existing databases refuse to open. The operator must rebuild the server and
+  re-import or recreate every client database under the new password. This is
+  a migration, not an in-band rotation.
+- **No revocation.** Removing a member means changing the password and
+  rebuilding. There is no revocation list and no per-client credential to
+  revoke.
+- **No forward secrecy.** A leaked password decrypts past and future traffic.
+  ChaCha20-Poly1305 does not change that.
+- **Compromise response.** A leaked password: rebuild under a new password and
+  assume all old data and recordings are exposed. A stolen database: treat all
+  plaintext in it as exposed. A compromised server: treat the whole tree as
+  exposed and restored from a trusted backup if one exists.
 
 ## 7. Out of scope
 
-- Byzantine fault-tolerant total order or client-to-client consensus;
-- detection or prevention of cross-client reordering by the server;
-- perfect forward secrecy;
-- traffic-analysis resistance (padding, cover traffic, timing obfuscation);
-- public-key infrastructure, certificate chains or a CA;
+- end-to-end encryption, a zero-knowledge server or server-side opacity;
+- perfect forward secrecy, password rotation, revocation or per-client
+  credentials;
 - per-client ACLs, roles or read restrictions;
+- Byzantine fault-tolerant total order, client-to-client consensus or
+  detection of cross-client reordering by the server;
+- traffic-analysis resistance (padding, cover traffic, timing obfuscation);
+- built-in encryption at rest;
+- public-key infrastructure, certificate chains or a CA;
 - cryptographic denial-of-service protection;
 - multi-tenant isolation;
 - TPM, secure boot, memory encryption or side-channel hardening;
 - supply-chain verification beyond pinned dependencies and licence checks;
 - protection of the master password distribution channel;
-- protection against a compromised client host after the key is unlocked.
+- protection against a compromised client host after the password is
+  unlocked.
 
 ## 8. Assurance and references
 
 This document states design boundaries; it is not a formal security audit. The
-implementation must demonstrate the claims with golden vectors for frame
-layout, AEAD and signature inputs; tamper matrices; deterministic replay tests;
-join and rsync tests; and chaos tests for loss, reorder, duplication and
-restart. Passing tests is engineering evidence, not a proof.
+implementation must demonstrate the claims with handshake and AEAD golden
+vectors, tamper and nonce-replay tests, deterministic replay tests,
+drain/compaction tests and the multi-host acceptance run. Passing tests is
+engineering evidence, not a proof.
 
 References:
 
-- `39-s1-spec.md` — S1 requirements, threat boundary and v1 scope;
-- `49-arbitration-list.md` — frame widths, AAD, chunk addressing, locks, rsync
-  segments and the decision that the server holds no key;
-- `50-client-signing.md` — per-client Ed25519, self-certifying id, signature
-  scope, key distribution and residual ordering risks;
-- `36-known-limitations.md` — limitation inventory;
-- `15/21-protocol-spec` — frame, AEAD and message layout;
-- `28-master-password.md` and `33-join-handshake.md` — Argon2id and join proof.
+- [`known-limitations.md`](known-limitations.md) — the semantic boundary;
+- [`../README.md`](../README.md) — architecture, deployment and CLI;
+- `man/syncmount.1` — command, environment and exit-status reference;
+- `docs/contracts/ledger.toml` — frozen contract index.

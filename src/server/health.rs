@@ -52,9 +52,9 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use crate::protocol::{ClientId, Seq};
+use crate::protocol::{Seq, SessionId};
 
-use super::online::{Session, SessionState, WatermarkVerdict};
+use super::online::{Session, WatermarkVerdict};
 
 /// Fallback P99 when no RTT sample exists (42 D8).
 pub const DEFAULT_RTT_P99_MS: u16 = 300;
@@ -120,7 +120,7 @@ pub struct Diagnosis {
 pub struct HealthMonitor {
     limits: HealthLimits,
     /// Last log instant per client, to keep warning volume bounded.
-    reported: HashMap<ClientId, Instant>,
+    reported: HashMap<SessionId, Instant>,
 }
 
 impl HealthMonitor {
@@ -164,9 +164,9 @@ impl HealthMonitor {
 
     /// Apply one watermark observation.
     ///
-    /// T2/T3 are decided by [`super::online::Watermark::observe`]; this
-    /// wrapper additionally moves an epoch-mismatched session into
-    /// `Resyncing` instead of kicking it (42 §6.2).
+    /// T2/T3 are decided by [`super::online::Watermark::observe`]. An epoch
+    /// mismatch is reported to the sequencer, which kicks the session so it
+    /// reconnects and replays under the current epoch.
     pub fn on_watermark(
         &mut self,
         session: &mut Session,
@@ -176,25 +176,9 @@ impl HealthMonitor {
         current: Seq,
         at: std::time::Instant,
     ) -> WatermarkVerdict {
-        let verdict = session
+        session
             .watermark
-            .observe(applied, epoch_seen, epoch, current, at);
-        match verdict {
-            WatermarkVerdict::EpochMismatch => session.state = SessionState::Resyncing,
-            // The epoch the client names now matches ours again: the session
-            // may rejoin the broadcast set. Without this exit, `Resyncing`
-            // would be terminal and every later view selection would skip
-            // the client forever.
-            WatermarkVerdict::Unchanged | WatermarkVerdict::Advanced
-                if epoch_seen == epoch && session.state == SessionState::Resyncing =>
-            {
-                session.state = SessionState::Online;
-            }
-            WatermarkVerdict::Unchanged
-            | WatermarkVerdict::Advanced
-            | WatermarkVerdict::Kick(_) => {}
-        }
-        verdict
+            .observe(applied, epoch_seen, epoch, current, at)
     }
 
     /// Report how far one session is behind, if at all.
@@ -218,7 +202,7 @@ impl HealthMonitor {
         let busy = work_seq > session.watermark.applied_seq();
         if !busy {
             session.watermark.note_idle(now);
-            self.reported.remove(&session.client_id);
+            self.reported.remove(&session.session_id);
             return None;
         }
         let threshold = self.threshold(session, work_seq);
@@ -231,7 +215,7 @@ impl HealthMonitor {
             .max(session.watermark.last_work_at());
         let lag = now.saturating_duration_since(since_work);
         if lag <= threshold {
-            self.reported.remove(&session.client_id);
+            self.reported.remove(&session.session_id);
             return None;
         }
         Some(Diagnosis {
@@ -248,7 +232,7 @@ impl HealthMonitor {
     ///
     /// At most one line per [`HealthLimits::diagnosis_interval`]. Metrics do
     /// not go through this gate.
-    pub fn should_report(&mut self, client: ClientId, now: Instant) -> bool {
+    pub fn should_report(&mut self, client: SessionId, now: Instant) -> bool {
         match self.reported.get(&client) {
             Some(last) if now.saturating_duration_since(*last) < self.limits.diagnosis_interval => {
                 false
@@ -261,7 +245,7 @@ impl HealthMonitor {
     }
 
     /// Drop the per-client report bookkeeping when a session detaches.
-    pub fn forget(&mut self, client: ClientId) {
+    pub fn forget(&mut self, client: SessionId) {
         self.reported.remove(&client);
     }
 }
@@ -273,18 +257,18 @@ mod tests {
     use super::*;
     use crate::protocol::KickReason;
     use crate::server::config::OutboxConfig;
-    use crate::server::online::{Outbox, SessionInit};
+    use crate::server::online::{Outbox, SessionInit, SessionState};
     use crate::transport::PeerId;
     use std::time::Instant;
 
-    fn client(byte: u8) -> ClientId {
-        ClientId::from_bytes([byte; 16])
+    fn client(byte: u8) -> SessionId {
+        SessionId(u128::from_le_bytes([byte; 16]))
     }
 
     fn session(at: Instant) -> Session {
         let (outbox, _data, _ctrl) = Outbox::new(&OutboxConfig::default());
         Session::new(SessionInit {
-            client_id: client(1),
+            session_id: client(1),
             nonce: 1,
             peer: PeerId::from_serial(1),
             outbox,
@@ -465,12 +449,12 @@ mod tests {
         session.watermark.note_work(at);
         let lagging = at + Duration::from_secs(60);
         assert!(monitor.diagnose(&mut session, work, lagging).is_some());
-        assert!(monitor.should_report(session.client_id, lagging));
-        assert!(!monitor.should_report(session.client_id, lagging + Duration::from_secs(1)));
-        assert!(monitor.should_report(session.client_id, lagging + DIAGNOSIS_INTERVAL));
+        assert!(monitor.should_report(session.session_id, lagging));
+        assert!(!monitor.should_report(session.session_id, lagging + Duration::from_secs(1)));
+        assert!(monitor.should_report(session.session_id, lagging + DIAGNOSIS_INTERVAL));
         // Caught up: the entry is dropped, so the next episode logs at once.
         assert_eq!(monitor.diagnose(&mut session, Seq(0), lagging), None);
-        assert!(monitor.should_report(session.client_id, lagging));
+        assert!(monitor.should_report(session.session_id, lagging));
     }
 
     #[test]
@@ -494,54 +478,11 @@ mod tests {
             monitor.on_watermark(&mut session, Seq(6), 6, 7, Seq(10), at),
             WatermarkVerdict::EpochMismatch
         );
-        assert_eq!(session.state, SessionState::Resyncing);
-    }
-
-    /// hp1: `Resyncing` must have an exit. A report that names the current
-    /// epoch again proves the client caught up with the restart; the session
-    /// rejoins the broadcast set instead of staying invisible forever.
-    #[test]
-    fn server_health_epoch_mismatch_recovers_when_the_epoch_matches_again() {
-        let at = Instant::now();
-        let mut session = session(at);
-        session.state = SessionState::Online;
-        let mut monitor = HealthMonitor::new(HealthLimits::default());
-
         assert_eq!(
-            monitor.on_watermark(&mut session, Seq(5), 7, 7, Seq(10), at),
-            WatermarkVerdict::Advanced
+            session.state,
+            SessionState::Replaying,
+            "health must not mutate the lifecycle; the sequencer kicks on mismatch"
         );
-        assert_eq!(
-            monitor.on_watermark(&mut session, Seq(6), 6, 7, Seq(10), at),
-            WatermarkVerdict::EpochMismatch
-        );
-        assert_eq!(session.state, SessionState::Resyncing);
-
-        // Still a foreign epoch: no exit.
-        assert_eq!(
-            monitor.on_watermark(&mut session, Seq(6), 5, 7, Seq(10), at),
-            WatermarkVerdict::EpochMismatch
-        );
-        assert_eq!(session.state, SessionState::Resyncing);
-
-        // The client now names our epoch and advances: back online.
-        assert_eq!(
-            monitor.on_watermark(&mut session, Seq(6), 7, 7, Seq(10), at),
-            WatermarkVerdict::Advanced
-        );
-        assert_eq!(session.state, SessionState::Online);
-
-        // A repeated, unchanged report is also a valid exit.
-        assert_eq!(
-            monitor.on_watermark(&mut session, Seq(6), 6, 7, Seq(10), at),
-            WatermarkVerdict::EpochMismatch
-        );
-        assert_eq!(session.state, SessionState::Resyncing);
-        assert_eq!(
-            monitor.on_watermark(&mut session, Seq(6), 7, 7, Seq(10), at),
-            WatermarkVerdict::Unchanged
-        );
-        assert_eq!(session.state, SessionState::Online);
     }
 
     #[test]

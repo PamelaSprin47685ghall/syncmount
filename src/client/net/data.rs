@@ -13,11 +13,9 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fmt;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
-use crate::client::replayer::OpData;
 use crate::protocol::crypto::{CryptoError, Opener};
 use crate::protocol::fragment::CHUNK_PLAIN;
-use crate::protocol::{DataRef, FrameBuf, ProtocolError, SessionId, StreamId};
-use crate::store::Errno;
+use crate::protocol::{FrameBuf, ProtocolError, SessionId, StreamId};
 
 /// Completed streams kept for late `ORDERED` frames.
 const COMPLETED_CAPACITY: usize = 64;
@@ -209,6 +207,15 @@ impl DataCache {
         Ok(())
     }
 
+    /// Take the reassembled bytes of one data session.
+    ///
+    /// The stream is removed from the cache, so a replayed duplicate cannot
+    /// reuse bytes that were meant for one `ORDERED` frame.
+    pub fn take(&self, session: SessionId) -> Option<Vec<u8>> {
+        let mut inner = self.lock();
+        inner.completed.remove(&session)
+    }
+
     /// Number of completed streams (diagnostics and tests).
     pub fn completed_len(&self) -> usize {
         self.lock().completed.len()
@@ -220,15 +227,6 @@ impl DataCache {
     }
 }
 
-impl OpData for DataCache {
-    fn read(&self, data: &DataRef) -> Result<Vec<u8>, Errno> {
-        self.lock()
-            .completed
-            .get(&data.session)
-            .cloned()
-            .ok_or(Errno::EIO)
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -281,12 +279,8 @@ mod tests {
         assert_eq!(cache.completed_len(), 1);
         assert_eq!(cache.stream_len(), 0);
 
-        let reference = DataRef {
-            session,
-            total_len: payload.len() as u64,
-            data_hash: *blake3::hash(payload).as_bytes(),
-        };
-        assert_eq!(cache.read(&reference), Ok(payload.to_vec()));
+        assert_eq!(cache.take(session), Some(payload.to_vec()));
+        assert_eq!(cache.take(session), None);
     }
 
     #[test]
@@ -309,12 +303,7 @@ mod tests {
         cache.push(&first, &opener).expect("first");
         assert_eq!(cache.completed_len(), 1);
 
-        let reference = DataRef {
-            session,
-            total_len: payload.len() as u64,
-            data_hash: *blake3::hash(&payload).as_bytes(),
-        };
-        assert_eq!(cache.read(&reference), Ok(payload));
+        assert_eq!(cache.take(session), Some(payload));
     }
 
     #[test]

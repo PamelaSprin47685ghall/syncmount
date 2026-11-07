@@ -25,10 +25,9 @@
 //! `STREAM_DATA` is raw sealed bytes and is handled by the fragment layer, so
 //! both decoders reject it with [`MessageError::WrongEncoding`] (44 §3.1).
 //!
-//! No signature verification happens here: `F_SIG` is opaque bytes. The
-//! payload hash that a signature covers is produced by
-//! [`Ordered::canonical_bytes_excluding`], which delegates to
-//! [`FieldMap::canonical_bytes_excluding`] (44 §4.6, INV-24).
+//! No signature verification happens here. The AEAD envelope authenticates
+//! the body; [`Ordered::canonical_bytes_excluding`] only serves callers that
+//! need a stable byte view (44 §4.6, INV-24).
 
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
@@ -96,8 +95,6 @@ pub mod fid {
     pub const F_DATA_SESSION: u8 = 0x1A;
     /// Total plaintext length, `u64` (`WRITE`, `PWRITE`).
     pub const F_TOTAL_LEN: u8 = 0x1B;
-    /// Canonical op-body hash, 32 B (`ORDERED`).
-    pub const F_PAYLOAD_HASH: u8 = 0x1C;
     /// Lock type, `u8` (`FLOCK`, `FCNTL_LOCK`).
     pub const F_LOCK_TYPE: u8 = 0x1D;
     /// Lock action, `u8` (`FLOCK`, `FCNTL_LOCK`).
@@ -114,31 +111,10 @@ pub mod fid {
     pub const F_CLIENT_TIME: u8 = 0x23;
     /// Open/create flags, `u32` (`CREATE_EXCL`).
     pub const F_OP_FLAGS: u8 = 0x24;
-    /// Ed25519 signature, 64 B (`ORDERED`, opaque here).
-    pub const F_SIG: u8 = 0x25;
-    /// Key epoch, `u32` (`ORDERED`).
-    pub const F_KEY_EPOCH: u8 = 0x26;
-    /// Ed25519 public key, 32 B (`ORDERED`).
-    pub const F_SENDER_PUB: u8 = 0x27;
-    /// Legacy PSK key-binding MAC, 32 B (`ORDERED`).
-    ///
-    /// 50 §3.3 replaces this with [`F_SELF_SIG`] for `KEY_ANNOUNCE`; the
-    /// field remains defined for older senders and is never required.
-    pub const F_KEY_MAC: u8 = 0x28;
-    /// Concatenated key-directory entries (`RELAY`).
-    pub const F_KEY_ENTRIES: u8 = 0x29;
-    /// Previous-epoch signature, 64 B (`KEY_ANNOUNCE`).
-    pub const F_PREV_SIG: u8 = 0x2A;
-    /// Last signed sequence, `u64` (`LEAVE` 0x1B).
+    /// Last acknowledged sequence, `u64` (`LEAVE`).
     pub const F_LAST_SIGNED_SEQ: u8 = 0x2B;
     /// Data-stream hash, 32 B (`WRITE`, `PWRITE`).
     pub const F_DATA_HASH: u8 = 0x2C;
-    /// Ed25519 self-signature, 64 B (`KEY_ANNOUNCE`; 50 §3.3).
-    ///
-    /// Covers `"sm/v1/keyentry\0" ‖ cluster_id ‖ client_id ‖ pk ‖ epoch`
-    /// and proves possession of the private key. This is the mandatory
-    /// `KEY_ANNOUNCE` proof; [`F_KEY_MAC`] is legacy and optional.
-    pub const F_SELF_SIG: u8 = 0x2D;
     /// Protocol major, `u16` (`HELLO`, `WELCOME`).
     pub const F_PROTO_MAJOR: u8 = 0x30;
     /// Protocol minor, `u16` (`HELLO`, `WELCOME`).
@@ -151,12 +127,8 @@ pub mod fid {
     pub const F_CLIENT_ID: u8 = 0x34;
     /// Client nonce, 32 B (`HELLO`).
     pub const F_CLIENT_NONCE: u8 = 0x35;
-    /// Join proof, bytes (`RELAY`).
-    pub const F_PROOF: u8 = 0x36;
     /// Server nonce, 32 B (`WELCOME`).
     pub const F_SERVER_NONCE: u8 = 0x38;
-    /// Join state, `u8` (`WELCOME`).
-    pub const F_JOIN_STATE: u8 = 0x39;
     /// Relay sub-message kind, `u8` (`RELAY`).
     pub const F_SUB_KIND: u8 = 0x40;
     /// Content chunk identifier, 32 B (`RELAY`).
@@ -169,8 +141,6 @@ pub mod fid {
     pub const F_PART_COUNT: u8 = 0x44;
     /// Plaintext digest, 32 B (`RELAY`).
     pub const F_PLAINTEXT_DIGEST: u8 = 0x45;
-    /// Join-proof result, `u8` (`RELAY`).
-    pub const F_PROOF_RESULT: u8 = 0x46;
     /// Vendor extension, bytes.
     pub const F_EXTRA: u8 = 0x7F;
 
@@ -218,6 +188,12 @@ pub mod fid {
     /// absent field are equivalent. Mutually exclusive with
     /// [`F_VIEW_SELF`] and the three view-source fields.
     pub const F_VIEW_BOOTSTRAP: u8 = 0x5D;
+    /// Server proof over the canonical `WELCOME` body, 61 B (`WELCOME`).
+    ///
+    /// `alg u8 | nonce 12 | ciphertext 32 | tag 16`, sealed under the
+    /// handshake key. The plaintext is `BLAKE3(canonical body excluding this
+    /// field)`; the AAD is `"sm/v2/welcome\0" ‖ client_nonce`.
+    pub const F_SERVER_PROOF: u8 = 0x5E;
 }
 
 /// A WCP encoding or decoding failure.
@@ -479,15 +455,13 @@ impl OpClass {
     pub const FLOCK: Self = Self(12);
     /// POSIX record lock.
     pub const FCNTL_LOCK: Self = Self(13);
-    /// Synchronization control. Unused in v1.
+    /// Synchronization control. Unused in v2.
     pub const SYNC_CTRL: Self = Self(14);
-    /// Public-key announcement.
-    pub const KEY_ANNOUNCE: Self = Self(15);
-    /// Client-signed graceful leave.
-    pub const LEAVE: Self = Self(16);
+    /// Graceful leave.
+    pub const LEAVE: Self = Self(15);
 
     /// Every defined class, in wire order.
-    pub const ALL: [Self; 16] = [
+    pub const ALL: [Self; 15] = [
         Self::WRITE,
         Self::PWRITE,
         Self::TRUNCATE,
@@ -502,14 +476,13 @@ impl OpClass {
         Self::FLOCK,
         Self::FCNTL_LOCK,
         Self::SYNC_CTRL,
-        Self::KEY_ANNOUNCE,
         Self::LEAVE,
     ];
 
-    /// Decode a wire value. Values outside `1..=16` are fatal.
+    /// Decode a wire value. Values outside `1..=15` are fatal.
     pub fn from_u8(raw: u8) -> Result<Self, MessageError> {
         match raw {
-            1..=16 => Ok(Self(raw)),
+            1..=15 => Ok(Self(raw)),
             other => Err(MessageError::UnknownOpClass(other)),
         }
     }
@@ -536,8 +509,7 @@ impl OpClass {
             12 => "FLOCK",
             13 => "FCNTL_LOCK",
             14 => "SYNC_CTRL",
-            15 => "KEY_ANNOUNCE",
-            16 => "LEAVE",
+            15 => "LEAVE",
             _ => "UNKNOWN",
         }
     }
@@ -552,14 +524,9 @@ impl OpClass {
         self.is_file_op()
     }
 
-    /// Whether this is a key announcement (15).
-    pub const fn is_key_announce(self) -> bool {
-        self.0 == 15
-    }
-
-    /// Whether this is a signed leave (16).
+    /// Whether this is a leave (15).
     pub const fn is_leave(self) -> bool {
-        self.0 == 16
+        self.0 == 15
     }
 }
 
@@ -576,14 +543,12 @@ pub enum MessageError {
     Wcp(WcpError),
     /// Path validation failed.
     Path(PathError),
-    /// `F_OP_CLASS` is outside `1..=16`; fatal (49 A14).
+    /// `F_OP_CLASS` is outside `1..=15`; fatal (49 A14).
     UnknownOpClass(u8),
-    /// `F_SUB_KIND` is outside `1..=15`.
+    /// `F_SUB_KIND` is outside `1..=10`.
     UnknownRelaySub(u8),
     /// `F_RESYNC` is outside `0..=2`.
     UnknownResync(u8),
-    /// `F_JOIN_STATE` is outside `0..=1`.
-    UnknownJoinState(u8),
     /// `F_TRN_REASON` is unknown.
     UnknownTrnReason(u16),
     /// `F_KICK_REASON` is unknown.
@@ -607,6 +572,13 @@ pub enum MessageError {
         len: usize,
         /// Required minimum.
         min: usize,
+    },
+    /// A fixed-layout body has the wrong exact width.
+    BadBodyLen {
+        /// Observed length.
+        len: usize,
+        /// Required exact length.
+        need: usize,
     },
     /// The view-source fields are not all present or all absent.
     ///
@@ -650,7 +622,6 @@ impl fmt::Display for MessageError {
             Self::UnknownOpClass(raw) => write!(f, "unknown op_class {raw}"),
             Self::UnknownRelaySub(raw) => write!(f, "unknown relay sub-kind {raw}"),
             Self::UnknownResync(raw) => write!(f, "unknown resync mode {raw}"),
-            Self::UnknownJoinState(raw) => write!(f, "unknown join state {raw}"),
             Self::UnknownTrnReason(raw) => write!(f, "unknown transport reason {raw}"),
             Self::UnknownKickReason(raw) => write!(f, "unknown kick reason {raw}"),
             Self::UnknownSyncReason(raw) => write!(f, "unknown sync-end reason {raw}"),
@@ -665,6 +636,9 @@ impl fmt::Display for MessageError {
             }
             Self::BodyTooShort { len, min } => {
                 write!(f, "body is {len} bytes, minimum {min}")
+            }
+            Self::BadBodyLen { len, need } => {
+                write!(f, "body is {len} bytes, exactly {need} required")
             }
             Self::PartialViewSource {
                 holder,
@@ -875,8 +849,8 @@ impl<'a> FieldMap<'a> {
 
     /// Re-encode every field except `exclude`, sorted by fid.
     ///
-    /// This is the canonical op-body form that W4 hashes for
-    /// `F_PAYLOAD_HASH` (44 §4.6, INV-24). Hashing is not done here.
+    /// This is the canonical op-body form (44 §4.6, INV-24). Hashing is not
+    /// done here.
     pub fn canonical_bytes_excluding(&self, exclude: &[u8]) -> Result<Vec<u8>, WcpError> {
         let mut selected: Vec<(u8, &'a [u8])> = self
             .iter()
@@ -1102,32 +1076,6 @@ impl ResyncMode {
     }
 }
 
-/// Join state carried in `F_JOIN_STATE` (44 §3.4, 44 D5).
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-#[repr(u8)]
-pub enum JoinState {
-    /// Challenge frame: the join proof is still outstanding.
-    Pending = 0,
-    /// Terminal frame: the session may enter STEADY.
-    Accepted = 1,
-}
-
-impl JoinState {
-    /// Decode a wire value.
-    pub fn from_u8(raw: u8) -> Result<Self, MessageError> {
-        match raw {
-            0 => Ok(Self::Pending),
-            1 => Ok(Self::Accepted),
-            other => Err(MessageError::UnknownJoinState(other)),
-        }
-    }
-
-    /// Raw wire value.
-    pub const fn as_u8(self) -> u8 {
-        self as u8
-    }
-}
-
 /// Limits nested in `WELCOME` under `F_LIMITS`.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct WelcomeLimits {
@@ -1321,10 +1269,8 @@ pub struct Welcome {
     pub server_time: u64,
     /// 32-byte server nonce.
     pub server_nonce: [u8; 32],
-    /// Join state.
-    pub join_state: JoinState,
-    /// Join session; required while [`JoinState::Pending`].
-    pub session_id: Option<SessionId>,
+    /// Join session.
+    pub session_id: SessionId,
     /// Optional snapshot reference.
     pub snapshot_ref: Option<SnapshotRef>,
     /// Client holding the view snapshot. Present only with
@@ -1345,17 +1291,16 @@ pub struct Welcome {
 }
 
 impl Welcome {
+    /// Width of the `F_SERVER_PROOF` value.
+    pub const SERVER_PROOF_LEN: usize = 61;
+
     /// Decode a plain `WELCOME` body.
     pub fn decode(body: &[u8], limits: &Limits) -> Result<Self, MessageError> {
         let fields = FieldMap::parse(body, limits)?;
-        let join_state =
-            JoinState::from_u8(required(fields.u8(fid::F_JOIN_STATE)?, fid::F_JOIN_STATE)?)?;
-        let session_id = fields
-            .fixed::<16>(fid::F_SESSION_ID)?
-            .map(SessionId::from_le_bytes);
-        if join_state == JoinState::Pending && session_id.is_none() {
-            return Err(MessageError::Wcp(WcpError::MissingField(fid::F_SESSION_ID)));
-        }
+        let session_id = SessionId::from_le_bytes(required(
+            fields.fixed::<16>(fid::F_SESSION_ID)?,
+            fid::F_SESSION_ID,
+        )?);
         let snapshot_ref = match fields.get(fid::F_SNAPSHOT_REF) {
             Some(nested) => Some(SnapshotRef::decode(nested, limits)?),
             None => None,
@@ -1401,10 +1346,7 @@ impl Welcome {
             }
         };
         if view_bootstrap
-            && (view_self
-                || view_holder.is_some()
-                || view_seq.is_some()
-                || view_session.is_some())
+            && (view_self || view_holder.is_some() || view_seq.is_some() || view_session.is_some())
         {
             return Err(MessageError::ViewBootstrapConflict);
         }
@@ -1430,7 +1372,6 @@ impl Welcome {
                 fields.fixed::<32>(fid::F_SERVER_NONCE)?,
                 fid::F_SERVER_NONCE,
             )?,
-            join_state,
             session_id,
             snapshot_ref,
             view_holder,
@@ -1441,11 +1382,44 @@ impl Welcome {
         })
     }
 
-    /// Encode a plain `WELCOME` body.
+    /// Encode a plain `WELCOME` body without a server proof.
     pub fn encode(&self) -> Result<Vec<u8>, MessageError> {
-        if self.join_state == JoinState::Pending && self.session_id.is_none() {
-            return Err(MessageError::Wcp(WcpError::MissingField(fid::F_SESSION_ID)));
-        }
+        self.encode_with_optional_proof(None)
+    }
+
+    /// Encode a plain `WELCOME` body with `F_SERVER_PROOF` appended.
+    ///
+    /// The proof covers [`Welcome::proof_input`] of the same body without the
+    /// proof field.
+    pub fn encode_with_proof(
+        &self,
+        proof: &[u8; Self::SERVER_PROOF_LEN],
+    ) -> Result<Vec<u8>, MessageError> {
+        self.encode_with_optional_proof(Some(proof))
+    }
+
+    /// The canonical `WELCOME` bytes without `F_SERVER_PROOF`.
+    ///
+    /// This is the exact input to the server proof hash, on both sides.
+    pub fn proof_input(body: &[u8], limits: &Limits) -> Result<[u8; 32], MessageError> {
+        let fields = FieldMap::parse(body, limits)?;
+        let canonical = fields.canonical_bytes_excluding(&[fid::F_SERVER_PROOF])?;
+        Ok(*blake3::hash(&canonical).as_bytes())
+    }
+
+    /// Read `F_SERVER_PROOF` from an encoded body.
+    pub fn server_proof(
+        body: &[u8],
+        limits: &Limits,
+    ) -> Result<Option<[u8; Self::SERVER_PROOF_LEN]>, MessageError> {
+        let fields = FieldMap::parse(body, limits)?;
+        Ok(fields.fixed::<61>(fid::F_SERVER_PROOF)?)
+    }
+
+    fn encode_with_optional_proof(
+        &self,
+        proof: Option<&[u8; Self::SERVER_PROOF_LEN]>,
+    ) -> Result<Vec<u8>, MessageError> {
         if self.view_self
             && (self.view_holder.is_some()
                 || self.view_seq.is_some()
@@ -1472,10 +1446,7 @@ impl Welcome {
         writer.nested(fid::F_LIMITS, |nested| self.limits.write(nested));
         writer.u64(fid::F_SERVER_TIME, self.server_time);
         writer.bytes(fid::F_SERVER_NONCE, &self.server_nonce);
-        writer.u8(fid::F_JOIN_STATE, self.join_state.as_u8());
-        if let Some(session_id) = self.session_id {
-            writer.bytes(fid::F_SESSION_ID, &session_id.to_le_bytes());
-        }
+        writer.bytes(fid::F_SESSION_ID, &self.session_id.to_le_bytes());
         if let Some(snapshot) = self.snapshot_ref {
             writer.nested(fid::F_SNAPSHOT_REF, |nested| snapshot.write(nested));
         }
@@ -1500,7 +1471,145 @@ impl Welcome {
         if self.view_bootstrap {
             writer.u8(fid::F_VIEW_BOOTSTRAP, 1);
         }
+        if let Some(proof) = proof {
+            writer.bytes(fid::F_SERVER_PROOF, proof);
+        }
         Ok(writer.finish()?)
+    }
+}
+
+/// `AUTH` body: fixed 112-byte plaintext, sealed under the handshake key.
+///
+/// Layout:
+///
+/// ```text
+/// client_nonce 32 | server_nonce 32 | session_id 16 | epoch 8
+/// | client_id 16 | proto_major 2 | proto_minor 2 | caps 4
+/// ```
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Auth {
+    /// Nonce the client sent in `HELLO`.
+    pub client_nonce: [u8; 32],
+    /// Nonce the server sent in `WELCOME`.
+    pub server_nonce: [u8; 32],
+    /// Join session named by `WELCOME`.
+    pub session_id: SessionId,
+    /// Server epoch named by `WELCOME`.
+    pub epoch: u64,
+    /// Client identity claimed in `HELLO`.
+    pub client_id: ClientId,
+    /// Negotiated protocol version.
+    pub proto: ProtoVersion,
+    /// Negotiated capability set.
+    pub caps: Caps,
+}
+
+impl Auth {
+    /// Plaintext width.
+    pub const LEN: usize = 32 + 32 + 16 + 8 + 16 + 2 + 2 + 4;
+
+    /// Encode the fixed layout.
+    pub fn encode(&self) -> [u8; Self::LEN] {
+        let mut out = [0u8; Self::LEN];
+        out[..32].copy_from_slice(&self.client_nonce);
+        out[32..64].copy_from_slice(&self.server_nonce);
+        out[64..80].copy_from_slice(&self.session_id.to_le_bytes());
+        out[80..88].copy_from_slice(&self.epoch.to_le_bytes());
+        out[88..104].copy_from_slice(&self.client_id.to_bytes());
+        out[104..106].copy_from_slice(&self.proto.major.to_le_bytes());
+        out[106..108].copy_from_slice(&self.proto.minor.to_le_bytes());
+        out[108..112].copy_from_slice(&self.caps.bits().to_le_bytes());
+        out
+    }
+
+    /// Decode exactly [`Auth::LEN`] bytes.
+    ///
+    /// # Errors
+    ///
+    /// [`MessageError::BadBodyLen`] for any other width.
+    pub fn decode(body: &[u8]) -> Result<Self, MessageError> {
+        if body.len() != Self::LEN {
+            return Err(MessageError::BadBodyLen {
+                len: body.len(),
+                need: Self::LEN,
+            });
+        }
+        let mut client_nonce = [0u8; 32];
+        client_nonce.copy_from_slice(&body[..32]);
+        let mut server_nonce = [0u8; 32];
+        server_nonce.copy_from_slice(&body[32..64]);
+        let mut session = [0u8; 16];
+        session.copy_from_slice(&body[64..80]);
+        let mut client = [0u8; 16];
+        client.copy_from_slice(&body[88..104]);
+        Ok(Self {
+            client_nonce,
+            server_nonce,
+            session_id: SessionId::from_le_bytes(session),
+            epoch: u64::from_le_bytes([
+                body[80], body[81], body[82], body[83], body[84], body[85], body[86], body[87],
+            ]),
+            client_id: ClientId::from_bytes(client),
+            proto: ProtoVersion {
+                major: u16::from_le_bytes([body[104], body[105]]),
+                minor: u16::from_le_bytes([body[106], body[107]]),
+            },
+            caps: Caps::from_bits(u32::from_le_bytes([
+                body[108], body[109], body[110], body[111],
+            ])),
+        })
+    }
+}
+
+/// `ACCEPT` body: fixed 32-byte plaintext, sealed under the handshake key.
+///
+/// Layout: `epoch 8 | session_id 16 | current_seq 8`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Accept {
+    /// Server epoch named by `WELCOME`.
+    pub epoch: u64,
+    /// Join session named by `WELCOME`.
+    pub session_id: SessionId,
+    /// Server sequence at acceptance time.
+    pub current_seq: Seq,
+}
+
+impl Accept {
+    /// Plaintext width.
+    pub const LEN: usize = 8 + 16 + 8;
+
+    /// Encode the fixed layout.
+    pub fn encode(&self) -> [u8; Self::LEN] {
+        let mut out = [0u8; Self::LEN];
+        out[..8].copy_from_slice(&self.epoch.to_le_bytes());
+        out[8..24].copy_from_slice(&self.session_id.to_le_bytes());
+        out[24..32].copy_from_slice(&self.current_seq.get().to_le_bytes());
+        out
+    }
+
+    /// Decode exactly [`Accept::LEN`] bytes.
+    ///
+    /// # Errors
+    ///
+    /// [`MessageError::BadBodyLen`] for any other width.
+    pub fn decode(body: &[u8]) -> Result<Self, MessageError> {
+        if body.len() != Self::LEN {
+            return Err(MessageError::BadBodyLen {
+                len: body.len(),
+                need: Self::LEN,
+            });
+        }
+        let mut session = [0u8; 16];
+        session.copy_from_slice(&body[8..24]);
+        Ok(Self {
+            epoch: u64::from_le_bytes([
+                body[0], body[1], body[2], body[3], body[4], body[5], body[6], body[7],
+            ]),
+            session_id: SessionId::from_le_bytes(session),
+            current_seq: Seq(u64::from_le_bytes([
+                body[24], body[25], body[26], body[27], body[28], body[29], body[30], body[31],
+            ])),
+        })
     }
 }
 
@@ -1528,16 +1637,6 @@ pub enum RelaySub {
     BlockMiss = 9,
     /// Cancel a sync session.
     Cancel = 10,
-    /// Join proof.
-    JoinProof = 11,
-    /// Join accepted by a verifier.
-    JoinAccept = 12,
-    /// Join rejected by a verifier.
-    JoinFail = 13,
-    /// Public-key directory request.
-    KeyReq = 14,
-    /// Public-key directory response.
-    KeyResp = 15,
 }
 
 impl RelaySub {
@@ -1554,11 +1653,6 @@ impl RelaySub {
             8 => Ok(Self::BlockReq),
             9 => Ok(Self::BlockMiss),
             10 => Ok(Self::Cancel),
-            11 => Ok(Self::JoinProof),
-            12 => Ok(Self::JoinAccept),
-            13 => Ok(Self::JoinFail),
-            14 => Ok(Self::KeyReq),
-            15 => Ok(Self::KeyResp),
             other => Err(MessageError::UnknownRelaySub(other)),
         }
     }
@@ -1581,11 +1675,6 @@ impl RelaySub {
             Self::BlockReq => "BLOCK_REQ",
             Self::BlockMiss => "BLOCK_MISS",
             Self::Cancel => "CANCEL",
-            Self::JoinProof => "JOIN_PROOF",
-            Self::JoinAccept => "JOIN_ACCEPT",
-            Self::JoinFail => "JOIN_FAIL",
-            Self::KeyReq => "KEY_REQ",
-            Self::KeyResp => "KEY_RESP",
         }
     }
 }
@@ -1661,34 +1750,22 @@ pub enum OpArgs<'a> {
         /// Range length.
         len: u64,
     },
-    /// `SYNC_CTRL`: no extra arguments in v1.
+    /// `SYNC_CTRL`: no extra arguments in v2.
     SyncCtrl,
-    /// `KEY_ANNOUNCE`: mandatory self-signature and optional rotation proof.
-    KeyAnnounce {
-        /// `Ed25519(sk, "sm/v1/keyentry\0" ‖ cluster_id ‖ client_id ‖ pk ‖ epoch)`
-        /// (50 §3.3). Required.
-        self_sig: [u8; 64],
-        /// Previous-epoch signature, if this is a rotation.
-        prev_sig: Option<[u8; 64]>,
-    },
     /// `LEAVE`: no extra arguments.
     Leave,
 }
 
 /// `ORDERED` body: sealed WCP (44 §3.2, 44 §3.4).
 ///
-/// Every class except `KEY_ANNOUNCE` carries `F_OP_ID`, `F_PAYLOAD_HASH` and
-/// `F_SIG`. `KEY_ANNOUNCE` carries `F_SENDER_PUB` and the mandatory
-/// `F_SELF_SIG`, may carry `F_PREV_SIG` and the legacy optional `F_KEY_MAC`,
-/// and must not carry `F_SIG` (50 §3.3, 44 INV-23).
+/// Every class carries `F_OP_ID`. The AEAD envelope authenticates the body;
+/// there are no per-operation signature fields.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct Ordered<'a> {
     /// Author client.
     pub client_id: ClientId,
-    /// Author key epoch.
-    pub key_epoch: u32,
-    /// Operation identifier; absent only for `KEY_ANNOUNCE`.
-    pub op_id: Option<OpId>,
+    /// Operation identifier.
+    pub op_id: OpId,
     /// Operation class.
     pub op_class: OpClass,
     /// Path for file ops.
@@ -1697,15 +1774,6 @@ pub struct Ordered<'a> {
     pub attrs: Option<FileAttrs>,
     /// Class-specific arguments.
     pub args: OpArgs<'a>,
-    /// Canonical op-body hash; absent only for `KEY_ANNOUNCE`.
-    pub payload_hash: Option<[u8; 32]>,
-    /// Signature bytes; opaque here. Forbidden for `KEY_ANNOUNCE`.
-    pub sig: Option<[u8; 64]>,
-    /// Inline public key, optional outside `KEY_ANNOUNCE`.
-    pub sender_pub: Option<[u8; 32]>,
-    /// Legacy key-binding MAC. Optional everywhere; `KEY_ANNOUNCE` uses
-    /// `F_SELF_SIG` instead (50 §3.3).
-    pub key_mac: Option<[u8; 32]>,
     /// The complete field map, including unknown fids.
     pub fields: FieldMap<'a>,
     raw: &'a [u8],
@@ -1719,48 +1787,8 @@ impl<'a> Ordered<'a> {
             fields.fixed::<16>(fid::F_CLIENT_ID)?,
             fid::F_CLIENT_ID,
         )?);
-        let key_epoch = required(fields.u32(fid::F_KEY_EPOCH)?, fid::F_KEY_EPOCH)?;
         let op_class = OpClass::from_u8(required(fields.u8(fid::F_OP_CLASS)?, fid::F_OP_CLASS)?)?;
-
-        let op_id = fields.fixed::<16>(fid::F_OP_ID)?.map(OpId::from_bytes);
-        let payload_hash = fields.fixed::<32>(fid::F_PAYLOAD_HASH)?;
-        let sig = fields.fixed::<64>(fid::F_SIG)?;
-        let sender_pub = fields.fixed::<32>(fid::F_SENDER_PUB)?;
-        let self_sig = fields.fixed::<64>(fid::F_SELF_SIG)?;
-        let key_mac = fields.fixed::<32>(fid::F_KEY_MAC)?;
-
-        if op_class.is_key_announce() {
-            if sig.is_some() {
-                return Err(MessageError::BadValue {
-                    fid: fid::F_SIG,
-                    reason: "F_SIG is forbidden for KEY_ANNOUNCE",
-                });
-            }
-            if sender_pub.is_none() {
-                return Err(MessageError::Wcp(WcpError::MissingField(fid::F_SENDER_PUB)));
-            }
-            if self_sig.is_none() {
-                return Err(MessageError::Wcp(WcpError::MissingField(fid::F_SELF_SIG)));
-            }
-        } else {
-            if self_sig.is_some() {
-                return Err(MessageError::BadValue {
-                    fid: fid::F_SELF_SIG,
-                    reason: "F_SELF_SIG is only valid for KEY_ANNOUNCE",
-                });
-            }
-            if op_id.is_none() {
-                return Err(MessageError::Wcp(WcpError::MissingField(fid::F_OP_ID)));
-            }
-            if payload_hash.is_none() {
-                return Err(MessageError::Wcp(WcpError::MissingField(
-                    fid::F_PAYLOAD_HASH,
-                )));
-            }
-            if sig.is_none() {
-                return Err(MessageError::Wcp(WcpError::MissingField(fid::F_SIG)));
-            }
-        }
+        let op_id = OpId::from_bytes(required(fields.fixed::<16>(fid::F_OP_ID)?, fid::F_OP_ID)?);
 
         let (path, attrs) = if op_class.requires_file_attrs() {
             let path = path_field(&fields, fid::F_PATH, limits)?;
@@ -1843,26 +1871,17 @@ impl<'a> Ordered<'a> {
                 len: required(fields.u64(fid::F_LOCK_LEN)?, fid::F_LOCK_LEN)?,
             },
             OpClass::SYNC_CTRL => OpArgs::SyncCtrl,
-            OpClass::KEY_ANNOUNCE => OpArgs::KeyAnnounce {
-                self_sig: required(self_sig, fid::F_SELF_SIG)?,
-                prev_sig: fields.fixed::<64>(fid::F_PREV_SIG)?,
-            },
             OpClass::LEAVE => OpArgs::Leave,
             other => return Err(MessageError::UnknownOpClass(other.get())),
         };
 
         Ok(Self {
             client_id,
-            key_epoch,
             op_id,
             op_class,
             path,
             attrs,
             args,
-            payload_hash,
-            sig,
-            sender_pub,
-            key_mac,
             fields,
             raw: body,
         })
@@ -1876,8 +1895,7 @@ impl<'a> Ordered<'a> {
         self.raw.to_vec()
     }
 
-    /// Canonical bytes with `exclude` removed; the input to `payload_hash`
-    /// (44 §4.6, INV-24).
+    /// Canonical bytes with `exclude` removed (44 §4.6, INV-24).
     pub fn canonical_bytes_excluding(&self, exclude: &[u8]) -> Result<Vec<u8>, WcpError> {
         self.fields.canonical_bytes_excluding(exclude)
     }
@@ -1896,32 +1914,17 @@ impl<'a> Ordered<'a> {
         }
     }
 
-    /// The `KEY_ANNOUNCE` self-signature, if this is an announcement.
-    ///
-    /// W4 verifies it against `sender_pub` and the `sm/v1/keyentry\0`
-    /// domain; the protocol layer only carries the bytes (50 §3.3).
-    pub fn self_sig(&self) -> Option<[u8; 64]> {
-        match &self.args {
-            OpArgs::KeyAnnounce { self_sig, .. } => Some(*self_sig),
-            _ => None,
-        }
-    }
 }
 
 impl fmt::Debug for Ordered<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Ordered")
             .field("client_id", &self.client_id)
-            .field("key_epoch", &self.key_epoch)
             .field("op_id", &self.op_id)
             .field("op_class", &self.op_class)
             .field("path", &self.path)
             .field("attrs", &self.attrs)
             .field("args", &self.args)
-            .field("payload_hash", &self.payload_hash)
-            .field("sig_len", &self.sig.map(|sig| sig.len()))
-            .field("sender_pub", &self.sender_pub.map(|_| "<32B>"))
-            .field("key_mac", &self.key_mac.map(|_| "<32B>"))
             .field("fields", &self.fields)
             .finish()
     }
@@ -2257,6 +2260,10 @@ pub enum Message<'a> {
     Hello(Hello),
     /// `WELCOME` (0x02).
     Welcome(Welcome),
+    /// `AUTH` (0x03), fixed plaintext.
+    Auth(Auth),
+    /// `ACCEPT` (0x04), fixed plaintext.
+    Accept(Accept),
     /// `ORDERED` (0x10).
     Ordered(Ordered<'a>),
     /// `RESPONSE` (0x11).
@@ -2289,6 +2296,8 @@ impl Message<'_> {
         match self {
             Self::Hello(_) => MsgType::HELLO,
             Self::Welcome(_) => MsgType::WELCOME,
+            Self::Auth(_) => MsgType::AUTH,
+            Self::Accept(_) => MsgType::ACCEPT,
             Self::Ordered(_) => MsgType::ORDERED,
             Self::Response(_) => MsgType::RESPONSE,
             Self::Relay(_) => MsgType::RELAY,
@@ -2319,6 +2328,8 @@ impl Message<'_> {
         match self {
             Self::Hello(message) => message.encode(),
             Self::Welcome(message) => message.encode(),
+            Self::Auth(message) => Ok(message.encode().to_vec()),
+            Self::Accept(message) => Ok(message.encode().to_vec()),
             Self::Ordered(message) => Ok(message.encode_body()),
             Self::Response(message) => message.encode(),
             Self::Relay(message) => message.encode(),
@@ -2365,12 +2376,7 @@ pub fn decode_plain<'a>(
     match msg_type {
         MsgType::HELLO => Ok(Message::Hello(Hello::decode(body, limits)?)),
         MsgType::WELCOME => Ok(Message::Welcome(Welcome::decode(body, limits)?)),
-        MsgType::PONG => Ok(Message::Pong(Pong::decode(body, limits)?)),
         MsgType::ERROR => Ok(Message::Error(Error::decode(body, limits)?)),
-        MsgType::KICK => Ok(Message::Kick(Kick::decode(body, limits)?)),
-        MsgType::FLOW => Ok(Message::Flow(Flow::decode(body, limits)?)),
-        MsgType::SYNC_END => Ok(Message::SyncEnd(SyncEnd::decode(body, limits)?)),
-        MsgType::LEAVE => Ok(Message::Leave(Leave::decode(body, limits)?)),
         other => Err(MessageError::WrongEncoding(other)),
     }
 }
@@ -2386,11 +2392,18 @@ pub fn decode_sealed<'a>(
     limits: &Limits,
 ) -> Result<Message<'a>, MessageError> {
     match msg_type {
+        MsgType::AUTH => Ok(Message::Auth(Auth::decode(body)?)),
+        MsgType::ACCEPT => Ok(Message::Accept(Accept::decode(body)?)),
         MsgType::ORDERED => Ok(Message::Ordered(Ordered::decode(body, limits)?)),
         MsgType::RESPONSE => Ok(Message::Response(Response::decode(body, limits)?)),
         MsgType::RELAY => Ok(Message::Relay(Relay::decode(body, limits)?)),
         MsgType::ACK => Ok(Message::Ack(Ack::decode(body, limits)?)),
         MsgType::PING => Ok(Message::Ping(Ping::decode(body, limits)?)),
+        MsgType::PONG => Ok(Message::Pong(Pong::decode(body, limits)?)),
+        MsgType::KICK => Ok(Message::Kick(Kick::decode(body, limits)?)),
+        MsgType::FLOW => Ok(Message::Flow(Flow::decode(body, limits)?)),
+        MsgType::SYNC_END => Ok(Message::SyncEnd(SyncEnd::decode(body, limits)?)),
+        MsgType::LEAVE => Ok(Message::Leave(Leave::decode(body, limits)?)),
         other => Err(MessageError::WrongEncoding(other)),
     }
 }
@@ -2559,6 +2572,140 @@ mod tests {
         Limits::default()
     }
 
+    fn welcome_fixture() -> Welcome {
+        Welcome {
+            proto: ProtoVersion { major: 2, minor: 0 },
+            caps: Caps::REQUIRED,
+            epoch: 9,
+            current_seq: Seq(42),
+            client_id: ClientId::from_bytes([0x11; 16]),
+            resync: ResyncMode::None,
+            limits: WelcomeLimits {
+                max_frame: 131_072,
+                credit_bytes: 1 << 20,
+                session_ttl_s: 60,
+                max_sessions: 8,
+            },
+            server_time: 1_234,
+            server_nonce: [0x22; 32],
+            session_id: SessionId(0x33),
+            snapshot_ref: None,
+            view_holder: None,
+            view_seq: None,
+            view_session: None,
+            view_self: false,
+            view_bootstrap: false,
+        }
+    }
+
+    #[test]
+    fn welcome_proof_roundtrips_and_is_excluded_from_its_input() {
+        let welcome = welcome_fixture();
+        let plain = welcome.encode().unwrap();
+        let proof = [0x5e; Welcome::SERVER_PROOF_LEN];
+        let body = welcome.encode_with_proof(&proof).unwrap();
+
+        assert_eq!(
+            Welcome::server_proof(&body, &limits()).unwrap(),
+            Some(proof)
+        );
+        assert_eq!(
+            Welcome::proof_input(&body, &limits()).unwrap(),
+            *blake3::hash(&plain).as_bytes()
+        );
+        assert_eq!(Welcome::decode(&body, &limits()).unwrap(), welcome);
+
+        let without = welcome.encode().unwrap();
+        assert_eq!(Welcome::server_proof(&without, &limits()).unwrap(), None);
+        assert_eq!(
+            Welcome::proof_input(&without, &limits()).unwrap(),
+            *blake3::hash(&without).as_bytes()
+        );
+    }
+
+    #[test]
+    fn auth_layout_is_frozen() {
+        let auth = Auth {
+            client_nonce: [0x11; 32],
+            server_nonce: [0x22; 32],
+            session_id: SessionId(0x33),
+            epoch: 0x44,
+            client_id: ClientId::from_bytes([0x55; 16]),
+            proto: ProtoVersion { major: 2, minor: 7 },
+            caps: Caps::REQUIRED,
+        };
+        let bytes = auth.encode();
+        assert_eq!(bytes.len(), 112);
+        assert_eq!(&bytes[..32], &[0x11; 32]);
+        assert_eq!(&bytes[32..64], &[0x22; 32]);
+        assert_eq!(&bytes[64..80], &SessionId(0x33).to_le_bytes());
+        assert_eq!(&bytes[80..88], &0x44u64.to_le_bytes());
+        assert_eq!(&bytes[88..104], &[0x55; 16]);
+        assert_eq!(&bytes[104..106], &2u16.to_le_bytes());
+        assert_eq!(&bytes[106..108], &7u16.to_le_bytes());
+        assert_eq!(&bytes[108..112], &Caps::REQUIRED.bits().to_le_bytes());
+        assert_eq!(Auth::decode(&bytes).unwrap(), auth);
+        assert_eq!(
+            Auth::decode(&bytes[..111]).unwrap_err(),
+            MessageError::BadBodyLen {
+                len: 111,
+                need: 112
+            }
+        );
+        assert_eq!(
+            Auth::decode(&[0u8; 113]).unwrap_err(),
+            MessageError::BadBodyLen {
+                len: 113,
+                need: 112
+            }
+        );
+    }
+
+    #[test]
+    fn accept_layout_is_frozen() {
+        let accept = Accept {
+            epoch: 0x44,
+            session_id: SessionId(0x33),
+            current_seq: Seq(0x55),
+        };
+        let bytes = accept.encode();
+        assert_eq!(bytes.len(), 32);
+        assert_eq!(&bytes[..8], &0x44u64.to_le_bytes());
+        assert_eq!(&bytes[8..24], &SessionId(0x33).to_le_bytes());
+        assert_eq!(&bytes[24..32], &0x55u64.to_le_bytes());
+        assert_eq!(Accept::decode(&bytes).unwrap(), accept);
+        assert_eq!(
+            Accept::decode(&bytes[..31]).unwrap_err(),
+            MessageError::BadBodyLen { len: 31, need: 32 }
+        );
+    }
+
+    #[test]
+    fn plain_decoder_accepts_only_pre_key_frames() {
+        for msg_type in [
+            MsgType::AUTH,
+            MsgType::ACCEPT,
+            MsgType::PONG,
+            MsgType::KICK,
+            MsgType::FLOW,
+            MsgType::SYNC_END,
+            MsgType::LEAVE,
+            MsgType::ORDERED,
+            MsgType::PING,
+        ] {
+            assert_eq!(
+                decode_plain(msg_type, &[], &limits()).unwrap_err(),
+                MessageError::WrongEncoding(msg_type)
+            );
+        }
+        for msg_type in [MsgType::HELLO, MsgType::WELCOME, MsgType::ERROR] {
+            assert_eq!(
+                decode_sealed(msg_type, &[], &limits()).unwrap_err(),
+                MessageError::WrongEncoding(msg_type)
+            );
+        }
+    }
+
     fn field_bytes(field_id: u8, value: &[u8]) -> Vec<u8> {
         let mut out = Vec::with_capacity(3 + value.len());
         out.push(field_id);
@@ -2584,11 +2731,8 @@ mod tests {
 
     fn ordered_common(writer: &mut WcpWriter, class: OpClass) {
         writer.bytes(fid::F_CLIENT_ID, &[1u8; 16]);
-        writer.u32(fid::F_KEY_EPOCH, 3);
         writer.bytes(fid::F_OP_ID, &[2u8; 16]);
         writer.u8(fid::F_OP_CLASS, class.get());
-        writer.bytes(fid::F_PAYLOAD_HASH, &[3u8; 32]);
-        writer.bytes(fid::F_SIG, &[4u8; 64]);
     }
 
     fn ordered_write_body() -> Vec<u8> {
@@ -2621,19 +2765,6 @@ mod tests {
     fn ordered_leave_body() -> Vec<u8> {
         let mut writer = WcpWriter::new();
         ordered_common(&mut writer, OpClass::LEAVE);
-        writer.finish().unwrap()
-    }
-
-    fn ordered_key_announce_body(with_prev: bool) -> Vec<u8> {
-        let mut writer = WcpWriter::new();
-        writer.bytes(fid::F_CLIENT_ID, &[7u8; 16]);
-        writer.u32(fid::F_KEY_EPOCH, 2);
-        writer.u8(fid::F_OP_CLASS, OpClass::KEY_ANNOUNCE.get());
-        writer.bytes(fid::F_SENDER_PUB, &[8u8; 32]);
-        writer.bytes(fid::F_SELF_SIG, &[9u8; 64]);
-        if with_prev {
-            writer.bytes(fid::F_PREV_SIG, &[10u8; 64]);
-        }
         writer.finish().unwrap()
     }
 
@@ -2779,8 +2910,7 @@ mod tests {
             },
             server_time: 1_700_000_000,
             server_nonce: [3u8; 32],
-            join_state: JoinState::Accepted,
-            session_id: None,
+            session_id: SessionId(0),
             snapshot_ref: None,
             view_holder: None,
             view_seq: None,
@@ -2825,10 +2955,26 @@ mod tests {
             reason: 1,
             last_signed_seq: 77,
         };
+        let auth = Auth {
+            client_nonce: [0x11; 32],
+            server_nonce: [0x22; 32],
+            session_id: SessionId(0x33),
+            epoch: 44,
+            client_id: ClientId::from_bytes([5u8; 16]),
+            proto: ProtoVersion { major: 2, minor: 0 },
+            caps: Caps::REQUIRED,
+        };
+        let accept = Accept {
+            epoch: 44,
+            session_id: SessionId(0x33),
+            current_seq: Seq(55),
+        };
 
-        let table: [(Message<'_>, MsgType); 14] = [
+        let table: [(Message<'_>, MsgType); 16] = [
             (Message::Hello(hello), MsgType::HELLO),
             (Message::Welcome(welcome), MsgType::WELCOME),
+            (Message::Auth(auth), MsgType::AUTH),
+            (Message::Accept(accept), MsgType::ACCEPT),
             (Message::Ordered(ordered), MsgType::ORDERED),
             (Message::Response(response), MsgType::RESPONSE),
             (Message::Relay(relay), MsgType::RELAY),
@@ -2921,8 +3067,7 @@ mod tests {
             },
             server_time: 1_700_000_000,
             server_nonce: [3u8; 32],
-            join_state: JoinState::Accepted,
-            session_id: None,
+            session_id: SessionId(0),
             snapshot_ref: Some(snapshot),
             view_holder: None,
             view_seq: None,
@@ -2933,24 +3078,15 @@ mod tests {
         let body = accepted.encode().unwrap();
         assert_eq!(Welcome::decode(&body, &limits).unwrap(), accepted);
 
-        let pending = Welcome {
-            join_state: JoinState::Pending,
-            session_id: Some(SessionId(5)),
+        let other_session = Welcome {
+            session_id: SessionId(5),
             snapshot_ref: None,
             ..accepted
         };
-        let body = pending.encode().unwrap();
-        assert_eq!(Welcome::decode(&body, &limits).unwrap(), pending);
+        let body = other_session.encode().unwrap();
+        assert_eq!(Welcome::decode(&body, &limits).unwrap(), other_session);
 
-        let missing = Welcome {
-            session_id: None,
-            ..pending
-        };
-        assert_eq!(
-            missing.encode().unwrap_err(),
-            MessageError::Wcp(WcpError::MissingField(fid::F_SESSION_ID))
-        );
-        let body = rebuilt(&pending.encode().unwrap(), &[], &[fid::F_SESSION_ID]);
+        let body = rebuilt(&other_session.encode().unwrap(), &[], &[fid::F_SESSION_ID]);
         assert_eq!(
             Welcome::decode(&body, &limits).unwrap_err(),
             MessageError::Wcp(WcpError::MissingField(fid::F_SESSION_ID))
@@ -2976,8 +3112,7 @@ mod tests {
             },
             server_time: 1_700_000_001,
             server_nonce: [2u8; 32],
-            join_state: JoinState::Accepted,
-            session_id: None,
+            session_id: SessionId(0),
             snapshot_ref: None,
             view_holder: None,
             view_seq: None,
@@ -3068,8 +3203,7 @@ mod tests {
             },
             server_time: 1_700_000_002,
             server_nonce: [4u8; 32],
-            join_state: JoinState::Accepted,
-            session_id: None,
+            session_id: SessionId(0),
             snapshot_ref: None,
             view_holder: None,
             view_seq: None,
@@ -3160,8 +3294,7 @@ mod tests {
             },
             server_time: 1_700_000_003,
             server_nonce: [6u8; 32],
-            join_state: JoinState::Accepted,
-            session_id: None,
+            session_id: SessionId(0),
             snapshot_ref: None,
             view_holder: None,
             view_seq: None,
@@ -3311,7 +3444,7 @@ mod tests {
         );
     }
 
-    /// 44:INV-23 -- ORDERED WRITE, PWRITE, LEAVE and KEY_ANNOUNCE roundtrip.
+    /// 44:INV-23 -- ORDERED WRITE, PWRITE and LEAVE roundtrip.
     #[test]
     fn u_messages_ordered_roundtrip() {
         let limits = limits();
@@ -3320,10 +3453,7 @@ mod tests {
         let write = Ordered::decode(&write_body, &limits).unwrap();
         assert_eq!(write.op_class, OpClass::WRITE);
         assert_eq!(write.client_id, ClientId::from_bytes([1u8; 16]));
-        assert_eq!(write.key_epoch, 3);
-        assert_eq!(write.op_id, Some(OpId::from_bytes([2u8; 16])));
-        assert_eq!(write.payload_hash, Some([3u8; 32]));
-        assert_eq!(write.sig, Some([4u8; 64]));
+        assert_eq!(write.op_id, OpId::from_bytes([2u8; 16]));
         assert_eq!(write.path_str(), Some("/dir/file"));
         assert_eq!(
             write.attrs,
@@ -3341,20 +3471,12 @@ mod tests {
         assert_eq!(write.data(), Some(expected_data));
         assert_eq!(write.args, OpArgs::Write(expected_data));
         assert_eq!(write.encode_body(), write_body);
-        let canonical = write
-            .canonical_bytes_excluding(&[
-                fid::F_SIG,
-                fid::F_PAYLOAD_HASH,
-                fid::F_SENDER_PUB,
-                fid::F_KEY_MAC,
-            ])
-            .unwrap();
+        let canonical = write.canonical_bytes_excluding(&[fid::F_PATH]).unwrap();
         let canonical_map = FieldMap::parse(&canonical, &limits).unwrap();
-        assert!(canonical_map.get(fid::F_SIG).is_none());
-        assert!(canonical_map.get(fid::F_PAYLOAD_HASH).is_none());
+        assert!(canonical_map.get(fid::F_PATH).is_none());
         assert_eq!(
-            canonical_map.get(fid::F_PATH),
-            Some(b"/dir/file".as_slice())
+            canonical_map.get(fid::F_OP_ID),
+            Some([2u8; 16].as_slice())
         );
 
         let pwrite_body = ordered_pwrite_body();
@@ -3376,75 +3498,6 @@ mod tests {
         assert_eq!(leave.args, OpArgs::Leave);
         assert!(leave.data().is_none());
         assert_eq!(leave.encode_body(), leave_body);
-
-        let announce_body = ordered_key_announce_body(true);
-        let announce = Ordered::decode(&announce_body, &limits).unwrap();
-        assert_eq!(announce.op_class, OpClass::KEY_ANNOUNCE);
-        assert!(announce.op_id.is_none());
-        assert!(announce.payload_hash.is_none());
-        assert!(announce.sig.is_none());
-        assert_eq!(announce.sender_pub, Some([8u8; 32]));
-        assert_eq!(announce.key_mac, None);
-        assert_eq!(announce.self_sig(), Some([9u8; 64]));
-        assert_eq!(
-            announce.args,
-            OpArgs::KeyAnnounce {
-                self_sig: [9u8; 64],
-                prev_sig: Some([10u8; 64]),
-            }
-        );
-        assert_eq!(announce.encode_body(), announce_body);
-
-        // F_KEY_MAC is legacy: accepted when present, never required.
-        let with_legacy_mac = rebuilt(&announce_body, &[(fid::F_KEY_MAC, vec![11u8; 32])], &[]);
-        let announce = Ordered::decode(&with_legacy_mac, &limits).unwrap();
-        assert_eq!(announce.key_mac, Some([11u8; 32]));
-        assert_eq!(announce.self_sig(), Some([9u8; 64]));
-
-        let missing_self_sig = rebuilt(&announce_body, &[], &[fid::F_SELF_SIG]);
-        assert_eq!(
-            Ordered::decode(&missing_self_sig, &limits).unwrap_err(),
-            MessageError::Wcp(WcpError::MissingField(fid::F_SELF_SIG))
-        );
-        let missing_pub = rebuilt(&announce_body, &[], &[fid::F_SENDER_PUB]);
-        assert_eq!(
-            Ordered::decode(&missing_pub, &limits).unwrap_err(),
-            MessageError::Wcp(WcpError::MissingField(fid::F_SENDER_PUB))
-        );
-
-        let announce_with_ids = rebuilt(
-            &announce_body,
-            &[
-                (fid::F_OP_ID, vec![2u8; 16]),
-                (fid::F_PAYLOAD_HASH, vec![3u8; 32]),
-            ],
-            &[],
-        );
-        let announce = Ordered::decode(&announce_with_ids, &limits).unwrap();
-        assert!(announce.op_id.is_some());
-        assert!(announce.payload_hash.is_some());
-
-        let forbidden_sig = rebuilt(&announce_body, &[(fid::F_SIG, vec![4u8; 64])], &[]);
-        assert_eq!(
-            Ordered::decode(&forbidden_sig, &limits).unwrap_err(),
-            MessageError::BadValue {
-                fid: fid::F_SIG,
-                reason: "F_SIG is forbidden for KEY_ANNOUNCE",
-            }
-        );
-
-        let self_sig_on_write = rebuilt(
-            &ordered_write_body(),
-            &[(fid::F_SELF_SIG, vec![4u8; 64])],
-            &[],
-        );
-        assert_eq!(
-            Ordered::decode(&self_sig_on_write, &limits).unwrap_err(),
-            MessageError::BadValue {
-                fid: fid::F_SELF_SIG,
-                reason: "F_SELF_SIG is only valid for KEY_ANNOUNCE",
-            }
-        );
     }
 
     /// 44:INV-23 -- every required ORDERED field is enforced.
@@ -3454,36 +3507,18 @@ mod tests {
         let base = ordered_write_body();
         let required = [
             fid::F_CLIENT_ID,
-            fid::F_KEY_EPOCH,
             fid::F_OP_ID,
             fid::F_OP_CLASS,
             fid::F_PATH,
             fid::F_MTIME_NS,
             fid::F_UID,
             fid::F_GID,
-            fid::F_PAYLOAD_HASH,
-            fid::F_SIG,
             fid::F_DATA_SESSION,
             fid::F_TOTAL_LEN,
             fid::F_DATA_HASH,
         ];
         for field_id in required {
             let body = rebuilt(&base, &[], &[field_id]);
-            assert_eq!(
-                Ordered::decode(&body, &limits).unwrap_err(),
-                MessageError::Wcp(WcpError::MissingField(field_id)),
-                "field 0x{field_id:02x}"
-            );
-        }
-
-        let announce = ordered_key_announce_body(false);
-        for field_id in [
-            fid::F_CLIENT_ID,
-            fid::F_KEY_EPOCH,
-            fid::F_SENDER_PUB,
-            fid::F_SELF_SIG,
-        ] {
-            let body = rebuilt(&announce, &[], &[field_id]);
             assert_eq!(
                 Ordered::decode(&body, &limits).unwrap_err(),
                 MessageError::Wcp(WcpError::MissingField(field_id)),
@@ -3497,7 +3532,7 @@ mod tests {
     fn u_messages_unknown_op_class_is_fatal() {
         let limits = limits();
         let base = ordered_write_body();
-        for raw in [17u8, 255u8] {
+        for raw in [16u8, 255u8] {
             let body = rebuilt(&base, &[(fid::F_OP_CLASS, vec![raw])], &[fid::F_OP_CLASS]);
             let error = Ordered::decode(&body, &limits).unwrap_err();
             assert_eq!(error, MessageError::UnknownOpClass(raw));
@@ -3507,7 +3542,7 @@ mod tests {
                 MessageError::UnknownOpClass(raw)
             );
         }
-        assert!(!MessageError::Wcp(WcpError::MissingField(fid::F_SIG)).is_fatal());
+        assert!(!MessageError::Wcp(WcpError::MissingField(fid::F_OP_ID)).is_fatal());
         assert!(!MessageError::Path(PathError::Empty).is_fatal());
     }
 
@@ -3605,11 +3640,11 @@ mod tests {
             negotiate(
                 ProtoVersion::CURRENT,
                 ProtoVersion::CURRENT,
-                Caps::REQUIRED.without(Caps::OP_SIGNATURE),
+                Caps::REQUIRED.without(Caps::PSK_AUTH),
                 Caps::REQUIRED,
             )
             .unwrap_err(),
-            VersionError::MissingCapability(Caps::OP_SIGNATURE)
+            VersionError::MissingCapability(Caps::PSK_AUTH)
         );
         assert!(matches!(
             negotiate(

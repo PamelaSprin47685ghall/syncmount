@@ -17,18 +17,25 @@
 //! `KICK` carries `seq = last_good_seq`, never a new sequence: it is a
 //! diagnostic fence, not an event (42 §6.3). `LEAVE` is a real event and is
 //! stamped by the actor.
+//!
+//! `KICK` is sealed under the steady-state session key. The key ring and
+//! nonce minter belong to the actor, so [`KickPlan::prepare`] leaves
+//! [`KickPlan::frame`] empty; the caller fills it with
+//! [`encode_kick_sealed`] before [`KickPlan::deliver`]. `ERROR` stays plain:
+//! it may be the only frame a peer can read after a routing failure.
 
 use std::time::Instant;
 
 use bytes::Bytes;
 
+use crate::protocol::crypto::{NonceMinter, PskKeyRing, Sealer};
 use crate::protocol::{
-    ClientId, ErrorMessage, Kick as KickMessage, KickReason, MsgType, Prefix, Seq, TrnReason,
+    ErrorMessage, Flags, FrameEncoder, FrameHeader, FrameRef, HEADER_LEN, Kick as KickMessage,
+    KickReason, MsgType, Prefix, Seq, SessionId, TrnReason,
 };
 
 use super::online::{OnlineTable, Session};
 use super::relay::{RelayHub, RelaySession};
-use super::sequencer::encode_control;
 
 /// Whether this reason also releases the client's locks through `LEAVE`.
 ///
@@ -48,7 +55,7 @@ pub struct KickPlan {
     pub session: Session,
     /// Reason carried in the frame.
     pub reason: KickReason,
-    /// Encoded `KICK`, if encoding succeeded.
+    /// Sealed `KICK`, filled by the caller with [`encode_kick_sealed`].
     pub frame: Option<Bytes>,
     /// Whether the actor must broadcast a `LEAVE` pseudo-operation.
     pub inject_leave: bool,
@@ -57,27 +64,30 @@ pub struct KickPlan {
 }
 
 impl KickPlan {
-    /// Build the plan: remove from fan-out, encode `KICK`, release relay.
+    /// Build the plan: remove from fan-out, release relay.
+    ///
+    /// The frame stays `None` because sealing needs the key ring and nonce
+    /// minter, which belong to the actor. The caller builds it from
+    /// [`Self::reason`] and `session.last_good_seq` before
+    /// [`Self::deliver`].
     ///
     /// Returns `None` when the identity is not attached, which makes a
     /// duplicate kick a no-op rather than a second frame.
     pub fn prepare(
         online: &mut OnlineTable,
         relay: &mut RelayHub,
-        client: ClientId,
+        session_id: SessionId,
         reason: KickReason,
         now: Instant,
     ) -> Option<Self> {
         // 1. Out of the broadcast set before any frame is queued.
-        let session = online.remove(&client)?;
-        // 2. Encode the fence with the last sequence the client may have.
-        let frame = encode_kick(reason, session.last_good_seq);
+        let session = online.remove(&session_id)?;
         // 4. The client's route slots die with it.
-        let dropped_relay = relay.drop_by_client(client, now);
+        let dropped_relay = relay.drop_by_session(session_id, now);
         Some(Self {
             session,
             reason,
-            frame,
+            frame: None,
             inject_leave: injects_leave(reason),
             dropped_relay,
         })
@@ -101,17 +111,31 @@ impl KickPlan {
     }
 }
 
-/// Encode a plain `KICK` frame.
-pub fn encode_kick(reason: KickReason, last_good: Seq) -> Option<Bytes> {
+/// Encode a sealed `KICK` frame under the steady-state session key.
+///
+/// The header carries `last_good` as its sequence: the fence tells the client
+/// the last sequence it may keep, and is not itself an event.
+pub fn encode_kick_sealed(
+    ring: &PskKeyRing,
+    nonces: &NonceMinter,
+    reason: KickReason,
+    last_good: Seq,
+) -> Option<Bytes> {
     let body = (KickMessage { reason }).encode().ok()?;
-    encode_control(MsgType::KICK, Prefix::None, &body, last_good).ok()
+    let mut header = FrameHeader::new(MsgType::KICK, Flags::ENC, 0, last_good);
+    let prefix = Prefix::None;
+    let sealed = Sealer::with_session_key(&ring.session_key(), nonces)
+        .seal(&mut header, &prefix, &body)
+        .ok()?;
+    let mut encoder = FrameEncoder::with_capacity(HEADER_LEN + sealed.len());
+    let bytes = encoder
+        .encode(&FrameRef::new(&header, &prefix, sealed.as_bytes()))
+        .ok()?;
+    Some(Bytes::copy_from_slice(bytes))
 }
 
 /// Encode a plain `ERROR` frame for a routed failure.
-pub fn encode_error(
-    reason: TrnReason,
-    session: Option<crate::protocol::SessionId>,
-) -> Option<Bytes> {
+pub fn encode_error(reason: TrnReason, session: Option<SessionId>) -> Option<Bytes> {
     let body = (ErrorMessage {
         reason,
         detail: &[],
@@ -119,7 +143,14 @@ pub fn encode_error(
     })
     .encode()
     .ok()?;
-    encode_control(MsgType::ERROR, Prefix::None, &body, Seq::UNSEQUENCED).ok()
+    let prefix = Prefix::None;
+    let mut header = FrameHeader::new(MsgType::ERROR, Flags::EMPTY, 0, Seq::UNSEQUENCED);
+    header.len = u32::try_from(prefix.encoded_len() + body.len()).ok()?;
+    let mut encoder = FrameEncoder::with_capacity(HEADER_LEN + prefix.encoded_len() + body.len());
+    let bytes = encoder
+        .encode(&FrameRef::new(&header, &prefix, &body))
+        .ok()?;
+    Some(Bytes::copy_from_slice(bytes))
 }
 
 #[cfg(test)]
@@ -127,22 +158,28 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+    use crate::protocol::crypto::{Opener, PskSalt};
     use crate::protocol::{
         Flags, FrameBuf, FrameDecoder, Limits, Message, RoutePrefix, SessionId, StreamId,
-        decode_plain,
+        decode_sealed,
     };
     use crate::server::config::OutboxConfig;
     use crate::server::online::{Outbox, SessionInit, SessionState};
     use crate::transport::PeerId;
 
-    fn client(byte: u8) -> ClientId {
-        ClientId::from_bytes([byte; 16])
+    fn session_id(byte: u8) -> SessionId {
+        SessionId(u128::from_le_bytes([byte; 16]))
     }
 
-    fn session(id: ClientId, nonce: u64, now: Instant) -> Session {
+    /// A deterministic steady-state key ring.
+    fn ring() -> PskKeyRing {
+        PskKeyRing::derive(&[7_u8; 32], &PskSalt::DEFAULT).unwrap()
+    }
+
+    fn session(id: SessionId, nonce: u64, now: Instant) -> Session {
         let (outbox, _data, _ctrl) = Outbox::new(&OutboxConfig::default());
         let mut session = Session::new(SessionInit {
-            client_id: id,
+            session_id: id,
             nonce,
             peer: PeerId::from_serial(nonce),
             outbox,
@@ -157,7 +194,7 @@ mod tests {
     }
 
     fn session_with_ctrl(
-        id: ClientId,
+        id: SessionId,
         nonce: u64,
         now: Instant,
     ) -> (
@@ -167,7 +204,7 @@ mod tests {
     ) {
         let (outbox, data, ctrl) = Outbox::new(&OutboxConfig::default());
         let mut session = Session::new(SessionInit {
-            client_id: id,
+            session_id: id,
             nonce,
             peer: PeerId::from_serial(nonce),
             outbox,
@@ -190,14 +227,19 @@ mod tests {
     #[test]
     fn server_kick_removes_from_fanout_before_enqueue_and_closes_after() {
         let now = Instant::now();
-        let a = client(1);
+        let a = session_id(1);
         let mut online = OnlineTable::new();
         let (session, _data, mut ctrl) = session_with_ctrl(a, 1, now);
         online.insert(session);
         let mut relay = RelayHub::new(super::super::relay::RelayLimits::default());
 
-        let plan = KickPlan::prepare(&mut online, &mut relay, a, KickReason::Stalled, now).unwrap();
+        let mut plan =
+            KickPlan::prepare(&mut online, &mut relay, a, KickReason::Stalled, now).unwrap();
         assert!(!online.contains(&a), "step 1: out of the fan-out set");
+        assert!(plan.frame.is_none(), "prepare leaves sealing to the caller");
+        let ring = ring();
+        let nonces = NonceMinter::with_instance(1);
+        plan.frame = encode_kick_sealed(&ring, &nonces, plan.reason, plan.session.last_good_seq);
         assert!(plan.frame.is_some());
         assert_eq!(
             ctrl.try_recv(),
@@ -207,8 +249,15 @@ mod tests {
         assert!(inject, "STALLED releases locks");
         let frame = decode(&ctrl.try_recv().unwrap());
         assert_eq!(frame.header.msg_type, MsgType::KICK);
+        assert!(
+            frame.header.flags.contains(Flags::ENC),
+            "KICK is sealed under the session key"
+        );
         assert_eq!(frame.header.seq, Seq(9), "KICK carries last_good_seq");
-        match decode_plain(MsgType::KICK, &frame.body, &Limits::default()).unwrap() {
+        let opened = Opener::with_session_key(&ring.session_key())
+            .open(&frame.header, &frame.prefix, &frame.body)
+            .unwrap();
+        match decode_sealed(MsgType::KICK, opened.as_slice(), &Limits::default()).unwrap() {
             Message::Kick(kick) => assert_eq!(kick.reason, KickReason::Stalled),
             other => panic!("expected KICK, got {other:?}"),
         }
@@ -222,7 +271,7 @@ mod tests {
     #[test]
     fn server_kick_shutdown_does_not_inject_leave() {
         let now = Instant::now();
-        let a = client(2);
+        let a = session_id(2);
         let mut online = OnlineTable::new();
         online.insert(session(a, 2, now));
         let mut relay = RelayHub::new(super::super::relay::RelayLimits::default());
@@ -236,8 +285,8 @@ mod tests {
     #[test]
     fn server_kick_drops_relay_slots_and_reports_survivors() {
         let now = Instant::now();
-        let a = client(3);
-        let b = client(4);
+        let a = session_id(3);
+        let b = session_id(4);
         let mut online = OnlineTable::new();
         let (session_a, _data_a, _ctrl_a) = session_with_ctrl(a, 3, now);
         let (session_b, _data_b, _ctrl_b) = session_with_ctrl(b, 4, now);
@@ -267,7 +316,7 @@ mod tests {
     #[test]
     fn server_kick_duplicate_is_a_no_op() {
         let now = Instant::now();
-        let a = client(5);
+        let a = session_id(5);
         let mut online = OnlineTable::new();
         online.insert(session(a, 5, now));
         let mut relay = RelayHub::new(super::super::relay::RelayLimits::default());

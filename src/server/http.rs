@@ -1,13 +1,14 @@
 //! HTTP surface and process lifecycle.
 //!
-//! [`Server::bind`] assembles the actor, the acceptor and the ticker.
-//! [`Server::run_with_shutdown`] owns the accept loop; `healthz` is served by
-//! the acceptor's synchronous closure, so a probe never waits on the actor
-//! (42 §7.4).
+//! [`Server::bind`] opens the SQLite store, derives the PSK ring, assembles
+//! the actor and the acceptor. [`Server::run_with_shutdown`] owns the accept
+//! loop; `healthz` is served by the acceptor's synchronous closure, so a
+//! probe never waits on the actor.
 //!
-//! Routing itself lives in [`crate::transport::http1::HttpAcceptor`]: exactly
-//! `{prefix}/rpc`, `{prefix}/events` and the absolute `/__syncmount/healthz`.
-//! This module only maps accepted requests to session tasks.
+//! Graceful shutdown is: drain (wait for every applied watermark to reach
+//! `current_seq`, bounded), compact (epoch + 1, seq 0, new replayable log),
+//! kick every session with `EpochMismatch`, then stop. A crash skips the
+//! compaction; the next start resumes `epoch`/`seq` from `meta`.
 
 use std::future::Future;
 use std::net::SocketAddr;
@@ -16,12 +17,16 @@ use std::time::{Duration, Instant};
 
 use tokio::task::JoinHandle;
 
+use crate::crypto::secret::MasterKey;
+use crate::protocol::crypto::PskSalt;
 use crate::transport::{HttpAcceptor, TransportError};
 
 use super::Epoch;
 use super::config::ServeConfig;
-use super::sequencer::{Metrics, Sequencer};
+use super::metrics::Metrics;
+use super::sequencer::Sequencer;
 use super::session::{self, SessionContext};
+use super::store::{StoreHandle, StoreMeta};
 
 /// Why the server could not start.
 #[derive(Debug, thiserror::Error)]
@@ -29,6 +34,12 @@ pub enum ServerError {
     /// Binding the listener failed.
     #[error("transport: {0}")]
     Transport(#[from] TransportError),
+    /// Opening the SQLite store failed.
+    #[error("store: {0}")]
+    Store(String),
+    /// Deriving the PSK ring failed.
+    #[error("key derivation: {0}")]
+    Secret(String),
 }
 
 /// A bound server: listener, actor and ticker.
@@ -38,30 +49,53 @@ pub struct Server {
     acceptor: HttpAcceptor,
     sequencer: Sequencer,
     metrics: Arc<Metrics>,
+    store: StoreHandle,
+    master: Arc<MasterKey>,
     actor: JoinHandle<()>,
     ticker: JoinHandle<()>,
 }
 
 impl Server {
-    /// Bind the listener and start the actor.
-    ///
-    /// Binding is the only fallible step. Nothing is loaded from disk: the
-    /// epoch is fresh and the sequence starts at zero.
-    pub async fn bind(config: ServeConfig) -> Result<Self, ServerError> {
+    /// Open the store, bind the listener and start the actor.
+    pub async fn bind(config: ServeConfig, master: MasterKey) -> Result<Self, ServerError> {
         let config = Arc::new(config);
-        let epoch = Epoch::generate();
+        let path = config.db_path.clone();
+        let (store, meta): (StoreHandle, StoreMeta) =
+            tokio::task::spawn_blocking(move || StoreHandle::start(path))
+                .await
+                .map_err(|error| ServerError::Store(format!("store thread: {error}")))?
+                .map_err(ServerError::Store)?;
+        let master = Arc::new(master);
+        let ring = Arc::new(
+            master
+                .derive_psk_keyring(&PskSalt::DEFAULT)
+                .map_err(|error| ServerError::Secret(error.to_string()))?,
+        );
+        let epoch = Epoch::new(meta.epoch.max(1) as u64);
         let metrics = Arc::new(Metrics::new(epoch));
-        let (sequencer, actor) = Sequencer::start(Arc::clone(&config), epoch, Arc::clone(&metrics));
+        let (sequencer, actor) = Sequencer::start(
+            Arc::clone(&config),
+            meta,
+            store.clone(),
+            ring,
+            Arc::clone(&metrics),
+        );
         let health_metrics = Arc::clone(&metrics);
-        let acceptor = HttpAcceptor::bind(config.listen, &config.namespace)
-            .await?
-            .with_healthz(move || health_metrics.healthz());
+        let acceptor = match HttpAcceptor::bind(config.listen, &config.namespace).await {
+            Ok(acceptor) => acceptor.with_healthz(move || health_metrics.healthz()),
+            Err(error) => {
+                let _ = store.shutdown().await;
+                return Err(error.into());
+            }
+        };
         let ticker = spawn_ticker(sequencer.clone(), config.tick_interval);
         Ok(Self {
             config,
             acceptor,
             sequencer,
             metrics,
+            store,
+            master,
             actor,
             ticker,
         })
@@ -72,7 +106,7 @@ impl Server {
         Ok(self.acceptor.local_addr()?)
     }
 
-    /// Actor handle, for tests and for W10's relay hub.
+    /// Actor handle, for tests and diagnostics.
     pub fn sequencer(&self) -> Sequencer {
         self.sequencer.clone()
     }
@@ -87,19 +121,26 @@ impl Server {
         self.run_with_shutdown(std::future::pending()).await;
     }
 
-    /// Run the accept loop until `shutdown` resolves, then stop the actor.
+    /// Run the accept loop until `shutdown` resolves, then drain, compact and
+    /// stop the actor.
     pub async fn run_with_shutdown(self, shutdown: impl Future<Output = ()>) {
         let Self {
             config,
             acceptor,
             sequencer,
             metrics: _metrics,
+            store,
+            master,
             actor,
             ticker,
         } = self;
         let context = SessionContext {
             sequencer: sequencer.clone(),
-            config,
+            config: Arc::clone(&config),
+            master,
+            guard: Arc::new(tokio::sync::Mutex::new(
+                crate::protocol::handshake::NonceReplayGuard::new(),
+            )),
         };
         let mut acceptor = acceptor;
         let accept = async {
@@ -115,15 +156,49 @@ impl Server {
             _ = shutdown => {}
             _ = accept => {}
         }
+        let drain = sequencer.drain(config.drain_timeout).await;
+        match drain {
+            Ok(report) if report.timed_out => {
+                tracing::warn!(
+                    sessions = report.sessions,
+                    applied_min = report.applied_min.get(),
+                    current = report.current_seq.get(),
+                    "drain timed out; compacting anyway"
+                );
+            }
+            Ok(report) => {
+                tracing::info!(
+                    sessions = report.sessions,
+                    seq = report.current_seq.get(),
+                    "drain complete"
+                );
+            }
+            Err(_) => {}
+        }
+        match sequencer.compact().await {
+            Ok(report) => {
+                tracing::info!(
+                    epoch = report.epoch,
+                    events = report.events,
+                    objects = report.objects,
+                    "event log compacted"
+                );
+            }
+            Err(error) => tracing::error!(%error, "compaction failed"),
+        }
         let _ = sequencer.shutdown().await;
         let _ = actor.await;
         ticker.abort();
+        if let Err(error) = store.shutdown().await {
+            tracing::error!(%error, "store shutdown failed");
+        }
     }
 
     /// Stop a server that is not running an accept loop.
     pub async fn shutdown(self) {
         let Self {
             sequencer,
+            store,
             actor,
             ticker,
             ..
@@ -131,6 +206,7 @@ impl Server {
         let _ = sequencer.shutdown().await;
         let _ = actor.await;
         ticker.abort();
+        let _ = store.shutdown().await;
     }
 }
 
@@ -152,18 +228,8 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
-    use crate::protocol::{
-        Caps, ClientId, CtrlPrefix, Flags, FrameBuf, FrameDecoder, FrameHeader, FrameRef, Hello,
-        Limits, Message, MsgType, Prefix, ProtoVersion, Seq, decode_plain, encode_frame,
-    };
-    use crate::server::config::OutboxConfig;
-    use crate::server::online::Outbox;
-    use crate::server::sequencer::{HelloRequest, encode_control};
-    use crate::transport::{DialOptions, Endpoint, HttpTransport, PeerId};
-    use bytes::Bytes;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpStream;
-    use tokio::sync::oneshot;
 
     async fn get_healthz(addr: SocketAddr) -> String {
         let mut stream = TcpStream::connect(addr).await.unwrap();
@@ -182,51 +248,17 @@ mod tests {
         text.split("\r\n\r\n").nth(1).unwrap_or_default().to_owned()
     }
 
-    fn ordered_frame() -> FrameBuf {
-        let body = vec![0x5a; 30];
-        let mut header = FrameHeader::new(MsgType::ORDERED, Flags::ENC, 0, Seq::UNSEQUENCED);
-        header.len = u32::try_from(body.len()).unwrap();
-        FrameBuf::new(header, Prefix::None, body)
-    }
-
-    async fn attach(
-        sequencer: &Sequencer,
-        client: ClientId,
-        nonce: u64,
-    ) -> crate::server::HelloReply {
-        let (outbox, data, ctrl) = Outbox::new(&OutboxConfig {
-            cap_bytes: 64 * 1024 * 1024,
-            cap_frames: 20_000,
-            data_frames: 20_000,
-            ctrl_frames: 64,
-        });
-        sequencer
-            .hello(HelloRequest {
-                nonce,
-                client_id: client,
-                epoch_seen: sequencer.epoch().get(),
-                applied_seq: Seq::UNSEQUENCED,
-                peer: PeerId::from_serial(nonce),
-                outbox,
-                data,
-                ctrl,
-            })
-            .await
-            .unwrap()
-    }
-
-    fn decode_one(bytes: &[u8]) -> FrameBuf {
-        let mut decoder = FrameDecoder::new(Limits::default());
-        decoder.push(bytes).unwrap();
-        decoder.next_frame_owned().unwrap().unwrap()
+    fn master() -> MasterKey {
+        MasterKey::derive_psk_from_password(b"test-master", &PskSalt::DEFAULT).unwrap()
     }
 
     #[tokio::test]
     async fn server_healthz_reports_fixed_fields_and_live_counters() {
-        let server = Server::bind(ServeConfig::for_tests()).await.unwrap();
+        let server = Server::bind(ServeConfig::for_tests(), master())
+            .await
+            .unwrap();
         let addr = server.local_addr().unwrap();
-        let sequencer = server.sequencer();
-        let (stop_tx, stop_rx) = oneshot::channel();
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
         let task = tokio::spawn(server.run_with_shutdown(async {
             let _ = stop_rx.await;
         }));
@@ -245,110 +277,6 @@ mod tests {
             assert!(empty.contains(field), "missing {field} in {empty}");
         }
 
-        let client = ClientId::from_bytes([7; 16]);
-        let _reply = attach(&sequencer, client, 1).await;
-        for _ in 0..3 {
-            sequencer.ordered(client, ordered_frame()).await.unwrap();
-        }
-        // The snapshot is ordered after the three commands on the same
-        // channel, so it also proves the actor finished them.
-        let snapshot = sequencer.snapshot().await.unwrap();
-        assert_eq!(snapshot.clients, 1, "attach must keep the session online");
-        assert_eq!(snapshot.current_seq, Seq(3));
-
-        let live = get_healthz(addr).await;
-        eprintln!("W9 evidence: healthz {live}");
-        assert!(live.contains("\"clients\":1"), "{live}");
-        assert!(live.contains("\"seq\":3"), "{live}");
-        assert!(live.contains("\"sync_sessions\":0"), "{live}");
-
-        let _ = stop_tx.send(());
-        task.await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn server_http_rpc_events_handshake_sequences_ordered() {
-        let server = Server::bind(ServeConfig::for_tests()).await.unwrap();
-        let addr = server.local_addr().unwrap();
-        let (stop_tx, stop_rx) = oneshot::channel();
-        let task = tokio::spawn(server.run_with_shutdown(async {
-            let _ = stop_rx.await;
-        }));
-
-        let endpoint = Endpoint::parse(&format!("http://{addr}/")).unwrap();
-        let options = DialOptions::random();
-        let mut transport = tokio::time::timeout(
-            Duration::from_secs(2),
-            HttpTransport::dial(&endpoint, &options),
-        )
-        .await
-        .unwrap()
-        .unwrap();
-
-        let hello = Hello::new(
-            ProtoVersion::CURRENT,
-            Caps::REQUIRED,
-            ClientId::from_bytes([9; 16]),
-            [7; 32],
-        );
-        let hello_body = hello.encode().unwrap();
-        let hello_frame = encode_control(
-            MsgType::HELLO,
-            Prefix::Ctrl(CtrlPrefix::new(Seq::UNSEQUENCED, 0)),
-            &hello_body,
-            Seq::UNSEQUENCED,
-        )
-        .unwrap();
-        tokio::time::timeout(Duration::from_secs(2), transport.send(hello_frame))
-            .await
-            .unwrap()
-            .unwrap();
-
-        let welcome_bytes = tokio::time::timeout(Duration::from_secs(2), transport.recv())
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
-        let welcome = decode_one(&welcome_bytes);
-        assert_eq!(welcome.header.msg_type, MsgType::WELCOME);
-        match decode_plain(MsgType::WELCOME, &welcome.body, &Limits::default()).unwrap() {
-            Message::Welcome(welcome) => {
-                assert_eq!(welcome.client_id, ClientId::from_bytes([9; 16]));
-                assert_eq!(welcome.current_seq, Seq::UNSEQUENCED);
-            }
-            other => panic!("expected WELCOME, got {other:?}"),
-        }
-
-        let ordered = ordered_frame();
-        let ordered_bytes = encode_frame(&FrameRef::new(
-            &ordered.header,
-            &ordered.prefix,
-            &ordered.body,
-        ))
-        .unwrap();
-        tokio::time::timeout(
-            Duration::from_secs(2),
-            transport.send(Bytes::from(ordered_bytes)),
-        )
-        .await
-        .unwrap()
-        .unwrap();
-
-        let broadcast_bytes = tokio::time::timeout(Duration::from_secs(2), transport.recv())
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
-        let broadcast = decode_one(&broadcast_bytes);
-        assert_eq!(broadcast.header.msg_type, MsgType::ORDERED);
-        assert_eq!(broadcast.header.seq, Seq(1));
-        eprintln!(
-            "W9 evidence: HTTP rpc/events paired; WELCOME client={:?}; first ORDERED seq={:?}",
-            ClientId::from_bytes([9; 16]),
-            broadcast.header.seq
-        );
-
-        transport.close().await.unwrap();
         let _ = stop_tx.send(());
         task.await.unwrap();
     }

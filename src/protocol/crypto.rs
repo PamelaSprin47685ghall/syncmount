@@ -6,10 +6,10 @@
 //! enc_body = alg u8 | kid u8 | nonce 12 | ciphertext n | tag 16
 //! ```
 //!
-//! and the V1Minimal AAD (44 §4.3, 49 A11):
+//! and the v2 AAD (44 §4.3, 49 A11):
 //!
 //! ```text
-//! aad = "sm/v1/aad\0"                     10 B
+//! aad = "sm/v2/aad\0"                     10 B
 //!     | alg u8 | kid u8                    2 B
 //!     | magic u8 | ver u8 | type u8        3 B
 //!     | flags u16 LE | req_id u32 LE       6 B
@@ -20,9 +20,10 @@
 //!
 //! The fixed part is 26 bytes and the largest AAD is 51 bytes, so no AAD
 //! allocation is ever needed. `seq` is deliberately absent: the sender does
-//! not know it when sealing and the server, which has no key, rewrites it on
-//! rebroadcast (44 INV-06/INV-17). Operation-level binding is the Ed25519
-//! signature's job (50), not the AAD's.
+//! not know it when sealing and the server rewrites it on rebroadcast
+//! (44 INV-06/INV-17). The server holds the same PSK, so it can decrypt
+//! `ORDERED` for validation and persistence, but it forwards the original
+//! ciphertext unchanged.
 //!
 //! The module is sans-io: entropy and frame headers are injected. It never
 //! returns plaintext before the tag verifies, and plaintext is held in a
@@ -38,6 +39,7 @@ use chacha20poly1305::{ChaCha20Poly1305, Key, KeyInit, Nonce, Tag};
 use hkdf::Hkdf;
 use rand_core::Rng;
 use sha2::Sha256;
+use subtle::ConstantTimeEq;
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use crate::protocol::frame::{CTRL_PREFIX_LEN, HEADER_LEN, ROUTE_PREFIX_LEN};
@@ -70,7 +72,7 @@ pub const NONCE_LEN: usize = 12;
 pub const TAG_LEN: usize = 16;
 
 /// AAD domain separator, including the terminating NUL (44 §4.3).
-pub const AAD_DOMAIN: &[u8; 10] = b"sm/v1/aad\0";
+pub const AAD_DOMAIN: &[u8; 10] = b"sm/v2/aad\0";
 
 /// AAD bytes before the variable prefix: 10 + 2 + (21 - 8) + 1 = 26.
 pub const AAD_FIXED_LEN: usize = 26;
@@ -79,16 +81,38 @@ pub const AAD_FIXED_LEN: usize = 26;
 pub const AAD_MAX_LEN: usize = AAD_FIXED_LEN + ROUTE_PREFIX_LEN;
 
 /// HKDF info for the payload key (49 A13).
-pub const ENC_INFO: &[u8] = b"sm/v1/enc";
+pub const ENC_INFO: &[u8] = b"sm/v2/enc";
 
-/// HKDF info for the control key. Reserved in v1 (49 A13).
-pub const CTRL_INFO: &[u8] = b"sm/v1/ctrl";
+/// HKDF info for the control key (49 A13).
+pub const CTRL_INFO: &[u8] = b"sm/v2/ctrl";
 
-/// HKDF info for the key-binding key used by `KEY_ANNOUNCE` (49 A13).
-pub const KEYBIND_INFO: &[u8] = b"sm/v1/keybind";
+/// HKDF info for the handshake master key (49 A13).
+pub const HS_INFO: &[u8] = b"sm/v2/hs";
+
+/// HKDF info for the per-connection handshake key.
+pub const HS_SESSION_INFO: &[u8] = b"sm/v2/hs/session";
 
 /// BLAKE3 domain for the key identifier (44 §4.1).
-pub const KID_DOMAIN: &[u8] = b"sm/v1/kid";
+pub const KID_DOMAIN: &[u8] = b"sm/v2/kid";
+
+/// AAD domain for the `WELCOME` server proof.
+pub const WELCOME_PROOF_DOMAIN: &[u8] = b"sm/v2/welcome\0";
+
+/// Width of the fixed PSK salt.
+pub const PSK_SALT_LEN: usize = 16;
+
+/// Fixed 16-byte PSK salt.
+///
+/// Frozen value of the legacy `default_cluster()`:
+/// `BLAKE3("sm/v1/cluster\0" ‖ "default")[..16]`. The domain string is part
+/// of the salt value, not of the v2 protocol domains, so it must not be
+/// rewritten. The URL never enters this value.
+pub const PSK_SALT: [u8; PSK_SALT_LEN] = [
+    0x60, 0xce, 0x80, 0xb3, 0xc3, 0x3b, 0xdf, 0x8b, 0x76, 0x3a, 0xf7, 0x46, 0x4a, 0xd1, 0x31, 0xda,
+];
+
+/// Width of a `WELCOME` server proof: `alg u8 | nonce 12 | ct 32 | tag 16`.
+pub const WELCOME_PROOF_LEN: usize = 1 + NONCE_LEN + 32 + TAG_LEN;
 
 const _: () = {
     assert!(AAD_FIXED_LEN == AAD_DOMAIN.len() + 2 + (HEADER_LEN - 8) + 1);
@@ -185,25 +209,347 @@ impl fmt::Display for ClusterId {
     }
 }
 
+/// The fixed 16-byte salt used by Argon2id and HKDF.
+///
+/// A distinct type keeps the PSK salt from being confused with the legacy
+/// [`ClusterId`]. The default is [`PSK_SALT`], the frozen value every client
+/// in the cluster uses.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PskSalt([u8; PSK_SALT_LEN]);
+
+impl PskSalt {
+    /// The frozen default salt.
+    pub const DEFAULT: Self = Self(PSK_SALT);
+
+    /// Wrap explicit bytes. Tests and golden vectors only.
+    pub const fn from_bytes(bytes: [u8; PSK_SALT_LEN]) -> Self {
+        Self(bytes)
+    }
+
+    /// Raw bytes.
+    pub const fn as_bytes(&self) -> &[u8; PSK_SALT_LEN] {
+        &self.0
+    }
+}
+
+impl Default for PskSalt {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
+impl fmt::Debug for PskSalt {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("PskSalt(")?;
+        for byte in self.0 {
+            write!(f, "{byte:02x}")?;
+        }
+        f.write_str(")")
+    }
+}
+
+/// Keys derived from the pre-shared key.
+///
+/// `enc` seals steady-state frames, `ctrl` is reserved, and `hs` is the input
+/// keying material for per-connection handshake keys. The PSK itself never
+/// enters an AEAD.
+#[derive(Zeroize, ZeroizeOnDrop)]
+pub struct PskKeyRing {
+    kid: u8,
+    enc: [u8; 32],
+    ctrl: [u8; 32],
+    hs: [u8; 32],
+}
+
+impl PskKeyRing {
+    /// Derive the ring with HKDF-SHA256.
+    ///
+    /// `salt = salt`, `ikm = psk`, and the info strings are [`ENC_INFO`],
+    /// [`CTRL_INFO`] and [`HS_INFO`]. The key id is
+    /// `BLAKE3(enc_key ‖ "sm/v2/kid")[0]`.
+    ///
+    /// # Errors
+    ///
+    /// [`CryptoError::Kdf`] only if HKDF rejects a 32-byte output, which
+    /// SHA-256 cannot do.
+    pub fn derive(psk: &[u8; 32], salt: &PskSalt) -> Result<Self, CryptoError> {
+        let hk = Hkdf::<Sha256>::new(Some(salt.as_bytes()), psk);
+        let mut ring = Self {
+            kid: 0,
+            enc: [0u8; 32],
+            ctrl: [0u8; 32],
+            hs: [0u8; 32],
+        };
+        hk.expand(ENC_INFO, &mut ring.enc)
+            .map_err(|_| CryptoError::Kdf)?;
+        hk.expand(CTRL_INFO, &mut ring.ctrl)
+            .map_err(|_| CryptoError::Kdf)?;
+        hk.expand(HS_INFO, &mut ring.hs)
+            .map_err(|_| CryptoError::Kdf)?;
+
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(&ring.enc);
+        hasher.update(KID_DOMAIN);
+        ring.kid = hasher.finalize().as_bytes()[0];
+        Ok(ring)
+    }
+
+    /// The steady-state key identifier.
+    pub const fn kid(&self) -> u8 {
+        self.kid
+    }
+
+    /// The steady-state encryption key.
+    pub const fn enc_key(&self) -> &[u8; 32] {
+        &self.enc
+    }
+
+    /// The control key. Reserved; exposed for KDF registry tests.
+    pub const fn ctrl_key(&self) -> &[u8; 32] {
+        &self.ctrl
+    }
+
+    /// The steady-state session key for [`Sealer`] and [`Opener`].
+    pub const fn session_key(&self) -> SessionKey {
+        SessionKey {
+            key: self.enc,
+            kid: self.kid,
+        }
+    }
+
+    /// Derive the handshake key for one connection.
+    ///
+    /// `salt = client_nonce ‖ server_nonce`, `ikm = hs`, and the info string
+    /// is [`HS_SESSION_INFO`]. The handshake key id is
+    /// `BLAKE3(hs_key ‖ "sm/v2/kid")[0]`.
+    ///
+    /// # Errors
+    ///
+    /// [`CryptoError::Kdf`] only if HKDF rejects a 32-byte output.
+    pub fn handshake_keys(
+        &self,
+        client_nonce: &[u8; 32],
+        server_nonce: &[u8; 32],
+    ) -> Result<HandshakeKeys, CryptoError> {
+        let mut salt = [0u8; 64];
+        salt[..32].copy_from_slice(client_nonce);
+        salt[32..].copy_from_slice(server_nonce);
+        let hk = Hkdf::<Sha256>::new(Some(&salt), &self.hs);
+        let mut key = [0u8; 32];
+        hk.expand(HS_SESSION_INFO, &mut key)
+            .map_err(|_| CryptoError::Kdf)?;
+
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(&key);
+        hasher.update(KID_DOMAIN);
+        let kid = hasher.finalize().as_bytes()[0];
+        salt.zeroize();
+        Ok(HandshakeKeys { key, kid })
+    }
+}
+
+impl fmt::Debug for PskKeyRing {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PskKeyRing")
+            .field("kid", &self.kid)
+            .finish_non_exhaustive()
+    }
+}
+
+/// A 32-byte key plus its one-byte envelope identifier.
+///
+/// The key is zeroized on drop. This is the unit [`Sealer`] and [`Opener`]
+/// accept; it is either the steady-state `enc` key or a handshake key.
+#[derive(Zeroize, ZeroizeOnDrop)]
+pub struct SessionKey {
+    key: [u8; 32],
+    kid: u8,
+}
+
+impl SessionKey {
+    /// Wrap an explicit key and identifier.
+    pub const fn new(key: [u8; 32], kid: u8) -> Self {
+        Self { key, kid }
+    }
+
+    /// The key bytes.
+    pub const fn key(&self) -> &[u8; 32] {
+        &self.key
+    }
+
+    /// The envelope identifier.
+    pub const fn kid(&self) -> u8 {
+        self.kid
+    }
+}
+
+impl fmt::Debug for SessionKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SessionKey")
+            .field("kid", &self.kid)
+            .finish_non_exhaustive()
+    }
+}
+
+/// A per-connection handshake key derived from both nonces.
+///
+/// `AUTH` and `ACCEPT` are sealed with this key. The `WELCOME` server proof
+/// uses it too, through [`HandshakeKeys::seal_welcome_proof`].
+#[derive(Zeroize, ZeroizeOnDrop)]
+pub struct HandshakeKeys {
+    key: [u8; 32],
+    kid: u8,
+}
+
+impl HandshakeKeys {
+    /// Wrap an explicit key and identifier. Tests only.
+    pub const fn new(key: [u8; 32], kid: u8) -> Self {
+        Self { key, kid }
+    }
+
+    /// The envelope identifier placed in sealed `AUTH`/`ACCEPT` frames.
+    pub const fn kid(&self) -> u8 {
+        self.kid
+    }
+
+    /// A sealer bound to this key.
+    pub fn sealer<'a>(&self, nonces: &'a NonceMinter) -> Sealer<'a> {
+        Sealer::with_key(&self.key, self.kid, nonces)
+    }
+
+    /// An opener bound to this key.
+    pub fn opener(&self) -> Opener<'static> {
+        Opener::with_key(&self.key, self.kid)
+    }
+
+    /// Seal a frame body under this handshake key.
+    ///
+    /// # Errors
+    ///
+    /// As [`Sealer::seal`].
+    pub fn seal(
+        &self,
+        header: &mut FrameHeader,
+        prefix: &Prefix,
+        plaintext: &[u8],
+        nonces: &NonceMinter,
+    ) -> Result<Sealed, CryptoError> {
+        self.sealer(nonces).seal(header, prefix, plaintext)
+    }
+
+    /// Open a frame body sealed under this handshake key.
+    ///
+    /// # Errors
+    ///
+    /// As [`Opener::open`].
+    pub fn open(
+        &self,
+        header: &FrameHeader,
+        prefix: &Prefix,
+        body: &[u8],
+    ) -> Result<Opened, CryptoError> {
+        self.opener().open(header, prefix, body)
+    }
+
+    /// Seal the `WELCOME` server proof.
+    ///
+    /// The proof is `alg u8 | nonce 12 | ciphertext 32 | tag 16`, where the
+    /// ciphertext is `body_hash` and the AAD is
+    /// `"sm/v2/welcome\0" ‖ client_nonce`. The caller supplies the nonce so
+    /// this function stays deterministic; it must be fresh per proof.
+    ///
+    /// # Errors
+    ///
+    /// [`CryptoError::BadAlg`] if this build lacks the default algorithm.
+    pub fn seal_welcome_proof(
+        &self,
+        client_nonce: &[u8; 32],
+        body_hash: &[u8; 32],
+        nonce: &[u8; NONCE_LEN],
+    ) -> Result<[u8; WELCOME_PROOF_LEN], CryptoError> {
+        let mut aad = [0u8; WELCOME_PROOF_DOMAIN.len() + 32];
+        aad[..WELCOME_PROOF_DOMAIN.len()].copy_from_slice(WELCOME_PROOF_DOMAIN);
+        aad[WELCOME_PROOF_DOMAIN.len()..].copy_from_slice(client_nonce);
+
+        let mut proof = [0u8; WELCOME_PROOF_LEN];
+        proof[0] = DEFAULT_ALG;
+        proof[1..1 + NONCE_LEN].copy_from_slice(nonce);
+        proof[1 + NONCE_LEN..1 + NONCE_LEN + 32].copy_from_slice(body_hash);
+        let tag = encrypt_in_place(
+            DEFAULT_ALG,
+            &self.key,
+            nonce,
+            &aad,
+            &mut proof[1 + NONCE_LEN..1 + NONCE_LEN + 32],
+        )?;
+        proof[1 + NONCE_LEN + 32..].copy_from_slice(&tag);
+        Ok(proof)
+    }
+
+    /// Verify the `WELCOME` server proof against a locally computed body hash.
+    ///
+    /// # Errors
+    ///
+    /// [`CryptoError::Aead`] for a bad algorithm byte, a malformed proof, a
+    /// tag mismatch, or a body hash mismatch. The caller must not distinguish
+    /// these cases on the wire.
+    pub fn open_welcome_proof(
+        &self,
+        client_nonce: &[u8; 32],
+        body_hash: &[u8; 32],
+        proof: &[u8; WELCOME_PROOF_LEN],
+    ) -> Result<(), CryptoError> {
+        if !is_supported_alg(proof[0]) {
+            return Err(CryptoError::BadAlg(proof[0]));
+        }
+        let mut aad = [0u8; WELCOME_PROOF_DOMAIN.len() + 32];
+        aad[..WELCOME_PROOF_DOMAIN.len()].copy_from_slice(WELCOME_PROOF_DOMAIN);
+        aad[WELCOME_PROOF_DOMAIN.len()..].copy_from_slice(client_nonce);
+
+        let mut nonce = [0u8; NONCE_LEN];
+        nonce.copy_from_slice(&proof[1..1 + NONCE_LEN]);
+        let mut tag = [0u8; TAG_LEN];
+        tag.copy_from_slice(&proof[1 + NONCE_LEN + 32..]);
+        let mut plaintext = [0u8; 32];
+        plaintext.copy_from_slice(&proof[1 + NONCE_LEN..1 + NONCE_LEN + 32]);
+        let result = decrypt_in_place(proof[0], &self.key, &nonce, &aad, &mut plaintext, &tag);
+        let matches = plaintext.ct_eq(body_hash);
+        plaintext.zeroize();
+        result?;
+        if bool::from(matches) {
+            Ok(())
+        } else {
+            Err(CryptoError::Aead)
+        }
+    }
+}
+
+impl fmt::Debug for HandshakeKeys {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HandshakeKeys")
+            .field("kid", &self.kid)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Keys derived from the master key for one cluster.
 ///
-/// `enc` seals payload frames, `keybind` authenticates `KEY_ANNOUNCE`, and
-/// `ctrl` is reserved in v1 (49 A13). There is no `auth_key`: the server holds
-/// no keys at all (49 A9/D-4).
+/// This is the legacy v2-domain ring retained for existing callers. New code
+/// should use [`PskKeyRing`]. `enc` seals payload frames and `ctrl` is
+/// reserved.
 #[derive(Zeroize, ZeroizeOnDrop)]
 pub struct KeyRing {
     kid: u8,
     enc: [u8; 32],
     ctrl: [u8; 32],
-    keybind: [u8; 32],
 }
 
 impl KeyRing {
     /// Derive the ring with HKDF-SHA256.
     ///
     /// `salt = cluster_id`, `ikm = master_key`, and the info strings are
-    /// [`ENC_INFO`], [`CTRL_INFO`] and [`KEYBIND_INFO`]. The key id is
-    /// `BLAKE3(enc_key ‖ "sm/v1/kid")[0]` (44 §4.1).
+    /// [`ENC_INFO`] and [`CTRL_INFO`]. The key id is
+    /// `BLAKE3(enc_key ‖ "sm/v2/kid")[0]` (44 §4.1).
     ///
     /// # Errors
     ///
@@ -215,13 +561,10 @@ impl KeyRing {
             kid: 0,
             enc: [0u8; 32],
             ctrl: [0u8; 32],
-            keybind: [0u8; 32],
         };
         hk.expand(ENC_INFO, &mut ring.enc)
             .map_err(|_| CryptoError::Kdf)?;
         hk.expand(CTRL_INFO, &mut ring.ctrl)
-            .map_err(|_| CryptoError::Kdf)?;
-        hk.expand(KEYBIND_INFO, &mut ring.keybind)
             .map_err(|_| CryptoError::Kdf)?;
 
         let mut hasher = blake3::Hasher::new();
@@ -236,15 +579,18 @@ impl KeyRing {
         self.kid
     }
 
-    /// The key-binding key for `KEY_ANNOUNCE` MACs (44 §4.7).
-    pub const fn keybind_key(&self) -> &[u8; 32] {
-        &self.keybind
-    }
-
-    /// The control key. Reserved in v1; exposed so the KDF registry can be
+    /// The control key. Reserved; exposed so the KDF registry can be
     /// tested without a second derivation path.
     pub const fn ctrl_key(&self) -> &[u8; 32] {
         &self.ctrl
+    }
+
+    /// The steady-state session key for [`Sealer`] and [`Opener`].
+    pub const fn session_key(&self) -> SessionKey {
+        SessionKey {
+            key: self.enc,
+            kid: self.kid,
+        }
     }
 }
 
@@ -501,42 +847,80 @@ impl fmt::Debug for Opened {
 }
 
 /// Seals plaintext into an envelope and sets `header.len`.
-#[derive(Debug)]
+///
+/// The key is copied from the ring or session key at construction and
+/// zeroized on drop. A sealer never borrows key material from its caller.
 pub struct Sealer<'k> {
-    ring: &'k KeyRing,
+    key: [u8; 32],
+    kid: u8,
     nonces: &'k NonceMinter,
     alg: u8,
 }
 
 impl<'k> Sealer<'k> {
-    /// Use the build's default algorithm.
-    pub const fn new(ring: &'k KeyRing, nonces: &'k NonceMinter) -> Self {
+    /// Use the build's default algorithm with a legacy [`KeyRing`].
+    pub const fn new(ring: &KeyRing, nonces: &'k NonceMinter) -> Self {
         Self {
-            ring,
+            key: ring.enc,
+            kid: ring.kid,
             nonces,
             alg: DEFAULT_ALG,
         }
     }
 
-    /// Use an explicit algorithm.
+    /// Use the build's default algorithm with any session key.
+    pub const fn with_session_key(session: &SessionKey, nonces: &'k NonceMinter) -> Self {
+        Self::with_key(session.key(), session.kid(), nonces)
+    }
+
+    /// Use an explicit key and identifier.
+    pub const fn with_key(key: &[u8; 32], kid: u8, nonces: &'k NonceMinter) -> Self {
+        Self {
+            key: *key,
+            kid,
+            nonces,
+            alg: DEFAULT_ALG,
+        }
+    }
+
+    /// Use an explicit algorithm with a legacy [`KeyRing`].
     ///
     /// # Errors
     ///
     /// [`CryptoError::BadAlg`] if this build does not implement `alg`.
-    pub fn with_alg(
-        ring: &'k KeyRing,
+    pub fn with_alg(ring: &KeyRing, nonces: &'k NonceMinter, alg: u8) -> Result<Self, CryptoError> {
+        Self::with_session_key_and_alg(&ring.session_key(), nonces, alg)
+    }
+
+    /// Use an explicit session key and algorithm.
+    ///
+    /// # Errors
+    ///
+    /// [`CryptoError::BadAlg`] if this build does not implement `alg`.
+    pub fn with_session_key_and_alg(
+        session: &SessionKey,
         nonces: &'k NonceMinter,
         alg: u8,
     ) -> Result<Self, CryptoError> {
         if !is_supported_alg(alg) {
             return Err(CryptoError::BadAlg(alg));
         }
-        Ok(Self { ring, nonces, alg })
+        Ok(Self {
+            key: *session.key(),
+            kid: session.kid(),
+            nonces,
+            alg,
+        })
     }
 
     /// The algorithm this sealer writes.
     pub const fn alg(&self) -> u8 {
         self.alg
+    }
+
+    /// The envelope identifier this sealer writes.
+    pub const fn kid(&self) -> u8 {
+        self.kid
     }
 
     /// Seal `plaintext` and set `header.len` to prefix plus body.
@@ -550,6 +934,26 @@ impl<'k> Sealer<'k> {
         header: &mut FrameHeader,
         prefix: &Prefix,
         plaintext: &[u8],
+    ) -> Result<Sealed, CryptoError> {
+        let nonce = self.nonces.next()?;
+        self.seal_with_nonce(header, prefix, plaintext, &nonce)
+    }
+
+    /// Seal with an explicit nonce.
+    ///
+    /// The caller must guarantee the nonce is fresh for this key. Tests and
+    /// the deterministic proof path use this; steady-state frames should use
+    /// [`Sealer::seal`].
+    ///
+    /// # Errors
+    ///
+    /// [`CryptoError::PlaintextTooLarge`] above [`MAX_PLAINTEXT`].
+    pub fn seal_with_nonce(
+        &self,
+        header: &mut FrameHeader,
+        prefix: &Prefix,
+        plaintext: &[u8],
+        nonce: &[u8; NONCE_LEN],
     ) -> Result<Sealed, CryptoError> {
         let max = MAX_PLAINTEXT as usize;
         if plaintext.len() > max {
@@ -566,19 +970,18 @@ impl<'k> Sealer<'k> {
             })?;
         header.len = len;
 
-        let aad = Aad::new(header, prefix, self.alg, self.ring.kid);
-        let nonce = self.nonces.next()?;
+        let aad = Aad::new(header, prefix, self.alg, self.kid);
 
         let mut out = Vec::with_capacity(2 + NONCE_LEN + plaintext.len() + TAG_LEN);
         out.push(self.alg);
-        out.push(self.ring.kid);
-        out.extend_from_slice(&nonce);
+        out.push(self.kid);
+        out.extend_from_slice(nonce);
         out.extend_from_slice(plaintext);
 
         let tag = encrypt_in_place(
             self.alg,
-            &self.ring.enc,
-            &nonce,
+            &self.key,
+            nonce,
             aad.as_bytes(),
             &mut out[2 + NONCE_LEN..],
         )?;
@@ -587,16 +990,50 @@ impl<'k> Sealer<'k> {
     }
 }
 
+impl Drop for Sealer<'_> {
+    fn drop(&mut self) {
+        self.key.zeroize();
+    }
+}
+
+impl fmt::Debug for Sealer<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Sealer")
+            .field("kid", &self.kid)
+            .field("alg", &self.alg)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Opens an envelope and authenticates it before exposing plaintext.
-#[derive(Debug)]
 pub struct Opener<'k> {
-    ring: &'k KeyRing,
+    key: [u8; 32],
+    kid: u8,
+    _borrow: std::marker::PhantomData<&'k ()>,
 }
 
 impl<'k> Opener<'k> {
-    /// Bind the opener to a key ring.
+    /// Bind the opener to a legacy [`KeyRing`].
     pub const fn new(ring: &'k KeyRing) -> Self {
-        Self { ring }
+        Self {
+            key: ring.enc,
+            kid: ring.kid,
+            _borrow: std::marker::PhantomData,
+        }
+    }
+
+    /// Bind the opener to any session key.
+    pub const fn with_session_key(session: &'k SessionKey) -> Self {
+        Self::with_key(session.key(), session.kid())
+    }
+
+    /// Bind the opener to an explicit key and identifier.
+    pub const fn with_key(key: &[u8; 32], kid: u8) -> Self {
+        Self {
+            key: *key,
+            kid,
+            _borrow: std::marker::PhantomData,
+        }
     }
 
     /// Authenticate `body` and return the plaintext.
@@ -605,7 +1042,7 @@ impl<'k> Opener<'k> {
     ///
     /// * [`CryptoError::Aead`] for a short or tampered envelope.
     /// * [`CryptoError::BadAlg`] for an algorithm this build lacks.
-    /// * [`CryptoError::UnknownKey`] when `kid` is not this ring's `kid`.
+    /// * [`CryptoError::UnknownKey`] when `kid` is not this opener's `kid`.
     pub fn open(
         &self,
         header: &FrameHeader,
@@ -622,7 +1059,7 @@ impl<'k> Opener<'k> {
         }
 
         let kid = body[1];
-        if kid != self.ring.kid {
+        if kid != self.kid {
             return Err(CryptoError::UnknownKey);
         }
 
@@ -637,13 +1074,27 @@ impl<'k> Opener<'k> {
         let mut plaintext = Zeroizing::new(body[2 + NONCE_LEN..tag_at].to_vec());
         decrypt_in_place(
             alg,
-            &self.ring.enc,
+            &self.key,
             &nonce,
             aad.as_bytes(),
             plaintext.as_mut_slice(),
             &tag,
         )?;
         Ok(Opened(plaintext))
+    }
+}
+
+impl Drop for Opener<'_> {
+    fn drop(&mut self) {
+        self.key.zeroize();
+    }
+}
+
+impl fmt::Debug for Opener<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Opener")
+            .field("kid", &self.kid)
+            .finish_non_exhaustive()
     }
 }
 
@@ -768,7 +1219,6 @@ mod tests {
         assert_eq!(first.kid(), second.kid());
         assert_eq!(first.enc, second.enc);
         assert_eq!(first.ctrl, second.ctrl);
-        assert_eq!(first.keybind, second.keybind);
 
         let other_cluster =
             KeyRing::derive(&[0x24; 32], &ClusterId::from_bytes([0x43; 16])).unwrap();
@@ -776,11 +1226,8 @@ mod tests {
 
         let other_master = other_ring();
         assert_ne!(first.enc, other_master.enc);
-        assert_ne!(first.keybind, other_master.keybind);
 
         assert_ne!(first.enc, first.ctrl);
-        assert_ne!(first.enc, first.keybind);
-        assert_ne!(first.ctrl, first.keybind);
     }
 
     #[test]
@@ -799,7 +1246,7 @@ mod tests {
         let aad = Aad::new(&header, &route_prefix(), ALG_CHACHA8, 0xab);
         assert_eq!(aad.len(), AAD_FIXED_LEN + ROUTE_PREFIX_LEN);
         let bytes = aad.as_bytes();
-        assert_eq!(&bytes[..10], b"sm/v1/aad\0");
+        assert_eq!(&bytes[..10], b"sm/v2/aad\0");
         assert_eq!(bytes[10], ALG_CHACHA8);
         assert_eq!(bytes[11], 0xab);
         assert_eq!(&bytes[12..15], &[0x53, 0x01, 0x12]);
@@ -1121,11 +1568,7 @@ mod tests {
     #[test]
     fn debug_output_never_contains_key_material() {
         let ring = ring();
-        let secrets = [
-            format!("{:?}", ring.enc),
-            format!("{:?}", ring.ctrl),
-            format!("{:?}", ring.keybind),
-        ];
+        let secrets = [format!("{:?}", ring.enc), format!("{:?}", ring.ctrl)];
 
         let rendered = format!("{ring:?}");
         assert!(rendered.contains("kid"));
@@ -1232,6 +1675,118 @@ mod tests {
         assert_eq!(u32::from_be_bytes(last[8..].try_into().unwrap()), u32::MAX);
         assert_eq!(minter.next(), Err(CryptoError::NonceExhausted));
         assert_eq!(minter.next(), Err(CryptoError::NonceExhausted));
+    }
+
+    #[test]
+    fn psk_ring_is_deterministic_and_domain_separated() {
+        let salt = PskSalt::DEFAULT;
+        let first = PskKeyRing::derive(&[0x24; 32], &salt).unwrap();
+        let second = PskKeyRing::derive(&[0x24; 32], &salt).unwrap();
+        assert_eq!(first.kid(), second.kid());
+        assert_eq!(first.enc_key(), second.enc_key());
+        assert_eq!(first.ctrl_key(), second.ctrl_key());
+
+        let other_psk = PskKeyRing::derive(&[0x25; 32], &salt).unwrap();
+        assert_ne!(first.enc_key(), other_psk.enc_key());
+        let other_salt = PskKeyRing::derive(&[0x24; 32], &PskSalt::from_bytes([0x99; 16])).unwrap();
+        assert_ne!(first.enc_key(), other_salt.enc_key());
+
+        assert_ne!(first.enc_key(), first.ctrl_key());
+        assert_eq!(PskSalt::DEFAULT.as_bytes(), &PSK_SALT);
+        assert_eq!(PSK_SALT.len(), PSK_SALT_LEN);
+    }
+
+    #[test]
+    fn handshake_key_binds_both_nonces_and_has_its_own_kid() {
+        let ring = PskKeyRing::derive(&[0x24; 32], &PskSalt::DEFAULT).unwrap();
+        let first = ring.handshake_keys(&[0x01; 32], &[0x02; 32]).unwrap();
+        let again = ring.handshake_keys(&[0x01; 32], &[0x02; 32]).unwrap();
+        assert_eq!(first.kid(), again.kid());
+        assert_ne!(first.kid(), ring.kid());
+
+        let other_client = ring.handshake_keys(&[0x03; 32], &[0x02; 32]).unwrap();
+        let other_server = ring.handshake_keys(&[0x01; 32], &[0x04; 32]).unwrap();
+        assert_ne!(first.kid(), other_client.kid());
+        assert_ne!(first.kid(), other_server.kid());
+        assert_ne!(other_client.kid(), other_server.kid());
+    }
+
+    #[test]
+    fn welcome_proof_roundtrips_and_binds_client_nonce_and_body() {
+        let ring = PskKeyRing::derive(&[0x24; 32], &PskSalt::DEFAULT).unwrap();
+        let keys = ring.handshake_keys(&[0x01; 32], &[0x02; 32]).unwrap();
+        let body_hash = [0x5a; 32];
+        let nonce = [0x6b; NONCE_LEN];
+        let proof = keys
+            .seal_welcome_proof(&[0x01; 32], &body_hash, &nonce)
+            .unwrap();
+        assert_eq!(proof.len(), WELCOME_PROOF_LEN);
+        assert_eq!(proof[0], DEFAULT_ALG);
+        assert_eq!(&proof[1..1 + NONCE_LEN], &nonce);
+
+        keys.open_welcome_proof(&[0x01; 32], &body_hash, &proof)
+            .unwrap();
+        assert!(matches!(
+            keys.open_welcome_proof(&[0x09; 32], &body_hash, &proof),
+            Err(CryptoError::Aead)
+        ));
+        assert!(matches!(
+            keys.open_welcome_proof(&[0x01; 32], &[0x5b; 32], &proof),
+            Err(CryptoError::Aead)
+        ));
+
+        let mut tampered = proof;
+        let last = tampered.len() - 1;
+        tampered[last] ^= 1;
+        assert!(matches!(
+            keys.open_welcome_proof(&[0x01; 32], &body_hash, &tampered),
+            Err(CryptoError::Aead)
+        ));
+    }
+
+    #[test]
+    fn handshake_keys_seal_and_open_with_the_handshake_kid() {
+        let ring = PskKeyRing::derive(&[0x24; 32], &PskSalt::DEFAULT).unwrap();
+        let keys = ring.handshake_keys(&[0x01; 32], &[0x02; 32]).unwrap();
+        let nonces = NonceMinter::with_instance(0x1122_3344_5566_7788);
+        let mut header = FrameHeader::new(MsgType::AUTH, Flags::ENC, 0, Seq::UNSEQUENCED);
+        let plaintext = [0x77u8; 112];
+        let sealed = keys
+            .seal(&mut header, &Prefix::None, &plaintext, &nonces)
+            .unwrap();
+        assert_eq!(sealed.as_bytes()[1], keys.kid());
+        assert_eq!(header.len, ENV_OVERHEAD + 112);
+        let opened = keys
+            .open(&header, &Prefix::None, sealed.as_bytes())
+            .unwrap();
+        assert_eq!(opened.as_slice(), &plaintext);
+
+        // The steady-state ring must not open a handshake envelope.
+        assert!(matches!(
+            Opener::with_session_key(&ring.session_key()).open(
+                &header,
+                &Prefix::None,
+                sealed.as_bytes()
+            ),
+            Err(CryptoError::UnknownKey) | Err(CryptoError::Aead)
+        ));
+    }
+
+    #[test]
+    fn session_key_sealer_matches_the_ring() {
+        let ring = ring();
+        let session = ring.session_key();
+        let nonces = NonceMinter::with_instance(21);
+        let mut header = FrameHeader::new(MsgType::ORDERED, Flags::ENC, 0, Seq::UNSEQUENCED);
+        let sealed = Sealer::with_session_key(&session, &nonces)
+            .seal(&mut header, &Prefix::None, b"session")
+            .unwrap();
+        let opened = Opener::with_session_key(&session)
+            .open(&header, &Prefix::None, sealed.as_bytes())
+            .unwrap();
+        assert_eq!(opened.as_slice(), b"session");
+        assert_eq!(session.kid(), ring.kid());
+        assert_eq!(session.key(), &ring.enc);
     }
 
     #[test]

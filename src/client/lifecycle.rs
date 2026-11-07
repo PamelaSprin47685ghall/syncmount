@@ -46,13 +46,16 @@ pub const EXIT_STARTUP: i32 = 2;
 pub const EXIT_AUDIT: i32 = 3;
 /// Disconnect or KICK.
 pub const EXIT_DISCONNECTED: i32 = 10;
+/// PSK or handshake authentication failure.
+pub const EXIT_AUTH: i32 = 4;
 
 /// Every exit code the machine may emit.
-pub const EXIT_CODES: [i32; 5] = [
+pub const EXIT_CODES: [i32; 6] = [
     EXIT_OK,
     EXIT_USAGE,
     EXIT_STARTUP,
     EXIT_AUDIT,
+    EXIT_AUTH,
     EXIT_DISCONNECTED,
 ];
 

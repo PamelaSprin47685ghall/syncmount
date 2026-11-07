@@ -1,4 +1,4 @@
-//! Bounded outbox and write coalescer.
+//! Unbounded outbox and write coalescer.
 //!
 //! Owner: W11 (E5). See 41 §2.4/§2.5 and 53 W11.
 //!
@@ -7,10 +7,11 @@
 //! * [`Outbox`] is the admission gate. A caller reserves capacity *before* it
 //!   touches the disk, allocates a [`LocalSeq`], and commits the operation.
 //!   The queue is keyed by `LocalSeq`, so two FUSE threads that commit out of
-//!   order still reach the uplink in sequence order. A full outbox is
-//!   [`Errno::ENOSPC`] and the disk stays untouched (39 §2.1, 41 §9). An
-//!   operation whose local effect failed is abandoned with
-//!   [`Outbox::skip`], so its sequence cannot stall every later operation.
+//!   order still reach the uplink in sequence order. The queue has no hard
+//!   ceiling: a write never fails because the network is behind. A soft RSS
+//!   budget warns once when it is crossed, but admission continues. An
+//!   operation whose local effect failed is abandoned with [`Outbox::skip`],
+//!   so its sequence cannot stall every later operation.
 //! * [`Coalescer`] is a pure state machine: it merges adjacent writes of one
 //!   inode into one wire operation of at most 4 MiB, and releases a partial
 //!   aggregate after the 2 ms quiet window (or 5 ms at the latest, or
@@ -28,8 +29,8 @@ use std::time::Duration;
 use crate::client::config::Tuning;
 use crate::protocol::frame::OpId;
 use crate::protocol::messages::OpClass;
+use crate::store::AttrDelta;
 use crate::store::node_table::InodeId;
-use crate::store::{AttrDelta, Errno};
 
 /// A client-local operation number; the right half of an `op_id`.
 ///
@@ -204,46 +205,17 @@ pub struct OutboxDepth {
     pub bytes: usize,
 }
 
-/// The outbox is full; the caller maps this to `ENOSPC`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct OutboxFull {
-    /// Bytes the caller asked for.
-    pub requested: usize,
-    /// Bytes still available.
-    pub available: usize,
-}
-
-impl OutboxFull {
-    /// The errno a FUSE write must return.
-    pub const fn errno(self) -> Errno {
-        Errno::ENOSPC
-    }
-}
-
-impl fmt::Display for OutboxFull {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "outbox full: requested {} bytes, {} available",
-            self.requested, self.available
-        )
-    }
-}
-
-impl std::error::Error for OutboxFull {}
-
 /// Replay-backlog window shared by the replayer and the outbox.
 ///
 /// The window counts local operations that were admitted but whose echo has
-/// not been applied yet. When the replay falls behind, the window closes:
-/// [`Outbox::reserve`] answers `ENOSPC` and [`Outbox::take_ready`] stops
-/// handing operations to the uplink. Production therefore stops before the
-/// server's per-session outbox can overflow and drop a frame; the replay
-/// catches up, echoes arrive, and the window reopens.
+/// not been applied yet. It is diagnostic only: a closed window never refuses
+/// admission and never stops the uplink. Backpressure on the write path is
+/// forbidden, because the network must not turn a successful local write into
+/// `ENOSPC`.
 ///
-/// A hole in the sequence also closes the window, because nothing new can be
-/// applied until it fills. The two limits give the window hysteresis: close at
-/// `high`, reopen at `low`.
+/// A sequence hole is still tracked so status can explain a stalled replay.
+/// The two limits give the counter hysteresis: mark closed at `high`, clear
+/// at `low`.
 #[derive(Debug)]
 pub struct Backpressure {
     in_flight: AtomicUsize,
@@ -254,7 +226,7 @@ pub struct Backpressure {
 }
 
 impl Backpressure {
-    /// Close at `high` operations in flight, reopen at `low`.
+    /// Mark the counter closed at `high` operations in flight, clear at `low`.
     pub fn new(high: usize, low: usize) -> Self {
         let high = high.max(1);
         Self {
@@ -266,16 +238,18 @@ impl Backpressure {
         }
     }
 
-    /// The production window: close at 256 admitted operations, reopen at 128.
+    /// The production thresholds: mark closed at 256 in-flight operations,
+    /// clear at 128.
     ///
-    /// The server outbox holds 512 frames and the downlink channel 1024, so
-    /// two clients that both stop at 256 leave the server queue room to drain
-    /// instead of dropping a frame.
+    /// These numbers only shape the status counter. The outbox no longer
+    /// consults them, so a lagging replay cannot fail a local write.
     pub fn default_window() -> Self {
         Self::new(256, 128)
     }
 
-    /// Whether admission and sending are allowed.
+    /// Whether the diagnostic counter is below its low threshold.
+    ///
+    /// Admission and sending never consult this value.
     pub fn is_open(&self) -> bool {
         !self.closed.load(Ordering::Acquire)
     }
@@ -303,7 +277,8 @@ impl Backpressure {
         }
     }
 
-    /// Close the window while a sequence hole is open, reopen when it fills.
+    /// Mark the counter closed while a sequence hole is open, clear it when
+    /// the hole fills.
     pub fn set_gap(&self, gap: bool) {
         self.gap.store(gap, Ordering::Release);
         if gap {
@@ -326,15 +301,18 @@ impl Backpressure {
     }
 }
 
-/// Bounded, sequence-ordered admission queue.
+/// Unbounded, sequence-ordered admission queue.
 ///
-/// The capacity is charged at [`Outbox::reserve`] time, not at commit time:
-/// "returned success" must mean "already admitted" (41 invariant 4).
+/// Capacity is counted at [`Outbox::reserve`] time so the soft budget sees an
+/// operation before its disk write, but the count is advisory: admission never
+/// fails. "Returned success" still means "already admitted" (41 invariant 4).
 pub struct Outbox {
     inner: Mutex<OutboxInner>,
     next_seq: AtomicU64,
-    max_bytes: usize,
-    max_ops: usize,
+    soft_bytes: usize,
+    soft_ops: usize,
+    over_soft: AtomicBool,
+    /// Replay counter, for diagnostics only. It never gates admission.
     backpressure: Arc<Backpressure>,
 }
 
@@ -350,13 +328,11 @@ struct OutboxInner {
 }
 
 impl Outbox {
-    /// Create an outbox with the given ceilings.
-    pub fn new(max_bytes: usize, max_ops: usize) -> Self {
-        Self::with_window(max_bytes, max_ops, Arc::new(Backpressure::default_window()))
-    }
-
-    /// Create an outbox whose admission is gated by a shared replay window.
-    fn with_window(max_bytes: usize, max_ops: usize, backpressure: Arc<Backpressure>) -> Self {
+    /// Create an outbox with the given soft budget.
+    ///
+    /// `soft_bytes` and `soft_ops` only drive a one-shot warning. They never
+    /// reject an operation.
+    pub fn new(soft_bytes: usize, soft_ops: usize) -> Self {
         Self {
             inner: Mutex::new(OutboxInner {
                 queue: BTreeMap::new(),
@@ -367,18 +343,22 @@ impl Outbox {
                 skipped: BTreeSet::new(),
             }),
             next_seq: AtomicU64::new(LocalSeq::FIRST.get()),
-            max_bytes: max_bytes.max(1),
-            max_ops: max_ops.max(1),
-            backpressure,
+            soft_bytes: soft_bytes.max(1),
+            soft_ops: soft_ops.max(1),
+            over_soft: AtomicBool::new(false),
+            backpressure: Arc::new(Backpressure::default_window()),
         }
     }
 
     /// Create an outbox from the client tuning.
     pub fn with_tuning(tuning: &Tuning) -> Self {
-        Self::new(tuning.outbox_max_bytes, tuning.outbox_max_ops)
+        Self::new(tuning.outbox_soft_bytes, tuning.outbox_soft_ops)
     }
 
-    /// Attach the replay window the replayer updates.
+    /// Attach the replay counter the replayer updates.
+    ///
+    /// The counter is advisory. Attaching it keeps `in_flight` accurate in the
+    /// status file; it does not restore admission or send gating.
     pub fn with_backpressure(mut self, backpressure: Arc<Backpressure>) -> Self {
         self.backpressure = backpressure;
         self
@@ -387,29 +367,30 @@ impl Outbox {
     /// Reserve capacity for one operation of `bytes` payload.
     ///
     /// The returned guard releases the capacity on drop unless it is committed.
-    pub fn reserve(&self, bytes: usize) -> Result<Reservation<'_>, OutboxFull> {
-        if !self.backpressure.is_open() {
-            return Err(OutboxFull {
-                requested: bytes,
-                available: 0,
-            });
-        }
+    /// This call never fails: the network cannot turn a local write into
+    /// `ENOSPC`. A real disk error still surfaces from the backing store.
+    pub fn reserve(&self, bytes: usize) -> Reservation<'_> {
         let mut inner = self.lock();
-        if inner.reserved_bytes.saturating_add(bytes) > self.max_bytes
-            || inner.reserved_ops >= self.max_ops
-        {
-            return Err(OutboxFull {
-                requested: bytes,
-                available: self.max_bytes.saturating_sub(inner.reserved_bytes),
-            });
+        inner.reserved_bytes = inner.reserved_bytes.saturating_add(bytes);
+        inner.reserved_ops = inner.reserved_ops.saturating_add(1);
+        let over = inner.reserved_bytes > self.soft_bytes || inner.reserved_ops > self.soft_ops;
+        let bytes_now = inner.reserved_bytes;
+        let ops_now = inner.reserved_ops;
+        drop(inner);
+        if over && !self.over_soft.swap(true, Ordering::Relaxed) {
+            tracing::warn!(
+                soft_bytes = self.soft_bytes,
+                soft_ops = self.soft_ops,
+                queued_bytes = bytes_now,
+                queued_ops = ops_now,
+                "outbox exceeded its soft budget; writes continue"
+            );
         }
-        inner.reserved_bytes += bytes;
-        inner.reserved_ops += 1;
-        Ok(Reservation {
+        Reservation {
             outbox: self,
             bytes,
             settled: false,
-        })
+        }
     }
 
     /// Allocate the next local sequence number.
@@ -429,9 +410,6 @@ impl Outbox {
     /// A sequence whose local operation failed is abandoned with
     /// [`Outbox::skip`], which closes the hole without sending anything.
     pub fn take_ready(&self) -> Option<QueuedOp> {
-        if !self.backpressure.is_open() {
-            return None;
-        }
         let mut inner = self.lock();
         loop {
             let seq = inner.next_send;
@@ -443,9 +421,10 @@ impl Outbox {
             inner.reserved_bytes = inner.reserved_bytes.saturating_sub(queued.op.byte_len());
             inner.reserved_ops = inner.reserved_ops.saturating_sub(1);
             inner.next_send = seq.checked_next().unwrap_or(seq);
+            self.clear_soft_alert(&inner);
             // Count the operation only when it leaves for the wire. An
-            // operation still queued behind a closed window must not hold the
-            // window shut after every sent operation has been echoed.
+            // operation still queued behind a sequence hole must not hold the
+            // replay counter shut after every sent operation has been echoed.
             if !matches!(queued.op, LocalOp::Xattr { .. }) {
                 self.backpressure.note_in_flight();
             }
@@ -525,6 +504,13 @@ impl Outbox {
         let mut inner = self.lock();
         inner.reserved_bytes = inner.reserved_bytes.saturating_sub(bytes);
         inner.reserved_ops = inner.reserved_ops.saturating_sub(1);
+        self.clear_soft_alert(&inner);
+    }
+
+    fn clear_soft_alert(&self, inner: &OutboxInner) {
+        if inner.reserved_bytes <= self.soft_bytes && inner.reserved_ops <= self.soft_ops {
+            self.over_soft.store(false, Ordering::Relaxed);
+        }
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, OutboxInner> {
@@ -540,8 +526,8 @@ impl fmt::Debug for Outbox {
         f.debug_struct("Outbox")
             .field("ops", &depth.ops)
             .field("bytes", &depth.bytes)
-            .field("max_ops", &self.max_ops)
-            .field("max_bytes", &self.max_bytes)
+            .field("soft_ops", &self.soft_ops)
+            .field("soft_bytes", &self.soft_bytes)
             .finish()
     }
 }
@@ -629,6 +615,11 @@ impl From<&Tuning> for CoalesceTuning {
 pub struct WireOp {
     /// Covered local sequences.
     pub span: Span,
+    /// Operation id of the first covered write.
+    ///
+    /// The aggregate is signed and echoed as this one operation; the span
+    /// tells the echo path which pending effects it confirms.
+    pub op_id: OpId,
     /// Target inode.
     pub ino: InodeId,
     /// Offset of the first byte.
@@ -667,6 +658,7 @@ impl std::error::Error for NotCoalescable {}
 #[derive(Debug)]
 struct Batch {
     span: Span,
+    op_id: OpId,
     ino: InodeId,
     off: u64,
     end: u64,
@@ -679,6 +671,7 @@ impl Batch {
     fn new(queued: &QueuedOp, ino: InodeId, off: u64, data: &[u8], now: Duration) -> Self {
         Self {
             span: Span::single(queued.seq),
+            op_id: queued.op_id,
             ino,
             off,
             end: off.saturating_add(data.len() as u64),
@@ -711,6 +704,7 @@ impl Batch {
     fn wire(&self) -> WireOp {
         WireOp {
             span: self.span,
+            op_id: self.op_id,
             ino: self.ino,
             off: self.off,
             data: self.data.clone(),
@@ -857,7 +851,7 @@ mod tests {
         let seq = outbox.alloc_seq();
         assert_eq!(seq, LocalSeq::FIRST);
 
-        let reservation = outbox.reserve(100).unwrap();
+        let reservation = outbox.reserve(100);
         assert_eq!(outbox.depth(), OutboxDepth { ops: 1, bytes: 100 });
         reservation.commit(seq, op_id(1), write(1, 0, &[0; 100]));
         assert_eq!(outbox.depth(), OutboxDepth { ops: 1, bytes: 100 });
@@ -869,27 +863,29 @@ mod tests {
         assert!(outbox.take_ready().is_none());
     }
 
-    /// 41 §9: a full outbox is ENOSPC and leaves no capacity leak.
+    /// Backpressure is forbidden: crossing the soft budget never rejects an
+    /// operation, and a dropped guard still releases its charge.
     #[test]
-    fn u_writer_outbox_full_is_enospc() {
+    fn u_writer_outbox_soft_budget_never_rejects() {
         let outbox = Outbox::new(64, 2);
-        let first = outbox.reserve(64).unwrap();
-        let full = outbox.reserve(1).unwrap_err();
-        assert_eq!(full.errno(), Errno::ENOSPC);
-        assert_eq!(full.requested, 1);
-        assert_eq!(full.available, 0);
+        let first = outbox.reserve(64);
+        // Both budgets are exceeded; admission still succeeds.
+        let second = outbox.reserve(1);
+        assert_eq!(outbox.depth(), OutboxDepth { ops: 2, bytes: 65 });
 
-        // Dropping the guard releases the reservation.
+        // Dropping the guards releases the reservations.
+        drop(second);
         drop(first);
         assert!(outbox.is_empty());
-        assert!(outbox.reserve(64).is_ok());
 
-        // The operation ceiling applies too.
+        // The operation budget is advisory too.
         let outbox = Outbox::new(1024, 1);
-        let held = outbox.reserve(0).unwrap();
-        assert!(outbox.reserve(0).is_err());
+        let held = outbox.reserve(0);
+        let also = outbox.reserve(0);
+        assert_eq!(outbox.depth(), OutboxDepth { ops: 2, bytes: 0 });
         held.abort();
-        assert!(outbox.reserve(0).is_ok());
+        also.abort();
+        assert!(outbox.is_empty());
     }
 
     /// 41 §2.4: concurrent commits still leave in sequence order.
@@ -902,13 +898,13 @@ mod tests {
         assert_eq!((a.get(), b.get(), c.get()), (1, 2, 3));
 
         // Commit 3, then 1, then 2.
-        let r3 = outbox.reserve(1).unwrap();
+        let r3 = outbox.reserve(1);
         r3.commit(c, op_id(3), write(1, 2, b"c"));
         assert!(outbox.take_ready().is_none(), "a hole must block the queue");
-        let r1 = outbox.reserve(1).unwrap();
+        let r1 = outbox.reserve(1);
         r1.commit(a, op_id(1), write(1, 0, b"a"));
         assert_eq!(outbox.take_ready().unwrap().seq, a);
-        let r2 = outbox.reserve(1).unwrap();
+        let r2 = outbox.reserve(1);
         r2.commit(b, op_id(2), write(1, 1, b"b"));
         assert_eq!(outbox.take_ready().unwrap().seq, b);
         assert_eq!(outbox.take_ready().unwrap().seq, c);
@@ -925,15 +921,15 @@ mod tests {
 
         // The local operation for `b` failed: its capacity is returned and
         // its sequence is abandoned.
-        let rb = outbox.reserve(1).unwrap();
+        let rb = outbox.reserve(1);
         rb.abort();
         outbox.skip(b);
 
         // `c` commits before `a`; the queue waits at `a`, then passes `b`.
-        let rc = outbox.reserve(1).unwrap();
+        let rc = outbox.reserve(1);
         rc.commit(c, op_id(3), write(1, 2, b"c"));
         assert!(outbox.take_ready().is_none());
-        let ra = outbox.reserve(1).unwrap();
+        let ra = outbox.reserve(1);
         ra.commit(a, op_id(1), write(1, 0, b"a"));
         assert_eq!(outbox.take_ready().unwrap().seq, a);
         assert_eq!(outbox.take_ready().unwrap().seq, c);
@@ -942,7 +938,7 @@ mod tests {
 
         // Skipping the sequence at the head also clears `has_ready`.
         let d = outbox.alloc_seq();
-        let rd = outbox.reserve(0).unwrap();
+        let rd = outbox.reserve(0);
         rd.abort();
         outbox.skip(d);
         assert!(!outbox.has_ready());
@@ -980,6 +976,7 @@ mod tests {
 
         let wire = coalescer.flush_all().unwrap();
         assert_eq!(wire.span, Span::new(LocalSeq(1), LocalSeq(2)));
+        assert_eq!(wire.op_id, op_id(1), "the first write signs the aggregate");
         assert_eq!(wire.ino, InodeId(1));
         assert_eq!(wire.off, 0);
         assert_eq!(wire.data, b"aabb");
@@ -1122,64 +1119,52 @@ mod tests {
         assert_eq!(coalescer.buffered_bytes(), 4);
     }
 
-    /// The replay window closes admission and sending, and echoes reopen it.
+    /// The replay counter is diagnostic: a closed window neither refuses
+    /// admission nor stops the uplink.
     #[test]
-    fn u_writer_backpressure_window_gates_outbox() {
+    fn u_writer_backpressure_never_gates_outbox() {
         let window = Arc::new(Backpressure::new(3, 1));
         let outbox = Outbox::new(1024, 8).with_backpressure(Arc::clone(&window));
 
         let a = outbox.alloc_seq();
         let b = outbox.alloc_seq();
         let c = outbox.alloc_seq();
-        outbox
-            .reserve(1)
-            .unwrap()
-            .commit(a, op_id(1), write(1, 0, b"a"));
+        outbox.reserve(1).commit(a, op_id(1), write(1, 0, b"a"));
         assert_eq!(window.in_flight(), 0, "a queued op is not on the wire yet");
         assert_eq!(outbox.take_ready().unwrap().seq, a);
-        outbox
-            .reserve(1)
-            .unwrap()
-            .commit(b, op_id(2), write(1, 1, b"b"));
+        outbox.reserve(1).commit(b, op_id(2), write(1, 1, b"b"));
         assert_eq!(outbox.take_ready().unwrap().seq, b);
-        outbox
-            .reserve(1)
-            .unwrap()
-            .commit(c, op_id(3), write(1, 2, b"c"));
+        outbox.reserve(1).commit(c, op_id(3), write(1, 2, b"c"));
         assert_eq!(outbox.take_ready().unwrap().seq, c);
         assert_eq!(window.in_flight(), 3);
         assert!(!window.is_open());
-        assert_eq!(outbox.reserve(1).unwrap_err().errno(), Errno::ENOSPC);
-        assert!(
-            outbox.take_ready().is_none(),
-            "a closed window sends nothing"
-        );
 
-        // Hysteresis: the window stays closed above `low`.
+        // A closed window still admits and sends; the local write must never
+        // fail because the replay is behind.
+        let d = outbox.alloc_seq();
+        outbox.reserve(1).commit(d, op_id(4), write(1, 3, b"d"));
+        assert_eq!(outbox.take_ready().unwrap().seq, d);
+
+        // Hysteresis still tracks the counter for diagnostics.
         window.note_echo();
         assert!(!window.is_open());
         window.note_echo();
+        window.note_echo();
         assert!(window.is_open());
-
-        // A fresh operation is admitted and sent again.
-        let d = outbox.alloc_seq();
-        outbox
-            .reserve(1)
-            .unwrap()
-            .commit(d, op_id(4), write(1, 3, b"d"));
-        assert_eq!(outbox.take_ready().unwrap().seq, d);
     }
 
-    /// A sequence hole closes the window until the hole fills.
+    /// A sequence hole is reported, never enforced.
     #[test]
-    fn u_writer_backpressure_gap_closes_until_it_fills() {
+    fn u_writer_backpressure_gap_never_blocks_admission() {
         let window = Arc::new(Backpressure::new(8, 2));
         let outbox = Outbox::new(1024, 8).with_backpressure(Arc::clone(&window));
 
         window.set_gap(true);
-        assert_eq!(outbox.reserve(0).unwrap_err().errno(), Errno::ENOSPC);
+        let held = outbox.reserve(0);
+        assert!(!window.is_open());
+        drop(held);
         window.set_gap(false);
-        assert!(outbox.reserve(0).is_ok());
+        assert!(window.is_open());
     }
 
     /// An xattr has no wire class and never echoes, so it must not hold the
@@ -1189,7 +1174,7 @@ mod tests {
         let window = Arc::new(Backpressure::new(1, 0));
         let outbox = Outbox::new(1024, 8).with_backpressure(Arc::clone(&window));
         let seq = outbox.alloc_seq();
-        outbox.reserve(0).unwrap().commit(
+        outbox.reserve(0).commit(
             seq,
             op_id(1),
             LocalOp::Xattr {

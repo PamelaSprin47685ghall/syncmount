@@ -22,7 +22,7 @@
 //! # Ports
 //!
 //! [`Transport`], [`Dialer`] and [`Acceptor`] are byte-level ports. The
-//! testkit substitutes an in-memory implementation; [`http1`] provides the
+//! tests substitute an in-memory implementation; [`http1`] provides the
 //! production implementation over hyper. No `Frame` type appears here: the
 //! port carries `Bytes`, so the dependency direction stays
 //! `client/server → transport` and never the reverse.

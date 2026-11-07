@@ -29,7 +29,7 @@ ROOT=$(mktemp -d "${TMPDIR:-/tmp}/syncmount-two.XXXXXX")
 MNT_A="$ROOT/a"
 MNT_B="$ROOT/b"
 export SYNCMOUNT_RUN_DIR="$ROOT/run"
-export XDG_STATE_HOME="$ROOT/state"
+export XDG_DATA_HOME="$ROOT/data"
 export SYNCMOUNT_MASTER_PASSWORD="$PASSWORD"
 
 SERVER_PID=
@@ -59,7 +59,7 @@ command -v fusermount3 >/dev/null || { echo "missing: fusermount3" >&2; exit 2; 
     exit 2
 }
 
-mkdir -p "$MNT_A" "$MNT_B" "$SYNCMOUNT_RUN_DIR" "$XDG_STATE_HOME" "$ROOT/state-a" "$ROOT/state-b"
+mkdir -p "$MNT_A" "$MNT_B" "$SYNCMOUNT_RUN_DIR" "$XDG_DATA_HOME"
 
 echo "== sequencer $URL"
 "$BIN" server "$URL" --listen "127.0.0.1:${PORT}" --log-format json \
@@ -86,11 +86,10 @@ wait_for_port || {
 
 MOUNT_PID=
 mount_client() {
-    local mnt=$1 log=$2 state=$3
-    # A distinct XDG_STATE_HOME gives each client its own Ed25519 identity.
-    # One identity mounted twice is the duplicate-client case, and the server
-    # kicks the older session.
-    XDG_STATE_HOME="$state" "$BIN" client "$URL" "$mnt" --log-format json >"$log" 2>&1 &
+    local mnt=$1 log=$2 db=$3
+    # Each client owns one database. Two mounts of one database are the same
+    # replica opened twice, which the instance lock refuses.
+    "$BIN" client "$URL" "$mnt" --db "$db" --log-format json >"$log" 2>&1 &
     MOUNT_PID=$!
     for _ in $(seq 1 100); do
         mountpoint -q "$mnt" && return 0
@@ -101,9 +100,9 @@ mount_client() {
 }
 
 echo "== mount A and B"
-mount_client "$MNT_A" "$ROOT/a.log" "$ROOT/state-a" || { cat "$ROOT/a.log" >&2; exit 2; }
+mount_client "$MNT_A" "$ROOT/a.log" "$ROOT/a.db" || { cat "$ROOT/a.log" >&2; exit 2; }
 CLIENT_A=$MOUNT_PID
-mount_client "$MNT_B" "$ROOT/b.log" "$ROOT/state-b" || { cat "$ROOT/b.log" >&2; exit 2; }
+mount_client "$MNT_B" "$ROOT/b.log" "$ROOT/b.db" || { cat "$ROOT/b.log" >&2; exit 2; }
 CLIENT_B=$MOUNT_PID
 
 echo "== write on A"

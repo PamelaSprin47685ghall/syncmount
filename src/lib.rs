@@ -2,8 +2,7 @@
 //!
 //! Module tree and dependency direction are fixed by the build skeleton
 //! (`docs/build.md`, W1). Leaves are `protocol` and `transport`; `client`
-//! never depends on `fuse`; `server` never depends on `store`, `sync` or
-//! `client`.
+//! never depends on `fuse`; `server` never depends on `store` or `client`.
 //!
 //! This crate is a skeleton: every module is declared so that owners can
 //! land implementations without touching this file.
@@ -16,13 +15,10 @@ pub mod crypto;
 pub mod logging;
 pub mod protocol;
 pub mod server;
+pub mod state;
 pub mod store;
-pub mod sync;
 pub mod transport;
 pub mod version;
-
-#[cfg(feature = "testkit")]
-pub mod testkit;
 
 #[cfg(feature = "fuse")]
 pub mod fuse;
