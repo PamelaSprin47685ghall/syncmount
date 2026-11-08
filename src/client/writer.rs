@@ -13,9 +13,10 @@
 //!   operation whose local effect failed is abandoned with [`Outbox::skip`],
 //!   so its sequence cannot stall every later operation.
 //! * [`Coalescer`] is a pure state machine: it merges adjacent writes of one
-//!   inode into one wire operation of at most 4 MiB, and releases a partial
-//!   aggregate after the 2 ms quiet window (or 5 ms at the latest, or
-//!   immediately at 128 KiB).
+//!   inode into one wire operation of at most 4 MiB. It releases the aggregate
+//!   at 128 KiB, when the next operation cannot merge, or when the uplink
+//!   flushes it. The uplink flushes after each outbox page, so an aggregate
+//!   never outlives a page and needs no timer.
 //!
 //! Neither type performs I/O, holds a lock across a syscall, or invents an
 //! order of its own. The uplink (W12) drives them.
@@ -24,7 +25,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use crate::client::config::Tuning;
 use crate::protocol::frame::OpId;
@@ -585,10 +585,6 @@ impl fmt::Debug for Reservation<'_> {
 pub struct CoalesceTuning {
     /// Size that forces an immediate send.
     pub aggregate_bytes: usize,
-    /// Quiet window for a partial aggregate.
-    pub window: Duration,
-    /// Hard age ceiling for a partial aggregate.
-    pub hard: Duration,
     /// Largest aggregate the coalescer will build.
     pub max_aggregate: usize,
 }
@@ -601,10 +597,10 @@ impl Default for CoalesceTuning {
 
 impl From<&Tuning> for CoalesceTuning {
     fn from(tuning: &Tuning) -> Self {
+        // The coalescer needs size limits only: the uplink flushes after each
+        // outbox page, so an aggregate never waits for a timer.
         Self {
             aggregate_bytes: tuning.aggregate_bytes,
-            window: tuning.aggregate_window,
-            hard: tuning.aggregate_hard,
             max_aggregate: tuning.aggregate_max,
         }
     }
@@ -663,12 +659,10 @@ struct Batch {
     off: u64,
     end: u64,
     data: Vec<u8>,
-    first_at: Duration,
-    last_push: Duration,
 }
 
 impl Batch {
-    fn new(queued: &QueuedOp, ino: InodeId, off: u64, data: &[u8], now: Duration) -> Self {
+    fn new(queued: &QueuedOp, ino: InodeId, off: u64, data: &[u8]) -> Self {
         Self {
             span: Span::single(queued.seq),
             op_id: queued.op_id,
@@ -676,8 +670,6 @@ impl Batch {
             off,
             end: off.saturating_add(data.len() as u64),
             data: data.to_vec(),
-            first_at: now,
-            last_push: now,
         }
     }
 
@@ -693,12 +685,11 @@ impl Batch {
         adjacent && self.ino == ino && self.end == off && self.data.len().saturating_add(len) <= max
     }
 
-    fn absorb(&mut self, queued: &QueuedOp, off: u64, data: &[u8], now: Duration) {
+    fn absorb(&mut self, queued: &QueuedOp, off: u64, data: &[u8]) {
         debug_assert_eq!(self.end, off);
         self.data.extend_from_slice(data);
         self.end = off.saturating_add(data.len() as u64);
         self.span.last = queued.seq;
-        self.last_push = now;
     }
 
     fn wire(&self) -> WireOp {
@@ -740,11 +731,11 @@ impl Coalescer {
     /// [`NotCoalescable`] for anything that is not an adjacent write of the
     /// same inode. In the last case the caller flushes with
     /// [`Coalescer::flush_all`] and sends the operation itself.
-    pub fn push(
-        &mut self,
-        queued: &QueuedOp,
-        now: Duration,
-    ) -> Result<Option<WireOp>, NotCoalescable> {
+    ///
+    /// The coalescer has no clock: it releases an aggregate on size, on a
+    /// break, or when the uplink flushes. The uplink flushes at the end of
+    /// every outbox page, so no timer is needed.
+    pub fn push(&mut self, queued: &QueuedOp) -> Result<Option<WireOp>, NotCoalescable> {
         let LocalOp::Write { ino, off, data } = &queued.op else {
             return Err(NotCoalescable);
         };
@@ -758,7 +749,7 @@ impl Coalescer {
             let Some(batch) = self.batch.as_mut() else {
                 return Ok(None);
             };
-            batch.absorb(queued, off, data, now);
+            batch.absorb(queued, off, data);
             if batch.data.len() >= self.tuning.aggregate_bytes {
                 return Ok(self.take());
             }
@@ -766,7 +757,7 @@ impl Coalescer {
         }
 
         let previous = self.take();
-        self.batch = Some(Batch::new(queued, ino, off, data, now));
+        self.batch = Some(Batch::new(queued, ino, off, data));
         // Only release the fresh batch immediately when nothing else is
         // waiting to be sent; otherwise the caller sends `previous` first and
         // the fresh batch is released on the next call, preserving order.
@@ -780,17 +771,6 @@ impl Coalescer {
             return Ok(current);
         }
         Ok(previous)
-    }
-
-    /// Release the aggregate if it is due.
-    pub fn due(&mut self, now: Duration) -> Option<WireOp> {
-        let batch = self.batch.as_ref()?;
-        let age = now.saturating_sub(batch.first_at);
-        let idle = now.saturating_sub(batch.last_push);
-        if age >= self.tuning.hard || (age >= self.tuning.window && idle >= self.tuning.window) {
-            return self.take();
-        }
-        None
     }
 
     /// Release the aggregate if it belongs to `ino` (`fsync` path).
@@ -959,19 +939,8 @@ mod tests {
     #[test]
     fn u_writer_coalescer_merges_adjacent_writes() {
         let mut coalescer = Coalescer::new(CoalesceTuning::default());
-        let t0 = Duration::from_millis(10);
-        assert!(
-            coalescer
-                .push(&queued(1, 1, 0, b"aa"), t0)
-                .unwrap()
-                .is_none()
-        );
-        assert!(
-            coalescer
-                .push(&queued(2, 1, 2, b"bb"), t0)
-                .unwrap()
-                .is_none()
-        );
+        assert!(coalescer.push(&queued(1, 1, 0, b"aa")).unwrap().is_none());
+        assert!(coalescer.push(&queued(2, 1, 2, b"bb")).unwrap().is_none());
         assert_eq!(coalescer.buffered_bytes(), 4);
 
         let wire = coalescer.flush_all().unwrap();
@@ -986,15 +955,11 @@ mod tests {
     /// 41 §2.5: a hole, another inode, or another class breaks the batch.
     #[test]
     fn u_writer_coalescer_breaks_on_gap_inode_and_class() {
-        let t0 = Duration::from_millis(10);
         let mut coalescer = Coalescer::new(CoalesceTuning::default());
 
         // Sequence hole: 1 then 3.
-        coalescer.push(&queued(1, 1, 0, b"aa"), t0).unwrap();
-        let first = coalescer
-            .push(&queued(3, 1, 2, b"cc"), t0)
-            .unwrap()
-            .unwrap();
+        coalescer.push(&queued(1, 1, 0, b"aa")).unwrap();
+        let first = coalescer.push(&queued(3, 1, 2, b"cc")).unwrap().unwrap();
         assert_eq!(first.span, Span::single(LocalSeq(1)));
         assert_eq!(coalescer.buffered_bytes(), 2);
         assert_eq!(
@@ -1003,16 +968,13 @@ mod tests {
         );
 
         // Different inode.
-        coalescer.push(&queued(4, 1, 0, b"aa"), t0).unwrap();
-        let other = coalescer
-            .push(&queued(5, 2, 2, b"bb"), t0)
-            .unwrap()
-            .unwrap();
+        coalescer.push(&queued(4, 1, 0, b"aa")).unwrap();
+        let other = coalescer.push(&queued(5, 2, 2, b"bb")).unwrap().unwrap();
         assert_eq!(other.ino, InodeId(1));
         assert_eq!(coalescer.flush_all().unwrap().ino, InodeId(2));
 
         // Non-write operations are never coalesced.
-        coalescer.push(&queued(6, 1, 0, b"aa"), t0).unwrap();
+        coalescer.push(&queued(6, 1, 0, b"aa")).unwrap();
         let meta = QueuedOp::new(
             LocalSeq(7),
             op_id(7),
@@ -1022,7 +984,7 @@ mod tests {
                 body: Vec::new(),
             },
         );
-        assert_eq!(coalescer.push(&meta, t0), Err(NotCoalescable));
+        assert_eq!(coalescer.push(&meta), Err(NotCoalescable));
         assert_eq!(
             coalescer.flush_all().unwrap().span,
             Span::single(LocalSeq(6))
@@ -1033,16 +995,10 @@ mod tests {
     #[test]
     fn u_writer_coalescer_sends_at_128k() {
         let mut coalescer = Coalescer::new(CoalesceTuning::default());
-        let t0 = Duration::from_millis(1);
         let chunk = vec![0u8; 64 * 1024];
-        assert!(
-            coalescer
-                .push(&queued(1, 1, 0, &chunk), t0)
-                .unwrap()
-                .is_none()
-        );
+        assert!(coalescer.push(&queued(1, 1, 0, &chunk)).unwrap().is_none());
         let wire = coalescer
-            .push(&queued(2, 1, 64 * 1024, &chunk), t0)
+            .push(&queued(2, 1, 64 * 1024, &chunk))
             .unwrap()
             .unwrap();
         assert_eq!(wire.data.len(), 128 * 1024);
@@ -1050,40 +1006,11 @@ mod tests {
         assert!(coalescer.is_empty());
     }
 
-    /// 39 §2.1: 2 ms quiet window, 5 ms hard ceiling.
-    #[test]
-    fn u_writer_coalescer_window_and_hard_ceiling() {
-        let mut coalescer = Coalescer::new(CoalesceTuning::default());
-        coalescer
-            .push(&queued(1, 1, 0, b"aa"), Duration::from_millis(100))
-            .unwrap();
-        assert!(coalescer.due(Duration::from_micros(100_500)).is_none());
-        // Quiet for 2 ms: the partial aggregate is released.
-        assert!(coalescer.due(Duration::from_millis(102)).is_some());
-        assert!(coalescer.is_empty());
-
-        // A continuous stream is held past the quiet window and released at
-        // the hard ceiling.
-        coalescer
-            .push(&queued(2, 1, 0, b"aa"), Duration::from_millis(200))
-            .unwrap();
-        coalescer
-            .push(&queued(3, 1, 2, b"bb"), Duration::from_millis(202))
-            .unwrap();
-        assert!(
-            coalescer.due(Duration::from_millis(203)).is_none(),
-            "age 3 ms < 5 ms hard ceiling"
-        );
-        let wire = coalescer.due(Duration::from_millis(205)).unwrap();
-        assert_eq!(wire.data, b"aabb");
-    }
-
     /// 41 §3.3: fsync flushes only the aggregate of its inode.
     #[test]
     fn u_writer_coalescer_flush_inode() {
         let mut coalescer = Coalescer::new(CoalesceTuning::default());
-        let t0 = Duration::from_millis(1);
-        coalescer.push(&queued(1, 1, 0, b"aa"), t0).unwrap();
+        coalescer.push(&queued(1, 1, 0, b"aa")).unwrap();
         assert!(coalescer.flush_inode(InodeId(2)).is_none());
         let wire = coalescer.flush_inode(InodeId(1)).unwrap();
         assert_eq!(wire.data, b"aa");
@@ -1096,24 +1023,16 @@ mod tests {
         let tuning = CoalesceTuning {
             aggregate_bytes: usize::MAX,
             max_aggregate: 8,
-            ..CoalesceTuning::default()
         };
         let mut coalescer = Coalescer::new(tuning);
-        let t0 = Duration::from_millis(1);
-        coalescer.push(&queued(1, 1, 0, b"aaaa"), t0).unwrap();
+        coalescer.push(&queued(1, 1, 0, b"aaaa")).unwrap();
         assert!(
-            coalescer
-                .push(&queued(2, 1, 4, b"bbbb"), t0)
-                .unwrap()
-                .is_none(),
+            coalescer.push(&queued(2, 1, 4, b"bbbb")).unwrap().is_none(),
             "exactly at the ceiling still fits"
         );
         // The next adjacent write cannot be absorbed: the full aggregate goes
         // out and the new one starts fresh.
-        let wire = coalescer
-            .push(&queued(3, 1, 8, b"cccc"), t0)
-            .unwrap()
-            .unwrap();
+        let wire = coalescer.push(&queued(3, 1, 8, b"cccc")).unwrap().unwrap();
         assert_eq!(wire.data, b"aaaabbbb");
         assert_eq!(wire.span, Span::new(LocalSeq(1), LocalSeq(2)));
         assert_eq!(coalescer.buffered_bytes(), 4);

@@ -72,9 +72,11 @@ pub const FUSE_CONF: &str = "/etc/fuse.conf";
 #[cfg(feature = "fuse")]
 pub const FUSE_DEVICE: &str = "/dev/fuse";
 
-const SUBCOMMANDS: [&str; 7] = [
+const SUBCOMMANDS: [&str; 9] = [
     "client",
     "server",
+    "mm-client",
+    "mm-server",
     "import",
     "status",
     "debug-state",
@@ -83,7 +85,7 @@ const SUBCOMMANDS: [&str; 7] = [
 ];
 
 /// Flags that consume the following argv token.
-const VALUE_FLAGS: [&str; 9] = [
+const VALUE_FLAGS: [&str; 11] = [
     "--log-level",
     "--log-format",
     "--key",
@@ -93,6 +95,8 @@ const VALUE_FLAGS: [&str; 9] = [
     "--mount-id",
     "--limit",
     "--db",
+    "--shadow-dir",
+    "--spool-dir",
 ];
 
 /// Parsed command line.
@@ -142,6 +146,10 @@ pub enum Command {
     DebugSeqGaps(DebugArgs),
     /// Dump the connection trace ring.
     DebugConntrace(ConntraceArgs),
+    /// Mount a 1.1 mm namespace through the shadow client.
+    MmClient(MmClientArgs),
+    /// Run a 1.1 mm HTTP server for one namespace.
+    MmServer(MmServerArgs),
 }
 
 /// `syncmount client URL MOUNTPOINT`.
@@ -261,6 +269,60 @@ pub struct ConntraceArgs {
     /// Number of entries to print, newest last.
     #[arg(long, default_value_t = 100, value_name = "N")]
     pub limit: usize,
+}
+
+/// `syncmount mm-client URL MOUNTPOINT --shadow-dir DIR --key-file FILE`.
+#[derive(Debug, Args)]
+pub struct MmClientArgs {
+    /// mm server URL, including the `/private-mm` namespace prefix.
+    pub url: String,
+    /// Local mount point.
+    pub mountpoint: PathBuf,
+
+    /// Shadow state directory for this mount.
+    #[arg(long, value_name = "DIR")]
+    pub shadow_dir: PathBuf,
+
+    /// Raw mm master key: 32 bytes or 64 hexadecimal characters.
+    #[arg(long, value_name = "PATH")]
+    pub key_file: Option<PathBuf>,
+
+    /// Allow every local user to access the mount.
+    #[arg(long)]
+    pub allow_other: bool,
+}
+
+/// `syncmount mm-server URL --listen ADDR --db PATH --spool-dir DIR`.
+#[derive(Debug, Args)]
+pub struct MmServerArgs {
+    /// Namespace URL such as `http://127.0.0.1:8081/private-mm`.
+    pub url: String,
+
+    /// Listen address (`host:port`).
+    #[arg(long, env = "SYNCMOUNT_MM_LISTEN", value_name = "ADDR")]
+    pub listen: Option<String>,
+
+    /// SQLite database owned by this mm server.
+    #[arg(
+        long = "db",
+        env = "SYNCMOUNT_MM_DB",
+        value_name = "PATH",
+        default_value = "mm-server.db"
+    )]
+    pub db: PathBuf,
+
+    /// Per-batch spool directory.
+    #[arg(
+        long = "spool-dir",
+        env = "SYNCMOUNT_MM_SPOOL",
+        value_name = "DIR",
+        default_value = "mm-spool"
+    )]
+    pub spool_dir: PathBuf,
+
+    /// Raw mm master key: 32 bytes or 64 hexadecimal characters.
+    #[arg(long, value_name = "PATH")]
+    pub key_file: Option<PathBuf>,
 }
 
 /// Errors that terminate the process.
@@ -424,7 +486,129 @@ fn execute(cli: Cli) -> Result<(), CliError> {
         Command::DebugState(args) => run_debug_state(args),
         Command::DebugSeqGaps(args) => run_seq_gaps(args),
         Command::DebugConntrace(args) => run_conntrace(args),
+        Command::MmClient(args) => run_mm_client(args),
+        Command::MmServer(args) => run_mm_server(args),
     }
+}
+
+// ---------------------------------------------------------------------------
+// 1.1 mm
+// ---------------------------------------------------------------------------
+
+#[cfg(not(feature = "fuse"))]
+fn run_mm_client(args: MmClientArgs) -> Result<(), CliError> {
+    let _ = args;
+    Err(CliError::Startup(
+        "this build has no FUSE support; rebuild with the `fuse` feature".to_owned(),
+    ))
+}
+
+#[cfg(feature = "fuse")]
+fn run_mm_client(args: MmClientArgs) -> Result<(), CliError> {
+    check_fuse_prerequisites(args.allow_other)?;
+    let master = load_mm_master(args.key_file.as_deref())?;
+    let config = crate::mmap::client::MmClientConfig::from_url(&args.url, master)
+        .map_err(|error| CliError::Usage(error.to_string()))?;
+    tracing::info!(
+        event = "starting",
+        mode = "mm-client",
+        url = %args.url,
+        namespace = config.namespace.wire_label(),
+        mountpoint = %args.mountpoint.display(),
+        shadow_dir = %args.shadow_dir.display(),
+        "starting syncmount mm client"
+    );
+    crate::mmap::client::mount_shadow(config, &args.mountpoint, &args.shadow_dir, args.allow_other)
+        .map_err(|error| CliError::Startup(error.to_string()))
+}
+
+fn run_mm_server(args: MmServerArgs) -> Result<(), CliError> {
+    let endpoint = ClientEndpoint::parse(&args.url)
+        .map_err(|error| CliError::Usage(format!("invalid URL `{}`: {error}", args.url)))?;
+    let prefix = if endpoint.prefix.is_empty() {
+        crate::mmap::client::MM_URL_PREFIX
+    } else {
+        endpoint.prefix.as_str()
+    };
+    let namespace = crate::mmap::client::MmNamespace::new(prefix)
+        .map_err(|error| CliError::Usage(error.to_string()))?;
+    let listen = resolve_listen(args.listen.as_deref(), None)?;
+    let master = load_mm_master(args.key_file.as_deref())?;
+    let config = crate::mmap::server::MmapConfig::new(
+        listen,
+        namespace.url_prefix(),
+        &args.db,
+        &args.spool_dir,
+        master,
+    );
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| CliError::Startup(format!("cannot start the async runtime: {error}")))?;
+    runtime.block_on(async move {
+        let server = crate::mmap::server::MmapServer::bind(config)
+            .await
+            .map_err(|error| {
+                CliError::Startup(format!("cannot start the mm server on {listen}: {error}"))
+            })?;
+        tracing::info!(
+            event = "starting",
+            mode = "mm-server",
+            namespace = namespace.url_prefix(),
+            listen = %listen,
+            "starting syncmount mm server"
+        );
+        server.run_with_shutdown(shutdown_signal()).await;
+        Ok(())
+    })
+}
+
+/// Load a raw mm master key from a 0600 file or `SYNCMOUNT_MM_KEY`.
+///
+/// The mm protocol derives keys directly from the raw 32 bytes; unlike the
+/// 1.0 PSK it does not run Argon2 here. The server must hold the same bytes.
+fn load_mm_master(key_file: Option<&Path>) -> Result<[u8; 32], CliError> {
+    if let Some(path) = key_file {
+        check_password_file(path)?;
+        let bytes = Zeroizing::new(fs::read(path).map_err(|error| {
+            CliError::Startup(format!(
+                "cannot read mm key file {}: {error}",
+                path.display()
+            ))
+        })?);
+        return parse_mm_key(&bytes);
+    }
+    if let Some(value) = std::env::var_os("SYNCMOUNT_MM_KEY") {
+        let bytes = Zeroizing::new(value.to_string_lossy().into_owned().into_bytes());
+        return parse_mm_key(&bytes);
+    }
+    Err(CliError::Startup(
+        "no mm master key: pass --key-file (0600) or set SYNCMOUNT_MM_KEY".to_owned(),
+    ))
+}
+
+fn parse_mm_key(bytes: &[u8]) -> Result<[u8; 32], CliError> {
+    let start = bytes.iter().position(|byte| !byte.is_ascii_whitespace());
+    let end = bytes.iter().rposition(|byte| !byte.is_ascii_whitespace());
+    let Some((start, end)) = start.zip(end) else {
+        return Err(CliError::Startup("mm key is empty".to_owned()));
+    };
+    let trimmed = &bytes[start..=end];
+    if trimmed.len() == 64 {
+        let decoded = hex::decode(trimmed)
+            .map_err(|_| CliError::Startup("mm key is not hexadecimal".to_owned()))?;
+        return decoded
+            .try_into()
+            .map_err(|_| CliError::Startup("mm key is not 32 bytes".to_owned()));
+    }
+    if trimmed.len() == 32 {
+        let mut key = [0u8; 32];
+        key.copy_from_slice(trimmed);
+        return Ok(key);
+    }
+    Err(CliError::Startup(
+        "mm key must be exactly 32 raw bytes or 64 hexadecimal characters".to_owned(),
+    ))
 }
 
 // ---------------------------------------------------------------------------

@@ -1,0 +1,32 @@
+# syncmount 1.1 mm server: private-mm namespace.
+# One process, one SQLite database, one spool directory. The 1.0 sequencer
+# on 127.0.0.1:8081 is a different process and is not touched by this unit.
+[Unit]
+Description=syncmount 1.1 mm server (private-mm)
+StartLimitIntervalSec=0
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+UMask=0077
+ExecStart=/usr/local/bin/syncmount --log-format json --log-level info mm-server http://127.0.0.1:8083/private-mm --listen 127.0.0.1:8083 --db /var/lib/syncmount-mm/private-mm/server.db --spool-dir /var/lib/syncmount-mm/private-mm/spool --key-file /etc/syncmount/mm.key
+Restart=on-failure
+RestartPreventExitStatus=1 2 3
+RestartSec=2s
+TimeoutStopSec=30s
+
+# The unit holds the mm master key and a plaintext SQLite database. Keep the
+# sandbox. The "-" keeps namespace setup alive if the directory is missing;
+# mm-server then exits 2 and RestartPreventExitStatus stops the loop.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=-/var/lib/syncmount-mm/private-mm
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target

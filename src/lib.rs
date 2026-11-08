@@ -17,6 +17,7 @@ pub mod cli;
 pub mod client;
 pub mod crypto;
 pub mod logging;
+pub mod mmap;
 pub mod protocol;
 pub mod server;
 pub mod state;

@@ -26,9 +26,10 @@
 //! * `fuse_inos` maps the 128-bit id to the kernel's 64-bit `st_ino`.
 
 use std::ffi::OsStr;
+use std::future::Future;
 use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -207,6 +208,14 @@ pub struct ClientDb {
     /// Userspace write-back buffer. Reads consult it before SQLite; commits
     /// drain it into one transaction per inode.
     pub(crate) writeback: WriteBuffer,
+    /// Wakes the uplink after a commit may have appended outbox rows.
+    ///
+    /// A permit survives until the uplink waits, so a write that lands while
+    /// the uplink is busy is never lost.
+    outbox_wake: tokio::sync::Notify,
+    /// Outbox pages the uplink fetched. An idle session costs one scan per
+    /// wakeup, so this counter is the observable cost of the idle path.
+    outbox_scans: AtomicU64,
     /// `flock(LOCK_EX | LOCK_NB)` on the database file, held for the process
     /// lifetime. Dropping the descriptor releases it.
     _lock: OwnedFd,
@@ -295,6 +304,8 @@ impl ClientDb {
             checkpoint: CheckpointThread::new(),
             checkpoint_config: checkpoint,
             writeback: WriteBuffer::new(writeback),
+            outbox_wake: tokio::sync::Notify::new(),
+            outbox_scans: AtomicU64::new(0),
             _lock: lock,
             path,
             cluster,
@@ -563,7 +574,37 @@ impl ClientDb {
         let tx = db.write()?;
         let value = body(&tx)?;
         tx.commit()?;
+        self.wake_uplink();
         Ok(value)
+    }
+
+    /// Wake the uplink because a commit may have appended outbox rows.
+    ///
+    /// Called after the transaction has committed, never before: the uplink
+    /// must not see a row that a rollback would remove.
+    pub(crate) fn wake_uplink(&self) {
+        self.outbox_wake.notify_one();
+    }
+
+    /// Resolve after [`ClientDb::wake_uplink`] has been called.
+    ///
+    /// One permit is retained while no waiter exists, so the uplink can call
+    /// this after it drained the outbox and still observe an earlier write.
+    pub(crate) fn uplink_notified(&self) -> impl Future<Output = ()> + '_ {
+        self.outbox_wake.notified()
+    }
+
+    /// Record one outbox page scan by the uplink.
+    pub(crate) fn note_outbox_scan(&self) {
+        self.outbox_scans.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Number of outbox page scans since the database opened.
+    ///
+    /// An idle event-driven uplink advances this a few times per second; a
+    /// fixed 2 ms poll advances it about five thousand times per ten seconds.
+    pub fn outbox_scans(&self) -> u64 {
+        self.outbox_scans.load(Ordering::Relaxed)
     }
 
     pub(crate) fn lock_writer(&self) -> MutexGuard<'_, Db> {
@@ -1340,6 +1381,36 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = ClientDb::open(dir.path().join("client.db"), [7u8; 16]).unwrap();
         (dir, db)
+    }
+
+    #[tokio::test]
+    async fn a_committed_outbox_row_wakes_the_uplink_once() {
+        let (_dir, db) = open();
+        // `initialize` commits once before any uplink exists. Drain that
+        // permit so the assertions below observe only the calls they make.
+        tokio::time::timeout(Duration::from_millis(10), db.uplink_notified())
+            .await
+            .expect("the open-time permit is retained");
+
+        db.create_file(
+            ROOT_INO,
+            OsStr::new("f"),
+            CreateAttrs::new(0o644, 1000, 1000),
+        )
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), db.uplink_notified())
+            .await
+            .expect("a local commit wakes the uplink");
+
+        // A rollback appends no outbox row and must not wake the uplink.
+        let failed: Result<(), DbError> = db.write(|_tx| Err(DbError::Corrupt("test rollback")));
+        assert!(failed.is_err());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), db.uplink_notified())
+                .await
+                .is_err(),
+            "a rolled-back transaction must not publish a wakeup"
+        );
     }
 
     #[test]

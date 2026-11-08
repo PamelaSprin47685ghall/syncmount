@@ -1,0 +1,34 @@
+# syncmount 1.1 mm client template.
+# Instance: private-mm or public-mm. The instance name is also the URL
+# namespace and the mount point, so the three cannot drift:
+#   mm-client@private-mm -> http://<host>/private-mm on /private-mm
+# Replace mst0v6.example.com with the real mm host; it must be one of the
+# hosts matched by the Caddy site in Caddyfile.mm.example.
+[Unit]
+Description=syncmount 1.1 mm client (%i)
+StartLimitIntervalSec=0
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=syncmount
+Group=syncmount
+UMask=0077
+Environment=HOME=/home/syncmount
+# Clear a stale mount from a previous crash. The leading "-" keeps a failed
+# umount from blocking startup.
+ExecStartPre=-/usr/bin/fusermount3 -uz /%i
+ExecStart=/usr/local/bin/syncmount --log-format json --log-level info mm-client http://mst0v6.example.com/%i /%i --shadow-dir /var/lib/syncmount-mm-client/%i --key-file /etc/syncmount/mm-client.key
+Restart=always
+RestartPreventExitStatus=2 4
+RestartSec=2s
+TimeoutStopSec=30s
+# fusermount3 is setuid-root, so NoNewPrivileges must stay off; /dev/fuse
+# must stay visible.
+PrivateDevices=no
+NoNewPrivileges=no
+ProtectHome=no
+
+[Install]
+WantedBy=multi-user.target

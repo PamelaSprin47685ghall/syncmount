@@ -205,10 +205,6 @@ pub struct Tuning {
     pub outbox_soft_ops: usize,
     /// Aggregate size that forces an immediate send (39: 128 KiB).
     pub aggregate_bytes: usize,
-    /// Quiet window after which a partial aggregate is sent (39: 2–5 ms).
-    pub aggregate_window: Duration,
-    /// Hard ceiling on how long a partial aggregate may wait.
-    pub aggregate_hard: Duration,
     /// Largest wire op the coalescer will build (39: 4 MiB).
     pub aggregate_max: usize,
     /// Frames buffered while waiting for a missing sequence.
@@ -233,8 +229,6 @@ impl Default for Tuning {
             outbox_soft_bytes: 1024 * 1024 * 1024,
             outbox_soft_ops: 1 << 20,
             aggregate_bytes: 128 * 1024,
-            aggregate_window: Duration::from_millis(2),
-            aggregate_hard: Duration::from_millis(5),
             aggregate_max: 4 * 1024 * 1024,
             reorder_frames: 1024,
             reorder_wait: Duration::from_secs(1),
@@ -471,13 +465,11 @@ mod tests {
         );
     }
 
-    /// 39 §2.1: 128 KiB / 2–5 ms, 1 GiB soft outbox budget.
+    /// 39 §2.1: 128 KiB aggregate, 1 GiB soft outbox budget.
     #[test]
     fn u_config_tuning_matches_the_spec() {
         let tuning = Tuning::default();
         assert_eq!(tuning.aggregate_bytes, 128 * 1024);
-        assert_eq!(tuning.aggregate_window, Duration::from_millis(2));
-        assert_eq!(tuning.aggregate_hard, Duration::from_millis(5));
         assert_eq!(tuning.outbox_soft_bytes, 1024 * 1024 * 1024);
         assert_eq!(tuning.reorder_frames, 1024);
         assert_eq!(tuning.resync_budget, 3);

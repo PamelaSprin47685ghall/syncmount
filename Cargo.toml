@@ -1,6 +1,6 @@
 [package]
 name = "syncmount"
-version = "1.0.0"
+version = "1.1.0"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT OR Apache-2.0"
@@ -19,6 +19,50 @@ path = "src/lib.rs"
 name = "syncmount"
 path = "src/bin/syncmount.rs"
 
+[[test]]
+name = "mmap_integration"
+required-features = ["mmap-tests"]
+
+[[test]]
+name = "mmap_lock"
+required-features = ["mmap-tests"]
+
+[[test]]
+name = "mmap_compat"
+required-features = ["mmap-tests"]
+
+[[test]]
+name = "e2e_mmap"
+required-features = ["mmap-tests"]
+
+[[test]]
+name = "chaos_mmap"
+required-features = ["mmap-tests", "chaos-tests"]
+
+[[test]]
+name = "mmap_recovery"
+required-features = ["mmap-tests", "slow-tests"]
+
+[[test]]
+name = "mmap_perf"
+required-features = ["mmap-tests"]
+
+[[test]]
+name = "delta_vectors"
+required-features = ["mmap-tests"]
+
+[[test]]
+name = "delta_property"
+required-features = ["mmap-tests"]
+
+[[test]]
+name = "delta_wire_budget"
+required-features = ["mmap-tests"]
+
+[[test]]
+name = "mmap_multihost"
+required-features = ["mmap-tests"]
+
 [features]
 default = ["reduced-round", "fuse"]
 
@@ -32,6 +76,12 @@ fuse = ["dep:fuser"]
 fuse-tests = ["fuse"]
 
 slow-tests = []
+
+# 1.1 mmap unit tests. Kept out of the default build so 1.0 tests are untouched.
+mmap-tests = ["fuse"]
+
+# Crash/fault-injection tests; opt-in only.
+chaos-tests = []
 
 # Disable blake3's C/asm build; slower, but needs no host C compiler.
 pure-blake3 = ["blake3/pure"]

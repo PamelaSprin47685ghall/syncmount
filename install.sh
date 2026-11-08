@@ -3,7 +3,7 @@
 #
 # Usage:
 #   ./install.sh                      install the latest release to ~/.local/bin
-#   ./install.sh --version 1.0.0      install a specific version
+#   ./install.sh --version 1.1.0      install a specific version
 #   ./install.sh --prefix /usr/local  install under /usr/local (may need sudo)
 #
 # Environment:
@@ -28,7 +28,7 @@ install.sh — download, verify and install a syncmount release.
 
 Usage:
   ./install.sh                      install the latest release to ~/.local/bin
-  ./install.sh --version 1.0.0      install a specific version
+  ./install.sh --version 1.1.0      install a specific version
   ./install.sh --prefix /usr/local  install under /usr/local (may need sudo)
 
 Environment:

@@ -44,8 +44,12 @@ use crate::transport::{DialOptions, Endpoint, EventsStream, HttpTransport, RpcSt
 /// How long the whole handshake may take.
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// How often an idle uplink looks for a new outbox row.
-const IDLE_POLL: Duration = Duration::from_millis(2);
+/// Bound on how long an idle uplink waits when no wakeup arrives.
+///
+/// The uplink sleeps on the outbox notifier, the control channel and the PING
+/// deadline. This fallback is not a poll: it limits the damage of a lost
+/// wakeup, so an operation can never wait forever.
+const IDLE_WAKE_FALLBACK: Duration = Duration::from_secs(1);
 
 /// How often the client reports its applied watermark to the server.
 const PING_INTERVAL: Duration = Duration::from_secs(1);
@@ -53,8 +57,9 @@ const PING_INTERVAL: Duration = Duration::from_secs(1);
 /// How long a replay batch waits for more ORDERED frames before committing.
 ///
 /// The transport may deliver one frame per chunk; without this window every
-/// ORDERED would become its own transaction. The window matches the writer's
-/// aggregate window and bounds how long an isolated event stays unapplied.
+/// ORDERED would become its own transaction. The window bounds how long an
+/// isolated event stays unapplied. The downlink arms one timer per quiet wait;
+/// it never polls the stream.
 const REPLAY_BATCH_WINDOW: Duration = Duration::from_millis(2);
 
 /// How long a replay may make no progress before the session resyncs.
@@ -1014,33 +1019,40 @@ async fn downlink(
                 }
             }
         } else {
-            match tokio::time::timeout(REPLAY_BATCH_WINDOW, events.recv()).await {
-                Ok(Ok(Some(bytes))) => bytes,
-                Ok(Ok(None)) => {
-                    if !settle_batch(
-                        &store,
-                        &mut pending,
-                        &mut pending_bytes,
-                        &watermark,
-                        &counters,
-                        &mut caught_up,
-                        current_seq,
-                        &gate,
-                        &signal,
-                    )
-                    .await
-                    {
+            // A batch is pending. Wait for one more chunk, but keep the batch
+            // window as the bound on an isolated event. The timer is armed
+            // only while the transport is quiet, so an idle downlink blocks in
+            // `recv` below instead of polling.
+            tokio::select! {
+                biased;
+                received = events.recv() => match received {
+                    Ok(Some(bytes)) => bytes,
+                    Ok(None) => {
+                        if !settle_batch(
+                            &store,
+                            &mut pending,
+                            &mut pending_bytes,
+                            &watermark,
+                            &counters,
+                            &mut caught_up,
+                            current_seq,
+                            &gate,
+                            &signal,
+                        )
+                        .await
+                        {
+                            return;
+                        }
+                        let _ = signal.send(Signal::Disconnected).await;
                         return;
                     }
-                    let _ = signal.send(Signal::Disconnected).await;
-                    return;
-                }
-                Ok(Err(error)) => {
-                    tracing::warn!(event = "disconnect", error = %error, "events stream failed");
-                    let _ = signal.send(Signal::Disconnected).await;
-                    return;
-                }
-                Err(_elapsed) => {
+                    Err(error) => {
+                        tracing::warn!(event = "disconnect", error = %error, "events stream failed");
+                        let _ = signal.send(Signal::Disconnected).await;
+                        return;
+                    }
+                },
+                _ = tokio::time::sleep(REPLAY_BATCH_WINDOW) => {
                     tracing::debug!(
                         event = "replay_flush",
                         reason = "idle",
@@ -1491,8 +1503,8 @@ async fn uplink(
     let nonces = NonceMinter::with_instance(rand::random());
     let sealer = Sealer::with_session_key(&key, &nonces);
     let mut coalescer = Coalescer::new(CoalesceTuning::default());
-    let started = Instant::now();
-    let mut last_ping = started;
+    let mut last_ping = Instant::now();
+    let mut control_open = true;
 
     loop {
         while let Ok(bytes) = control.try_recv() {
@@ -1516,6 +1528,7 @@ async fn uplink(
             }
         }
 
+        store.note_outbox_scan();
         let page = match store.outbox_page(OUTBOX_PAGE) {
             Ok(page) => page,
             Err(error) => {
@@ -1525,15 +1538,29 @@ async fn uplink(
         };
 
         if page.is_empty() {
-            if let Some(wire) = coalescer.due(started.elapsed()) {
-                if let Err(error) =
-                    send_wire(&mut rpc, &store, &sealer, &wire, &[], &counters, &conntrace).await
-                {
-                    let _ = signal.send(uplink_signal(error)).await;
-                    return;
-                }
-            } else {
-                tokio::time::sleep(IDLE_POLL).await;
+            // Nothing to send. Sleep until a commit wakes the uplink, the
+            // downlink delivers a control frame, or the PING is due. Every
+            // commit publishes one permit, so a write that races with the
+            // outbox scan is not lost.
+            let ping_in = PING_INTERVAL.saturating_sub(last_ping.elapsed());
+            tokio::select! {
+                _ = store.uplink_notified() => {}
+                received = control.recv(), if control_open => match received {
+                    Some(bytes) => {
+                        if let Err(error) = rpc.send(Bytes::from(bytes)).await {
+                            tracing::warn!(
+                                event = "disconnect",
+                                error = %error,
+                                "uplink failed; reconnecting"
+                            );
+                            let _ = signal.send(Signal::Disconnected).await;
+                            return;
+                        }
+                    }
+                    None => control_open = false,
+                },
+                _ = tokio::time::sleep(ping_in) => {}
+                _ = tokio::time::sleep(IDLE_WAKE_FALLBACK) => {}
             }
             continue;
         }
@@ -1542,7 +1569,7 @@ async fn uplink(
         while cursor < page.len() {
             let op = &page[cursor];
             if let Some(queued) = queued_write(&store, op) {
-                match coalescer.push(&queued, started.elapsed()) {
+                match coalescer.push(&queued) {
                     Ok(Some(wire)) => {
                         let members = members_for(&page, &wire);
                         if let Err(error) = send_wire(

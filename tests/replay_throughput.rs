@@ -2,10 +2,13 @@
 //! server, with a real SQLite replica on each client.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+use std::ffi::OsStr;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use syncmount::client::db::OutboxState;
+use syncmount::client::ops::CreateAttrs;
 use syncmount::client::session::{self, SessionOptions};
 use syncmount::client::{ClientDb, Conntrace, Counters, State, WriteGate};
 use syncmount::crypto::MasterKey;
@@ -15,7 +18,7 @@ use syncmount::server::config::ServeConfig;
 use syncmount::server::store::StoreHandle;
 use syncmount::server::wire::WireOp;
 use syncmount::server::{CommitOutcome, CommitRequest, Server};
-use syncmount::store::sqlite::EventPayload;
+use syncmount::store::sqlite::{EventPayload, ROOT_INO};
 use syncmount::transport::Endpoint;
 use tokio::sync::mpsc;
 
@@ -385,6 +388,117 @@ async fn one_client_replays_fifty_thousand_events() {
         total as f64 / elapsed.as_secs_f64() >= 1000.0,
         "replay rate below 1000 events/s: {elapsed:?} for {total}"
     );
+
+    let _ = client.shutdown.send(()).await;
+    let exit = client.task.await.unwrap();
+    assert_ne!(exit.code, 10, "client must not exit 10: {exit:?}");
+    let _ = stop_tx.send(());
+    let _ = server_task.await;
+}
+
+/// An idle session must not scan the outbox at a fixed rate.
+///
+/// The 1.0 uplink scanned every 2 ms, about five thousand times in ten
+/// seconds. The event-driven uplink scans only when a commit, a control frame
+/// or the PING wakes it, so ten idle seconds cost a few dozen scans.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_idle_uplink_does_not_poll_the_outbox() {
+    let dir = tempfile::tempdir().unwrap();
+    let (server, endpoint) = start_server(dir.path(), 1).await;
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+    let server_task = tokio::spawn(server.run_with_shutdown(async {
+        let _ = stop_rx.await;
+    }));
+
+    let ring = master().derive_psk_keyring(&PskSalt::DEFAULT).unwrap();
+    let client = spawn_client(dir.path(), "idle", &endpoint, &ring);
+    wait_applied(&client, 1, Duration::from_secs(30)).await;
+    let steady_deadline = Instant::now() + Duration::from_secs(10);
+    while client.gate.state() != State::Steady {
+        assert!(
+            !client.task.is_finished(),
+            "client exited before reaching steady"
+        );
+        assert!(
+            Instant::now() < steady_deadline,
+            "client never reached steady"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    // Let the last echo land before the idle window starts.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let before = client.db.outbox_scans();
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    let scans = client.db.outbox_scans().saturating_sub(before);
+    eprintln!("IDLE outbox scans in 10 s: {scans}");
+    assert!(
+        scans <= 60,
+        "an idle uplink scanned the outbox {scans} times in 10 s; the 2 ms poll is back"
+    );
+    assert!(!client.task.is_finished(), "the idle session exited");
+
+    let _ = client.shutdown.send(()).await;
+    let exit = client.task.await.unwrap();
+    assert_ne!(exit.code, 10, "client must not exit 10: {exit:?}");
+    let _ = stop_tx.send(());
+    let _ = server_task.await;
+}
+
+/// A commit wakes an idle uplink instead of waiting for a timer.
+///
+/// The deadline is shorter than both the one-second fallback and the PING
+/// interval, so only the outbox notifier can satisfy it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_commit_wakes_an_idle_uplink() {
+    let dir = tempfile::tempdir().unwrap();
+    let (server, endpoint) = start_server(dir.path(), 1).await;
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+    let server_task = tokio::spawn(server.run_with_shutdown(async {
+        let _ = stop_rx.await;
+    }));
+
+    let ring = master().derive_psk_keyring(&PskSalt::DEFAULT).unwrap();
+    let client = spawn_client(dir.path(), "wake", &endpoint, &ring);
+    wait_applied(&client, 1, Duration::from_secs(30)).await;
+    let steady_deadline = Instant::now() + Duration::from_secs(10);
+    while client.gate.state() != State::Steady {
+        assert!(
+            !client.task.is_finished(),
+            "client exited before reaching steady"
+        );
+        assert!(
+            Instant::now() < steady_deadline,
+            "client never reached steady"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    // Let the uplink enter its idle wait.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let scans_before = client.db.outbox_scans();
+
+    let started = Instant::now();
+    client
+        .db
+        .create_file(
+            ROOT_INO,
+            OsStr::new("wake"),
+            CreateAttrs::new(0o644, 1000, 1000),
+        )
+        .unwrap();
+    let deadline = Duration::from_millis(500);
+    while client.db.outbox_count(OutboxState::Pending).unwrap() != 0 {
+        assert!(
+            started.elapsed() < deadline,
+            "the uplink did not send the committed row within {deadline:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(
+        client.db.outbox_scans() > scans_before,
+        "the uplink sent the row without scanning the outbox"
+    );
+    eprintln!("WAKE committed row sent in {:?}", started.elapsed());
 
     let _ = client.shutdown.send(()).await;
     let exit = client.task.await.unwrap();

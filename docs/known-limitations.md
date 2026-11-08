@@ -1,9 +1,9 @@
 # Known limitations
 
-Status: normative design boundary for syncmount 1.0.0 (protocol 3.0, payload
-v3). This document states the guarantees the design makes, the guarantees it
-weakens, and the behaviour it refuses. It describes the design, not a
-particular build.
+Status: normative design boundary for syncmount 1.1.0. The 1.0 core keeps
+protocol 3.0 and payload v3; the 1.1 mm path uses SMM1. This document states
+the guarantees the design makes, the guarantees it weakens, and the behaviour
+it refuses. It describes the design, not a particular build.
 
 Where this document says **best effort**, the operation is accepted and does
 not fail because of the weak semantics. The result is whatever local execution
@@ -34,14 +34,17 @@ operation. A large write may be split into several wire operations.
 
 A `write` appends to a per-inode memory buffer and returns. The bytes are
 visible to local reads immediately, but they are volatile until the buffer is
-committed. A background thread commits the buffer as one client SQLite
-transaction that updates the replica and appends the matching outbox row,
-every 100 ms and whenever the soft buffer cap forces it. `flush`, `release`
-(close), `fsync`, `truncate`, a size-changing `setattr`, `unlink` and `rename`
-commit the affected buffer synchronously first; `create`, `mkdir`, `symlink`,
-`link`, `rmdir` and the namespace part of `unlink`/`rename` commit before the
-FUSE callback returns. The network is not consulted on the write path. There
-is no synchronous arbitration round trip.
+committed. The background writer is event driven: the first buffered write
+wakes it and arms one 100 ms commit deadline, and an idle buffer leaves it
+waiting on a condition variable with no timer. At the deadline it commits each
+dirty inode as one client SQLite transaction that updates the replica and
+appends the matching outbox row; the soft buffer cap can force an earlier
+commit.
+`flush`, `release` (close), `fsync`, `truncate`, a size-changing `setattr`,
+`unlink` and `rename` commit the affected buffer synchronously first;
+`create`, `mkdir`, `symlink`, `link`, `rmdir` and the namespace part of
+`unlink`/`rename` commit before the FUSE callback returns. The network is not
+consulted on the write path. There is no synchronous arbitration round trip.
 
 A crash loses every buffered write that was not committed. The window is at
 most one flush interval under normal load, or longer if the soft cap is
@@ -49,6 +52,13 @@ exceeded and the synchronous commit fails. The cap defaults to 64 MiB, logs
 one warning when crossed and never returns `ENOSPC`. A normal process exit
 commits the buffer. Reads consult the buffer before SQLite, so read-after-write
 is consistent inside the window; `stat` reports the buffered size.
+
+The outbox uplink is event driven. A commit publishes one notifier permit; the
+uplink also wakes when a control frame arrives or when its one-second
+PING/fallback deadline expires. Each pass sends at most one page of 64 outbox
+rows, coalesces adjacent writes within that page, and flushes the aggregate at
+the page boundary, so no aggregate waits for a timer. An idle session wakes
+about once a second.
 
 Operation boundaries are explicit. One FUSE write request is inserted
 atomically; coalesced requests may share a transaction, but each request is
@@ -146,6 +156,10 @@ A reconnect above `applied_seq == 0` replays the server's event log from
 `applied_seq + 1`. A different epoch normally clears the replica tables,
 resets `applied_seq` to zero and replays the compacted log from the beginning;
 pending outbox rows survive the reset and are sent after the replay.
+
+The downlink applies at most 64 events or 4 MiB per transaction. It drains the
+frames already queued, then arms one 2 ms quiet-window timer only while a batch
+is pending; an idle stream blocks on `recv` rather than polling.
 
 The exception is a drained client whose durable epoch is the one before the
 compaction and whose `applied_seq` equals the pre-compaction sequence. Its
@@ -377,7 +391,7 @@ set the practical envelope.
 | Event log growth | Events accumulate until a graceful shutdown compacts them. A long-running server needs disk headroom for the log plus the live tree. |
 | Whole-file buffering | `PWRITE` and `TRUNCATE` need the complete post-operation file bytes. The server refuses a result above 4 GiB. |
 | Payload ceiling | One wire write aggregate and one event payload are capped at 4 MiB. A larger write is split by the client. |
-| Coalescing | Adjacent writes are merged up to 128 KiB immediately, a 2 ms quiet window, or a 5 ms hard ceiling. Without coalescing, small random writes can saturate one HTTP/1.1 connection. |
+| Coalescing | Adjacent writes in one outbox page are merged into an aggregate of at most 4 MiB; an aggregate is sent as soon as it reaches 128 KiB, and the rest is flushed at the page boundary. No timer is involved. Without coalescing, small random writes can saturate one HTTP/1.1 connection. |
 | Path depth | `PATH_MAX` (4096 bytes) is the real limit; deep-tree optimisation is not attempted. |
 
 The reference deployment has 12 clients and a design point of about one
@@ -509,8 +523,8 @@ These are scope exclusions, not bugs and not promises:
   credentials;
 - per-client ACLs, roles or read restrictions;
 - the v1 join and identity machinery (removed);
-- delta transfer, bulk tree install and incremental catch-up
-  beyond the event log;
+- delta transfer on the 1.0 path (the 1.1 mm path has rsync COPY/LITERAL);
+  bulk tree install and incremental catch-up beyond the event log;
 - offline mode, local-wins merge, journal replay or pending-operation replay;
 - independent fsck or content-level verification tools;
 - multi-tenant or multi-cluster routing (one process, one namespace);
@@ -525,7 +539,66 @@ These are scope exclusions, not bugs and not promises:
 - files above 4 GiB or wire payloads above 4 MiB;
 - built-in encryption at rest.
 
-## 7. User notice
+## 7. 1.1 mmap namespaces
+
+The `mm-server` and `mm-client` commands are a second design boundary. They
+use their own SQLite schema, the SMM1 protocol and a local shadow tree, and
+never read or write a 1.0 database, event log or mountpoint. The
+`/private-mm` and `/public-mm` namespaces can run beside 1.0 on one host.
+
+### 7.1 Per-directory uploads
+
+The unit of upload is one canonical directory. `fsync` acquires a server lock
+for that directory, sends a full direct-entry manifest plus rsync
+COPY/LITERAL instructions and commits the whole batch in one
+`BEGIN IMMEDIATE` transaction. Two clients cannot upload the same directory at
+once. Different directories can proceed in parallel, but the single SQLite
+writer serialises their commits. A directory rename or removal checks the lock
+prefixes of its subtree.
+
+`flush` and `close` do not upload. A `409` (base changed) or `423` (lock held,
+lost or expired) maps to `EAGAIN`; the dirty generations and batch id survive
+and the next `fsync` retries. There is no in-call retry and no automatic
+backoff. A committed batch is never replayed: a repeated `upload/begin`
+returns `409 BATCH_COMMITTED`, and the result comes from `GET batch/{id}`.
+
+### 7.2 POSIX surface
+
+- Hard links are not supported. `link` returns `EOPNOTSUPP`; one inode has one
+  name.
+- A rename between directories returns `EXDEV`. A rename inside one directory,
+  including replace and a same-directory directory rename, is supported.
+  `RENAME_EXCHANGE` returns `EOPNOTSUPP`.
+- Names must be valid UTF-8. A non-UTF-8 name returns `EINVAL`. The 255-byte
+  component and 4096-byte path limits still apply.
+- `setxattr` and `removexattr` return `EOPNOTSUPP`. POSIX record locks are
+  served by the daemon; `flock` is local to one mount.
+- `mmap(MAP_SHARED)` is the supported path. Writeback goes through the shadow
+  objects and is uploaded by `fsync`.
+
+### 7.3 Consistency and recovery
+
+A checkout returns `(epoch, dir_seq, dir_version)` and the direct entries of
+one directory. A write is visible locally at once; `fsync` publishes it. A
+client can hold a stale base after another client commits; the next `fsync`
+gets `409`, keeps the dirty state and retries from a fresh checkout.
+
+Uploads spool to the server before the commit. A failed commit leaves the
+server tree unchanged (full rollback) and the client keeps its dirty state. A
+lost BEGIN or COMMIT response is resolved with `GET batch/{id}`: committed
+adopts the result, open resends once, aborted generates a new batch id on the
+next `fsync`. A full spool disk fails the request; the tree is unchanged.
+
+### 7.4 Limits
+
+One SMM1 meta frame is capped at 16 MiB, one `FILE_READ` range at 8 MiB, one
+file at 4 GiB, one directory batch at 100,000 entries and 64 GiB, and one file
+at 1,048,576 rsync blocks. A signature list above the meta cap must be split
+per file or fall back to FULL. One process serves one namespace; there is no
+cross-namespace transaction, no HA and no multi-tenant routing. Both processes
+speak plain HTTP.
+
+## 8. User notice
 
 > syncmount is a server-authoritative, eventually consistent filesystem, not
 > a POSIX filesystem, not an ACID store and not an end-to-end encrypted

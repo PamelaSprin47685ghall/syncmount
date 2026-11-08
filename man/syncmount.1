@@ -1,4 +1,4 @@
-.TH SYNCMOUNT 1 "2026-11-08" "syncmount 1.0.0" "User Commands"
+.TH SYNCMOUNT 1 "2026-11-08" "syncmount 1.1.0" "User Commands"
 .SH NAME
 syncmount \- server-authoritative, eventually consistent FUSE filesystem
 .SH SYNOPSIS
@@ -13,6 +13,18 @@ syncmount \- server-authoritative, eventually consistent FUSE filesystem
 .B server
 .I URL
 .RI [ server-options ]
+.br
+.B syncmount
+.RI [ options ]
+.B mm-client
+.I URL MOUNTPOINT
+.RI [ mm-client-options ]
+.br
+.B syncmount
+.RI [ options ]
+.B mm-server
+.I URL
+.RI [ mm-server-options ]
 .br
 .B syncmount
 .RI [ options ]
@@ -58,11 +70,20 @@ mounts one namespace as a local directory.
 The server owns the authoritative tree, assigns a total order, appends an
 event log and streams that log to every client.
 A client keeps a full SQLite replica. A write buffers in memory and returns;
-a background commit every 100 ms, or flush, close, fsync, truncate, a
-size-changing setattr, unlink or rename, writes it to the replica and the
-durable outbox. Namespace operations commit before returning.
+a background writer wakes on the first buffered write and commits it at a
+100 ms deadline, or on flush, close, fsync, truncate, a size-changing setattr,
+unlink or rename, to the replica and the durable outbox. Namespace operations
+commit before returning. The writer waits on a condition variable while the
+buffer is idle, so an idle buffer does not poll.
 The mountpoint is a view over the replica database; it is not a backing
 directory.
+.PP
+The I/O paths are event driven. A commit notifies the outbox uplink; a control
+frame or the one-second PING deadline also wakes it. It sends at most one page
+of 64 rows per pass and flushes a coalesced write aggregate at the page
+boundary, so no aggregate waits for a timer. The downlink applies at most
+64 events or 4 MiB per transaction and arms one 2 ms quiet-window timer only
+while a batch is pending. An idle client wakes about once a second.
 .PP
 The server and every client derive the same pre-shared key from one master
 password with Argon2id and HKDF-SHA256.
@@ -156,6 +177,43 @@ or
 The server requires the master password even though it never sends it: it
 decrypts operations, plans them against the authoritative state and stores
 plaintext file data.
+.TP
+.B mm-client \fIURL MOUNTPOINT\fR
+Mount one 1.1 mmap namespace over a local shadow tree and run until unmounted
+or interrupted.
+The URL prefix must be
+.B /private-mm
+or
+.BR /public-mm ;
+.B /private
+and
+.B /public
+are 1.0 namespaces and are refused.
+An empty prefix selects
+.BR /private-mm .
+The scheme must be
+.BR http .
+.I MOUNTPOINT
+must be an existing absolute directory.
+The client keeps objects, versions and upload state under
+.B \-\-shadow\-dir
+and does not read or write a 1.0 client database.
+The key is the raw 32-byte mm key, not the 1.0 master password.
+.TP
+.B mm-server \fIURL\fR
+Run one 1.1 mmap namespace server.
+The URL path is the namespace and must match the clients; the host and port
+are ignored.
+Each namespace needs its own process, SQLite database
+.RB ( \-\-db )
+and upload spool
+.RB ( \-\-spool\-dir ).
+The server commits one directory batch per transaction, holds per-directory
+upload locks and serves
+.B {prefix}/mm/v1/*
+plus
+.BR /__syncmount/healthz .
+It speaks plain HTTP/1.1.
 .TP
 .B import \fB\-\-from\fR \fIDIR\fR
 Import an existing POSIX directory tree into a client database without
@@ -314,6 +372,61 @@ the event log and the replay sidecar.
 Read the master password from
 .IR PATH .
 The same ownership and mode rules as the client apply.
+.SS mm client
+.TP
+.BI \-\-shadow\-dir " DIR"
+Required.
+Local store for objects, versions, dirty generations and upload state.
+The directory is created when absent.
+Back up the whole directory; it may contain uncommitted data.
+.TP
+.BI \-\-key\-file " PATH"
+Read the mm key from
+.IR PATH .
+The file must be a regular file, owned by the current effective user and mode
+0600.
+It holds either 32 raw bytes or 64 hexadecimal characters.
+The server and every client of one namespace must hold the same bytes.
+.B SYNCMOUNT_MM_KEY
+provides the key when the option is absent.
+.TP
+.B \-\-allow\-other
+Allow every local user to access the mount; requires
+.B user_allow_other
+in
+.IR /etc/fuse.conf .
+.SS mm server
+.TP
+.BI \-\-listen " ADDR"
+Bind
+.IR ADDR .
+Default:
+.B 127.0.0.1:8080
+or
+.BR SYNCMOUNT_MM_LISTEN .
+.TP
+.BI \-\-db " PATH"
+Server SQLite database.
+Default:
+.B SYNCMOUNT_MM_DB
+if set, otherwise
+.B mm-server.db
+in the current directory.
+.TP
+.BI \-\-spool\-dir " DIR"
+Per-batch upload spool.
+Default:
+.B SYNCMOUNT_MM_SPOOL
+if set, otherwise
+.B mm-spool
+in the current directory.
+The spool must have room for the largest batch; a full disk returns 507.
+.TP
+.BI \-\-key\-file " PATH"
+Read the mm key from
+.IR PATH ,
+with the same rules as
+.BR mm-client .
 .SS Import
 .TP
 .BI \-\-from " DIR"
@@ -771,6 +884,41 @@ A new password derives a new namespace id and requires new databases.
 There is one server process per namespace and no high availability.
 The server can delay, drop, duplicate or reorder frames; clients detect their
 own sequence gaps and epoch changes, but cannot prove a cross-client reorder.
+.PP
+The 1.1 mmap path has its own limits.
+Uploads of one canonical directory are serialised by a server lock; different
+directories can proceed in parallel, but one SQLite writer serialises their
+commits.
+A conflict
+.RB ( 409
+base changed, or
+.B 423
+lock held, lost or expired) is returned to the caller as
+.B EAGAIN
+with the dirty state intact; the next
+.B fsync
+retries it.
+.B flush
+and
+.B close
+do not upload.
+Hard links are refused with
+.BR EOPNOTSUPP .
+A rename between directories returns
+.BR EXDEV ;
+rename inside one directory, including replace, is supported, and
+.B RENAME_EXCHANGE
+returns
+.BR EOPNOTSUPP .
+A non-UTF-8 name returns
+.BR EINVAL .
+Extended attributes are refused with
+.BR EOPNOTSUPP .
+The 1.0
+.B /private
+and
+.B /public
+paths, their units, databases and options are unchanged.
 .PP
 The full semantic boundary is in
 .I docs/known-limitations.md

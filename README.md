@@ -4,12 +4,12 @@ Server-authoritative, eventually consistent FUSE filesystem backed by SQLite.
 
 One binary is both the client and the server. A client mounts a namespace as a
 local directory, buffers each write in memory and returns, and synchronises
-through a durable outbox. A background thread commits the buffer to its own
-SQLite database and the outbox within 100 ms, or sooner on flush, fsync, close
-or a namespace operation. The server owns the authoritative tree, assigns one
-total order, appends an event log and streams that log to every client. A
-client's mountpoint is a view over its replica database; it is not a backing
-directory.
+through a durable outbox. A background writer wakes on the first buffered write
+and commits the buffer to its own SQLite database and the outbox within 100 ms,
+or sooner on flush, fsync, close or a namespace operation; an idle buffer does
+not poll. The server owns the authoritative tree, assigns one total order,
+appends an event log and streams that log to every client. A client's
+mountpoint is a view over its replica database; it is not a backing directory.
 
 **This is not end-to-end encryption.** The server holds the master password,
 decrypts every operation, applies it to a plaintext SQLite database and serves
@@ -46,15 +46,23 @@ and the next session resends them.
 
 ## Status
 
-v1.0.0, protocol 3.0, payload v3. 1.0.0 is a clean break from every earlier
-release: there is no supported mixed-version cluster. Protocol 1.0 and 2.0
-peers are rejected during negotiation. Payload v1 and v2 records remain
-decodable, but an older binary cannot read a v3 record.
+v1.1.0, protocol 3.0, payload v3. The 1.0 wire protocol, schema and
+`/private` and `/public` behaviour are unchanged; 1.1 adds the independent
+`--mmap` namespaces (`/private-mm`, `/public-mm`) served by `mm-server` and
+mounted by `mm-client` over a local shadow tree. 1.0 and 1.1 can share a host
+and one reverse proxy because they use different paths, ports and databases.
+Within the 1.0 core, protocol 3.0 is a clean break from every earlier release:
+there is no supported mixed-version cluster. Protocol 1.0 and 2.0 peers are
+rejected during negotiation. Payload v1 and v2 records remain decodable, but
+an older binary cannot read a v3 record.
 
 The current implementation covers the shared SQLite store, the server
 sequencer and event log, the PSK handshake, the FUSE-over-SQLite client, the
 durable outbox, deterministic replay, import, drain/compaction and the 12-host
-reference deployment.
+reference deployment. The 1.1 mmap path adds an independent mm schema, the
+SMM1 protocol, rsync deltas, per-directory upload locks, a streaming upload
+spool and a FUSE-over-shadow client; it does not read or write the 1.0
+databases.
 
 ## Upgrade to 1.0.0
 
@@ -187,6 +195,8 @@ id and new databases.
 |---|---|
 | `syncmount client URL MOUNTPOINT` | Mount the replica and run until unmounted, a signal arrives, or the reconnect budget is exhausted. |
 | `syncmount server URL` | Run the authoritative sequencer; `--listen`/`--port` choose the bind address. |
+| `syncmount mm-client URL MOUNTPOINT` | Mount one 1.1 mmap namespace over a local shadow tree. |
+| `syncmount mm-server URL` | Run one 1.1 mmap namespace server (separate database and spool). |
 | `syncmount import --from DIR` | Import a POSIX tree into a client database without mounting it. |
 | `syncmount status [--json]` | Read the per-mount status file under the runtime base (default `/run/syncmount`). |
 | `syncmount debug-state` | Print the full published status document. |
@@ -212,6 +222,19 @@ seed outbox events now), and `--key-file PATH`. An import is idempotent; run it
 on a quiescent tree before the first client start, then let that client seed
 the empty server. All clients of one namespace must import the same tree.
 
+mm-client options: `--shadow-dir DIR` (required; local object and metadata
+store), `--key-file PATH` (raw 32-byte or 64-hex mm key; else
+`SYNCMOUNT_MM_KEY`), `--allow-other`. The URL prefix must be `/private-mm` or
+`/public-mm`; the client rejects `/private` and `/public`, because those are
+1.0 namespaces. An empty prefix selects `/private-mm`.
+
+mm-server options: `--listen ADDR` (default `127.0.0.1:8080`, or
+`SYNCMOUNT_MM_LISTEN`), `--db PATH` (default `mm-server.db`, or
+`SYNCMOUNT_MM_DB`), `--spool-dir DIR` (default `mm-spool`, or
+`SYNCMOUNT_MM_SPOOL`), `--key-file PATH`. The URL path is the namespace and
+must match the clients; its host and port are ignored. Run one process,
+database and spool directory per namespace.
+
 Exit status: `0` success, `1` usage error detected by syncmount (the refused
 `--key`, an invalid URL or listen address), `2` argument parsing failure (for
 example an unknown option or missing value; clap exits 2) or startup failure,
@@ -220,6 +243,58 @@ authentication failure (wrong master password), `10` disconnected after the
 reconnect budget was exhausted or after a terminal kick. A systemd unit should
 use `Restart=always`, list `2` and `4` in `RestartPreventExitStatus`, and set
 `StartLimitIntervalSec=0`; see the SYSTEMD section of `man/syncmount.1`.
+
+## mmap namespaces (1.1)
+
+`mm-server` and `mm-client` are a second, independent path. They use their own
+SQLite schema, the SMM1 protocol and a local shadow tree; they never read or
+write a 1.0 database, event log or mountpoint. Both paths can run on the same
+host and share one reverse proxy.
+
+```bash
+syncmount mm-server http://127.0.0.1:8083/private-mm \
+  --listen 127.0.0.1:8083 --db /var/lib/syncmount-mm/private-mm/server.db \
+  --spool-dir /var/lib/syncmount-mm/private-mm/spool \
+  --key-file /etc/syncmount/mm.key
+
+syncmount mm-client http://sync.example.com/private-mm /private-mm \
+  --shadow-dir /var/lib/syncmount-mm-client/private-mm \
+  --key-file /etc/syncmount/mm-client.key
+```
+
+The key is 32 raw bytes or 64 hex characters; the server and every client of
+one namespace must hold the same bytes. The URL prefix is the namespace and
+must be `/private-mm` or `/public-mm` (an empty prefix means `/private-mm`);
+`/private` and `/public` are refused because they belong to 1.0. Both
+processes speak plain HTTP, so terminate TLS in front of the listener. The
+server needs `--spool-dir` for per-batch uploads. The client keeps objects,
+versions and upload state under `--shadow-dir` and needs an existing absolute
+mountpoint.
+
+A checkout returns the `(epoch, dir_seq, dir_version)` base plus the direct
+entries of one directory. A write stays local. `fsync` acquires the
+per-directory upload lock, asks for rsync signatures, sends COPY/LITERAL
+instructions and commits the whole directory batch in one server transaction.
+A `409` (base changed) or `423` (lock held, lost or expired) maps to `EAGAIN`,
+keeps the dirty generations, and is retried on the next `fsync`; `flush` and
+`close` do not upload.
+
+Limitations specific to the mm path:
+
+- **One uploader per directory.** Uploads of one canonical directory are
+  serialised by a server lock. Different directories can proceed in parallel,
+  but the single SQLite writer serialises their commits.
+- **No hard links.** `link` returns `EOPNOTSUPP`; each inode has one name.
+- **No cross-directory rename.** A rename between directories returns
+  `EXDEV`. A rename inside one directory, including replace, is supported;
+  `RENAME_EXCHANGE` returns `EOPNOTSUPP`.
+- **UTF-8 names only.** A non-UTF-8 name returns `EINVAL`. The 255-byte
+  component and 4096-byte path limits of 1.0 still apply.
+- **No xattrs.** `setxattr` and `removexattr` return `EOPNOTSUPP`.
+- **Conflicts are retried later.** A `409` or `423` is not retried inside the
+  failing call. The dirty state survives and the next `fsync` retries it.
+- **1.0 is untouched.** `/private`, `/public`, their units, databases and
+  options keep their 1.0 behaviour; the mm path is opt-in by command name.
 
 ## Deployment
 
@@ -329,10 +404,12 @@ the same `SYNCMOUNT_RUN_DIR` when running `syncmount status`.
 
 Every mutation is local-first. A `write` appends to a per-inode memory
 buffer and returns; the bytes are visible to local reads at once, but SQLite
-has not seen them yet. A background thread commits each dirty inode as one
-SQLite transaction that updates the object row, the full chunk list, the size
-and the matching outbox row, every 100 ms and whenever the soft buffer cap
-forces it. `flush`, `release` (close), `fsync`, `truncate`, a size-changing
+has not seen them yet. A background writer wakes on the first buffered write
+and commits each dirty inode as one SQLite transaction that updates the object
+row, the full chunk list, the size and the matching outbox row, at a 100 ms
+deadline or earlier when the soft buffer cap forces it. It waits on a
+condition variable while the buffer is idle, so there is no fixed polling
+tick. `flush`, `release` (close), `fsync`, `truncate`, a size-changing
 `setattr`, `unlink` and `rename` commit the affected buffer synchronously
 first; `create`, `mkdir`, `symlink`, `link` and `rmdir` commit before
 returning. There is no synchronous arbitration round trip. Reads use the
@@ -358,6 +435,14 @@ commits the buffer. The soft cap defaults to 64 MiB and only forces an early
 commit; it never turns a local write into `ENOSPC`. The outbox row is created
 at commit, so its sequence order matches the SQLite transaction and a
 namespace operation always follows the writes it covers.
+
+The I/O paths are event driven. The outbox uplink wakes when a commit publishes
+a notifier permit, when a control frame arrives, or when the one-second
+PING/fallback deadline expires; it sends at most one page of 64 rows per pass
+and flushes a coalesced write aggregate at the page boundary, so no aggregate
+waits for a timer. The downlink applies at most 64 events or 4 MiB per
+transaction and arms one 2 ms quiet-window timer only while a batch is pending.
+An idle client wakes about once a second.
 
 The outbox row moves through four states:
 
@@ -586,7 +671,7 @@ CI asserts a size below 15 MiB and no `NEEDED` entries. See
 
 ```bash
 ./install.sh                      # latest release into ~/.local/bin
-./install.sh --version 1.0.0 --prefix /usr/local
+./install.sh --version 1.1.0 --prefix /usr/local
 ```
 
 The script downloads the tarball, verifies its sha256, installs the binary and

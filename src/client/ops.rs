@@ -474,6 +474,7 @@ impl ClientDb {
             Self::commit_buffered_in_tx(&tx, *ino, buffer)?;
         }
         tx.commit()?;
+        self.wake_uplink();
         Ok(())
     }
 

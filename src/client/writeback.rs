@@ -1,9 +1,17 @@
 //! Userspace write-back buffer for the FUSE view.
 //!
 //! A `write` callback appends to a per-inode buffer and returns. The buffer is
-//! committed to SQLite by [`WriteBuffer::commit`], which runs on a background
-//! thread every [`WritebackConfig::flush_interval`] and synchronously from
-//! `flush`, `fsync`, `release` and every namespace mutation.
+//! committed to SQLite by [`WriteBuffer::commit`]. A synchronous commit comes
+//! from `flush`, `fsync`, `release` and every namespace mutation; otherwise a
+//! background thread commits within one [`WritebackConfig::flush_interval`].
+//!
+//! # Wake-up
+//!
+//! The background thread is event driven. A buffered write wakes it, and it
+//! sets one commit deadline [`WritebackConfig::flush_interval`] later. It then
+//! waits on a condition variable. An idle buffer produces no wake-up, so the
+//! thread does not poll. `stop` wakes the thread, and the thread returns at
+//! once.
 //!
 //! # Why userspace
 //!
@@ -32,9 +40,9 @@
 //! documented in `README.md` and `docs/known-limitations.md`.
 
 use std::collections::{BTreeMap, HashMap};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{
-    Arc, Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard, Weak,
+    Arc, Condvar, Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard, Weak,
 };
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -56,7 +64,7 @@ pub const DEFAULT_MAX_BYTES: usize = 64 * 1024 * 1024;
 /// Tuning for the write-back buffer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WritebackConfig {
-    /// Delay between background commits.
+    /// Maximum delay between a buffered write and its background commit.
     pub flush_interval: Duration,
     /// Soft cap on buffered bytes.
     pub max_bytes: usize,
@@ -285,12 +293,28 @@ impl State {
     }
 }
 
+/// Wake-up state shared with the background committer.
+///
+/// `dirty` means that a buffered write may not be in SQLite yet. `insert` sets
+/// it, and a failed commit sets it again. A successful commit clears it only
+/// when `generation` did not change during the commit, so a write that arrives
+/// while the commit runs cannot lose its wake-up. `stopped` ends the thread.
+#[derive(Debug, Default)]
+struct WaitState {
+    dirty: bool,
+    stopped: bool,
+    generation: u64,
+}
+
 /// The write-back buffer.
 pub(crate) struct WriteBuffer {
     state: RwLock<State>,
     commit: Mutex<()>,
+    /// Wake-up state for the background committer. The thread owns clones of
+    /// both `wait` and `wake`, so it can sleep without an `Arc<ClientDb>`.
+    wait: Arc<Mutex<WaitState>>,
+    wake: Arc<Condvar>,
     config: WritebackConfig,
-    stop: Arc<AtomicBool>,
     thread: Mutex<Option<JoinHandle<()>>>,
     peak: AtomicU64,
     commits: AtomicU64,
@@ -314,8 +338,9 @@ impl WriteBuffer {
         Self {
             state: RwLock::new(State::default()),
             commit: Mutex::new(()),
+            wait: Arc::new(Mutex::new(WaitState::default())),
+            wake: Arc::new(Condvar::new()),
             config: config.normalized(),
-            stop: Arc::new(AtomicBool::new(false)),
             thread: Mutex::new(None),
             peak: AtomicU64::new(0),
             commits: AtomicU64::new(0),
@@ -349,6 +374,53 @@ impl WriteBuffer {
         self.commit.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    fn wait_state(&self) -> MutexGuard<'_, WaitState> {
+        self.wait.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Current dirty generation, taken before a commit. [`Self::settle_dirty`]
+    /// clears the flag only when this value is still current.
+    fn dirty_generation(&self) -> u64 {
+        self.wait_state().generation
+    }
+
+    /// Mark buffered data as pending and wake the background committer.
+    ///
+    /// The wake-up is sent only on a clean-to-dirty transition. When `dirty`
+    /// is already set, the thread has already seen the work, or it will see it
+    /// at its armed deadline. Extra wake-ups would only make it recheck sooner.
+    fn mark_dirty(&self) {
+        let mut wait = self.wait_state();
+        let was_dirty = wait.dirty;
+        wait.dirty = true;
+        wait.generation = wait.generation.wrapping_add(1);
+        drop(wait);
+        if !was_dirty {
+            self.wake.notify_one();
+        }
+    }
+
+    /// Clear `dirty` after a successful commit.
+    ///
+    /// The flag stays set when data is still buffered, or when a write arrived
+    /// after `generation` was taken. In both cases the next commit owns the
+    /// remaining work.
+    fn settle_dirty(&self, generation: u64) {
+        // Read and release the state lock first: the wait lock must never nest
+        // with the state lock.
+        let leftover = {
+            let state = self.read_state();
+            !state.dirty.is_empty() || !state.committing.is_empty()
+        };
+        if leftover {
+            return;
+        }
+        let mut wait = self.wait_state();
+        if wait.generation == generation {
+            wait.dirty = false;
+        }
+    }
+
     /// Append one write. Returns `true` when the soft cap is exceeded.
     pub(crate) fn insert(&self, ino: Ino, off: u64, data: &[u8]) -> bool {
         let mut state = self.write_state();
@@ -359,6 +431,11 @@ impl WriteBuffer {
         state.bytes = state.bytes.saturating_sub(before).saturating_add(after);
         let bytes = state.bytes;
         drop(state);
+        // Wake after the state lock is released, so the wait lock never nests
+        // with the state lock.
+        if !data.is_empty() {
+            self.mark_dirty();
+        }
         self.peak.fetch_max(bytes as u64, Ordering::Relaxed);
         bytes > self.config.max_bytes
     }
@@ -389,11 +466,12 @@ impl WriteBuffer {
             return;
         }
         let weak = Arc::downgrade(db);
-        let stop = Arc::clone(&self.stop);
+        let wait = Arc::clone(&self.wait);
+        let wake = Arc::clone(&self.wake);
         let interval = self.config.flush_interval;
         match std::thread::Builder::new()
             .name("syncmount-writeback".to_owned())
-            .spawn(move || writeback_loop(weak, stop, interval))
+            .spawn(move || writeback_loop(weak, wait, wake, interval))
         {
             Ok(handle) => *slot = Some(handle),
             Err(error) => {
@@ -407,8 +485,14 @@ impl WriteBuffer {
     }
 
     /// Stop and join the background committer.
+    ///
+    /// The thread wakes at once, even when it waits for a commit deadline.
     pub(crate) fn stop(&self) {
-        self.stop.store(true, Ordering::Relaxed);
+        {
+            let mut wait = self.wait_state();
+            wait.stopped = true;
+        }
+        self.wake.notify_all();
         let handle = {
             let mut slot = self.thread.lock().unwrap_or_else(PoisonError::into_inner);
             slot.take()
@@ -439,7 +523,24 @@ impl WriteBuffer {
     ///
     /// `only = None` commits every inode. A failed inode stays in
     /// `committing` and is retried by the next call; the others still commit.
+    ///
+    /// The wake-up flag is settled after [`Self::commit_locked`] releases the
+    /// commit guard and the state lock, so the wait lock never nests with
+    /// either of them.
     fn commit(&self, db: &ClientDb, only: Option<Ino>) -> Result<(), DbError> {
+        // Taken before the commit starts: every write that arrives later
+        // raises the generation, so this commit cannot clear its pending flag.
+        let generation = self.dirty_generation();
+        let result = self.commit_locked(db, only);
+        match &result {
+            Ok(()) => self.settle_dirty(generation),
+            Err(_) => self.mark_dirty(),
+        }
+        result
+    }
+
+    /// The body of [`Self::commit`], with the commit guard held.
+    fn commit_locked(&self, db: &ClientDb, only: Option<Ino>) -> Result<(), DbError> {
         let _guard = self.commit_guard();
         {
             let mut state = self.write_state();
@@ -534,6 +635,10 @@ impl WriteBuffer {
         state.dirty.clear();
         state.committing.clear();
         state.bytes = 0;
+        drop(state);
+        let mut wait = self.wait_state();
+        wait.dirty = false;
+        wait.generation = wait.generation.wrapping_add(1);
     }
 }
 
@@ -546,31 +651,73 @@ fn is_discardable(error: &DbError) -> bool {
     )
 }
 
-/// Background loop: commit every interval until stopped.
-fn writeback_loop(db: Weak<ClientDb>, stop: Arc<AtomicBool>, interval: Duration) {
-    let mut next = Instant::now() + interval;
+/// Wait on `wake` until a notification, `stopped`, or `timeout` elapses.
+///
+/// `None` is an infinite wait; `Condvar::wait` is the std form of
+/// `wait_timeout(None)`. The caller re-checks [`WaitState`] after every return.
+fn wait_for<'a>(
+    wake: &Condvar,
+    guard: MutexGuard<'a, WaitState>,
+    timeout: Option<Duration>,
+) -> MutexGuard<'a, WaitState> {
+    match timeout {
+        Some(timeout) => {
+            wake.wait_timeout(guard, timeout)
+                .unwrap_or_else(PoisonError::into_inner)
+                .0
+        }
+        None => wake.wait(guard).unwrap_or_else(PoisonError::into_inner),
+    }
+}
+
+/// Background loop: commit one interval after a write, then sleep.
+///
+/// The thread holds no `Arc<ClientDb>` while it waits, so it cannot keep the
+/// database alive. It wakes for three reasons only: a write, the commit
+/// deadline, or [`WriteBuffer::stop`]. An idle buffer sleeps without a timer,
+/// so it produces no wake-up and no commit.
+fn writeback_loop(
+    db: Weak<ClientDb>,
+    wait: Arc<Mutex<WaitState>>,
+    wake: Arc<Condvar>,
+    interval: Duration,
+) {
+    let mut deadline: Option<Instant> = None;
     loop {
-        if stop.load(Ordering::Relaxed) {
+        let guard = wait.lock().unwrap_or_else(PoisonError::into_inner);
+        if guard.stopped {
             return;
         }
-        let now = Instant::now();
-        if now >= next {
-            let Some(db) = db.upgrade() else {
-                return;
-            };
-            if let Err(error) = db.commit_pending() {
-                tracing::warn!(
-                    event = "writeback_commit",
-                    error = %error,
-                    "background write-back commit failed; will retry"
-                );
-            }
-            drop(db);
-            next = Instant::now() + interval;
-        } else {
-            let wait = (next - now).min(Duration::from_millis(10));
-            std::thread::sleep(wait);
+        if !guard.dirty {
+            // Nothing to commit. Wait for `insert` or `stop`; no timer runs.
+            deadline = None;
+            drop(wait_for(wake.as_ref(), guard, None));
+            continue;
         }
+        let now = Instant::now();
+        let due = *deadline.get_or_insert(now + interval);
+        if now < due {
+            drop(wait_for(wake.as_ref(), guard, Some(due - now)));
+            continue;
+        }
+        // The deadline is spent. Clear it before the commit, so a failure
+        // waits one full interval before the retry instead of spinning.
+        deadline = None;
+        drop(guard);
+        let Some(db) = db.upgrade() else {
+            return;
+        };
+        if let Err(error) = db.commit_pending() {
+            tracing::warn!(
+                event = "writeback_commit",
+                error = %error,
+                "background write-back commit failed; will retry"
+            );
+        }
+        drop(db);
+        // `commit` clears `dirty` on success and sets it again on failure. A
+        // write that arrives during the commit keeps it set. The next
+        // iteration reads the result under the wait lock.
     }
 }
 
@@ -1123,6 +1270,101 @@ mod tests {
         }
         db.stop_writeback();
         assert_eq!(db.read_at(object.ino, 0, 5).unwrap(), b"timer");
+    }
+
+    fn open_shared(interval: Duration) -> (tempfile::TempDir, Arc<ClientDb>) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(
+            ClientDb::open_with_writeback(
+                dir.path().join("client.db"),
+                [7u8; 16],
+                WritebackConfig {
+                    flush_interval: interval,
+                    ..WritebackConfig::default()
+                },
+            )
+            .unwrap(),
+        );
+        (dir, db)
+    }
+
+    #[test]
+    fn a_buffered_write_commits_only_after_the_interval() {
+        let (_dir, db) = open_shared(Duration::from_millis(500));
+        db.start_writeback();
+        let object = file(&db, "f");
+        db.write_at(object.ino, 0, b"later").unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(
+            db.writeback_stats().commits,
+            0,
+            "the background thread must wait for the flush interval"
+        );
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while db.writeback_stats().commits == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "the background thread did not commit after the interval"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        db.stop_writeback();
+        assert_eq!(db.read_at(object.ino, 0, 5).unwrap(), b"later");
+        assert_eq!(db.outbox_count(OutboxState::Pending).unwrap(), 2);
+    }
+
+    #[test]
+    fn an_idle_buffer_stops_without_waiting_for_the_interval() {
+        let (_dir, db) = open_shared(Duration::from_secs(60));
+        db.start_writeback();
+        let started = Instant::now();
+        db.stop_writeback();
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "stop must wake the idle thread and not wait for the interval"
+        );
+    }
+
+    #[test]
+    fn an_idle_background_thread_does_not_commit_periodically() {
+        let (_dir, db) = open_shared(Duration::from_millis(20));
+        db.start_writeback();
+        // Five intervals without a write. The thread must stay asleep.
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(
+            db.writeback_stats().commits,
+            0,
+            "an idle buffer has nothing to commit"
+        );
+        let object = file(&db, "f");
+        db.write_at(object.ino, 0, b"once").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while db.writeback_stats().commits == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "the buffered write was not committed"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let commits = db.writeback_stats().commits;
+        // After the queue drains, no periodic commit may run.
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(
+            db.writeback_stats().commits,
+            commits,
+            "an idle background thread must not commit on a timer"
+        );
+        // A write after the idle period must wake the thread again.
+        db.write_at(object.ino, 4, b"twice").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while db.writeback_stats().commits <= commits {
+            assert!(
+                Instant::now() < deadline,
+                "a later write did not wake the background thread"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        db.stop_writeback();
     }
 
     #[test]
