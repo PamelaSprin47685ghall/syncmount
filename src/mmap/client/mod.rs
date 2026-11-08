@@ -648,6 +648,28 @@ impl MmRemote for MmHttpClient {
     ) -> Result<crate::mmap::shadow::FileData, RemoteError> {
         self.file_read_endpoint(request)
     }
+
+    fn batch_status(
+        &self,
+        batch_id: crate::mmap::types::BatchId,
+    ) -> Result<crate::mmap::shadow::BatchStatus, RemoteError> {
+        let status = MmHttpClient::batch_status(self, batch_id)?;
+        Ok(crate::mmap::shadow::BatchStatus {
+            batch_id: status.batch_id,
+            state: match status.state {
+                crate::mmap::proto::BatchState::Open => crate::mmap::shadow::BatchState::Open,
+                crate::mmap::proto::BatchState::Committed => {
+                    crate::mmap::shadow::BatchState::Committed
+                }
+                crate::mmap::proto::BatchState::Aborted => crate::mmap::shadow::BatchState::Aborted,
+            },
+            snapshot_seq: status.snapshot_seq,
+            base_seq_after: status.base_seq_after,
+            dir_version_after: status.dir_version_after,
+            manifest_hash: status.manifest_hash,
+            dir_path: status.dir_path,
+        })
+    }
 }
 
 /// Open a shadow mount that talks to an mm server over HTTP.

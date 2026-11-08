@@ -1,5 +1,27 @@
 # Changelog
 
+## 1.1.1 — 2026-11-09
+
+The wire protocol, commands and the 1.0 path are unchanged. The shadow schema
+gains one additive column (`snapshot_gen`), created on open and defaulted to 0
+for existing databases.
+
+### Fixed
+
+- **Shadow restart adopts committed batches.** On mount, the mm client scans
+  the batch ids persisted in the shadow database and asks `mm-server` for each
+  status. A batch that committed before the crash is adopted locally (base
+  version, `snapshot_seq`, cleanup of dirty generations up to the frozen
+  snapshot) without uploading again. An open batch is kept for the next
+  `fsync`; an aborted or unknown batch is cleared and stays dirty; a network
+  or `401` error leaves the state untouched and does not block the mount. A
+  batch is adopted at most once, and an older commit never rolls back a newer
+  checkout.
+
+### Changed
+
+- Version string and man page report 1.1.1.
+
 ## 1.1.0 — 2026-11-09
 
 The 1.0 wire protocol, schema, `/private` and `/public` paths, options and

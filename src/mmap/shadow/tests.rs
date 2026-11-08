@@ -13,18 +13,20 @@ use std::sync::{Arc, Barrier, Mutex};
 use std::time::Duration;
 
 use crate::mmap::base;
+use crate::mmap::db::MmTx;
 use crate::mmap::rsync::{Instruction, Signature, block_size_for, decode_from, sign};
 use crate::mmap::types::{
-    DirAttrs, EntryKind, EntryOp, FileRecord, Hash, Ino, LockId, ManifestEntry, MmBase, MmSeq,
-    ROOT_INO,
+    BatchId, DirAttrs, EntryKind, EntryOp, FileRecord, Hash, Ino, LockId, ManifestEntry, MmBase,
+    MmSeq, ROOT_INO,
 };
 
 use super::remote::{
-    CheckoutEntry, CheckoutOutcome, CheckoutRequest, CheckoutSnapshot, FileData, FileReadRequest,
-    GrantedLock, LockRequest, LockResponse, MmRemote, RemoteError, SignatureFilePlan,
-    SignaturesRequest, SignaturesResponse, UploadRequest, UploadResponse, UploadResult,
+    BatchState, BatchStatus, CheckoutEntry, CheckoutOutcome, CheckoutRequest, CheckoutSnapshot,
+    FileData, FileReadRequest, GrantedLock, LockRequest, LockResponse, MmRemote, RemoteError,
+    SignatureFilePlan, SignaturesRequest, SignaturesResponse, UploadAbort, UploadBegin,
+    UploadRequest, UploadResponse, UploadResult,
 };
-use super::{Shadow, ShadowConfig, ShadowError};
+use super::{Shadow, ShadowConfig, ShadowDir, ShadowError, UploadPhase, VersionState};
 
 const NS: &str = "/private-mm";
 
@@ -39,6 +41,7 @@ struct MockDir {
 #[derive(Clone, Copy, Debug)]
 enum FailPoint {
     Any,
+    BatchStatus,
     Checkout,
     Lock,
     Upload,
@@ -49,6 +52,7 @@ struct MockRemote {
     state: Mutex<MockState>,
     fail: Mutex<Option<(FailPoint, RemoteError)>>,
     checkouts: AtomicUsize,
+    statuses: AtomicUsize,
 }
 
 struct MockState {
@@ -56,7 +60,17 @@ struct MockState {
     snapshot_seq: u64,
     dirs: BTreeMap<Ino, MockDir>,
     commits: Vec<super::remote::UploadCommit>,
+    batches: HashMap<BatchId, MockBatch>,
     locks: HashMap<Ino, LockId>,
+}
+
+#[derive(Clone, Debug)]
+struct MockBatch {
+    state: BatchState,
+    manifest_hash: Hash,
+    dir_path: String,
+    /// Base, global sequence and directory version, when committed.
+    result: Option<(MmBase, MmSeq, Hash)>,
 }
 
 impl MockRemote {
@@ -82,10 +96,12 @@ impl MockRemote {
                     },
                 )]),
                 commits: Vec::new(),
+                batches: HashMap::new(),
                 locks: HashMap::new(),
             }),
             fail: Mutex::new(None),
             checkouts: AtomicUsize::new(0),
+            statuses: AtomicUsize::new(0),
         })
     }
 
@@ -149,6 +165,27 @@ impl MockRemote {
 
     fn commits(&self) -> Vec<super::remote::UploadCommit> {
         self.state.lock().unwrap().commits.clone()
+    }
+
+    fn batch_state(&self, batch_id: BatchId) -> Option<BatchState> {
+        self.state
+            .lock()
+            .unwrap()
+            .batches
+            .get(&batch_id)
+            .map(|batch| batch.state)
+    }
+
+    fn batch_count(&self) -> usize {
+        self.state.lock().unwrap().batches.len()
+    }
+
+    fn statuses(&self) -> usize {
+        self.statuses.load(Ordering::Relaxed)
+    }
+
+    fn snapshot_seq(&self) -> MmSeq {
+        MmSeq::new(self.state.lock().unwrap().snapshot_seq)
     }
 
     fn set_failure(&self, point: FailPoint, error: RemoteError) {
@@ -314,13 +351,29 @@ impl MmRemote for MockRemote {
                     .dirs
                     .get(&begin.dir_ino)
                     .ok_or(RemoteError::NotFound)?;
+                let base = dir.base;
+                state.batches.insert(
+                    begin.batch_id,
+                    MockBatch {
+                        state: BatchState::Open,
+                        manifest_hash: [0u8; 32],
+                        dir_path: begin.dir_path.clone(),
+                        result: None,
+                    },
+                );
                 Ok(UploadResponse::Plan(super::remote::UploadPlan {
                     batch_id: begin.batch_id,
-                    base: dir.base,
+                    base,
                     expires_at_ms: 1_000,
                 }))
             }
-            UploadRequest::Abort(_) => Ok(UploadResponse::Aborted),
+            UploadRequest::Abort(abort) => {
+                if let Some(batch) = state.batches.get_mut(&abort.batch_id) {
+                    batch.state = BatchState::Aborted;
+                    batch.result = None;
+                }
+                Ok(UploadResponse::Aborted)
+            }
             UploadRequest::Commit(commit) => {
                 let mut dir = state
                     .dirs
@@ -420,6 +473,15 @@ impl MmRemote for MockRemote {
                     entry_count: commit.manifest.len() as u32,
                     bytes: commit.bytes,
                 };
+                state.batches.insert(
+                    commit.batch_id,
+                    MockBatch {
+                        state: BatchState::Committed,
+                        manifest_hash: [0u8; 32],
+                        dir_path: commit.dir_path.clone(),
+                        result: Some((result.base, result.snapshot_seq, version)),
+                    },
+                );
                 state.dirs.insert(commit.dir_ino, dir);
                 let epoch = state.epoch;
                 for (ino, attrs) in created_dirs {
@@ -494,6 +556,28 @@ impl MmRemote for MockRemote {
             offset: request.offset,
             range_hash: *blake3::hash(&bytes).as_bytes(),
             bytes,
+        })
+    }
+
+    fn batch_status(&self, batch_id: BatchId) -> Result<BatchStatus, RemoteError> {
+        self.statuses.fetch_add(1, Ordering::Relaxed);
+        self.fail_if(FailPoint::BatchStatus)?;
+        let state = self.state.lock().unwrap();
+        let Some(batch) = state.batches.get(&batch_id) else {
+            return Err(RemoteError::NotFound);
+        };
+        let (snapshot_seq, base_seq_after, dir_version_after) = match batch.result {
+            Some((base, seq, version)) => (Some(seq), Some(base.dir_seq), Some(version)),
+            None => (None, None, None),
+        };
+        Ok(BatchStatus {
+            batch_id,
+            state: batch.state,
+            snapshot_seq,
+            base_seq_after,
+            dir_version_after,
+            manifest_hash: batch.manifest_hash,
+            dir_path: batch.dir_path.clone(),
         })
     }
 }
@@ -1049,4 +1133,407 @@ fn mock_body_and_base_are_visible_to_tests() {
     assert_eq!(mock.body(ROOT_INO, "x").unwrap(), b"v");
     let base = mock.base(ROOT_INO);
     assert_eq!(base.epoch, 1);
+}
+
+// ---------------------------------------------------------------------------
+// Restart recovery
+// ---------------------------------------------------------------------------
+
+fn open_shadow(root: &std::path::Path, mock: &Arc<MockRemote>) -> Shadow {
+    let mut config = ShadowConfig::new(root, NS);
+    config.revalidate_ttl = Duration::ZERO;
+    let remote: Arc<dyn MmRemote> = mock.clone();
+    Shadow::open(config, remote).unwrap()
+}
+
+/// Mount one directory and write `f` without uploading it.
+fn dirty_root(mock: &Arc<MockRemote>, root: &std::path::Path) -> (Shadow, Ino, u64, u64) {
+    let shadow = open_shadow(root, mock);
+    shadow.ensure_dir(ROOT_INO, true).unwrap();
+    let (attr, handle) = shadow
+        .create(1, "f", 0o100644, 0, 1000, 1000, true)
+        .unwrap();
+    shadow.write(attr.fuse_ino, handle.id, 0, b"hello").unwrap();
+    let dir = shadow.db().shadow_dir(ROOT_INO).unwrap().unwrap();
+    let file = shadow.db().file_by_name(ROOT_INO, "f").unwrap().unwrap();
+    (shadow, file.ino, file.version, dir.dirty_gen)
+}
+
+fn persist_upload(shadow: &Shadow, batch_id: BatchId, snapshot_gen: u64) {
+    shadow
+        .db()
+        .set_snapshot_gen(ROOT_INO, snapshot_gen)
+        .unwrap();
+    shadow
+        .db()
+        .set_upload_phase(ROOT_INO, UploadPhase::Uploading, Some(batch_id), None)
+        .unwrap();
+}
+
+fn begin_upload(mock: &MockRemote, batch_id: BatchId) {
+    mock.upload(&UploadRequest::Begin(UploadBegin {
+        batch_id,
+        dir_path: "/".to_owned(),
+        dir_ino: ROOT_INO,
+        base: mock.base(ROOT_INO),
+        manifest: Vec::new(),
+    }))
+    .unwrap();
+}
+
+/// Rewind the local publish of a committed batch: the server keeps the
+/// commit, the mount behaves as if it died before recording it.
+fn rewind_publish(
+    shadow: &Shadow,
+    before: &ShadowDir,
+    file_ino: Ino,
+    file_version: u64,
+    batch_id: BatchId,
+    snapshot_gen: u64,
+) {
+    shadow
+        .db()
+        .write(|tx| {
+            tx.conn().execute(
+                "UPDATE mm_dirs
+                 SET base_epoch = ?1, base_seq = ?2, dir_version = ?3, phase = 'ready'
+                 WHERE namespace = ?4 AND ino = ?5",
+                rusqlite::params![
+                    i64::try_from(before.record.base.epoch).unwrap(),
+                    i64::try_from(before.record.base.dir_seq.get()).unwrap(),
+                    before.record.base.dir_version.as_slice(),
+                    NS,
+                    ROOT_INO.as_slice(),
+                ],
+            )?;
+            tx.conn().execute(
+                "DELETE FROM mm_dir_versions WHERE namespace = ?1 AND dir_ino = ?2",
+                rusqlite::params![NS, ROOT_INO.as_slice()],
+            )?;
+            tx.conn().execute(
+                "UPDATE shadow_versions
+                 SET dirty_gen = ?1, state = 'dirty', synced_size = 0, synced_mtime_ns = 0
+                 WHERE ino = ?2 AND version = ?3",
+                rusqlite::params![
+                    i64::try_from(snapshot_gen).unwrap(),
+                    file_ino.as_slice(),
+                    i64::try_from(file_version).unwrap(),
+                ],
+            )?;
+            tx.conn().execute(
+                "UPDATE shadow_dirs
+                 SET dirty_gen = ?1, uploaded_gen = ?2, upload_state = 'uploading',
+                     batch_id = ?3, lock_id = NULL, snapshot_gen = ?4,
+                     snapshot_seq = ?5, valid_until_ms = 0
+                 WHERE dir_ino = ?6",
+                rusqlite::params![
+                    i64::try_from(before.dirty_gen).unwrap(),
+                    i64::try_from(before.uploaded_gen).unwrap(),
+                    batch_id.as_bytes().as_slice(),
+                    i64::try_from(snapshot_gen).unwrap(),
+                    i64::try_from(before.snapshot_seq.get()).unwrap(),
+                    ROOT_INO.as_slice(),
+                ],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+}
+
+#[test]
+fn restart_adopts_committed_batch_without_uploading_it_again() {
+    let mock = MockRemote::new();
+    let root = tempfile::tempdir().unwrap();
+    let (shadow, file_ino, file_version, snapshot_gen) = dirty_root(&mock, root.path());
+    let before = shadow.db().shadow_dir(ROOT_INO).unwrap().unwrap();
+    let fuse_ino = shadow.lookup(1, "f").unwrap().fuse_ino;
+    shadow.fsync(fuse_ino, None).unwrap();
+    assert_eq!(mock.commits().len(), 1);
+    let batch_id = mock.commits()[0].batch_id;
+    let committed_base = mock.base(ROOT_INO);
+    let committed_seq = mock.snapshot_seq();
+    assert_eq!(
+        shadow.db().shadow_dir(ROOT_INO).unwrap().unwrap().batch_id,
+        None
+    );
+
+    rewind_publish(
+        &shadow,
+        &before,
+        file_ino,
+        file_version,
+        batch_id,
+        snapshot_gen,
+    );
+    drop(shadow);
+
+    let shadow = open_shadow(root.path(), &mock);
+    let dir = shadow.db().shadow_dir(ROOT_INO).unwrap().unwrap();
+    assert_eq!(dir.batch_id, None);
+    assert_eq!(dir.upload_state, UploadPhase::Idle);
+    assert!(dir.clean());
+    assert_eq!(dir.record.base, committed_base);
+    assert_eq!(dir.snapshot_seq, committed_seq);
+    assert_eq!(dir.uploaded_gen, snapshot_gen);
+    assert_eq!(dir.snapshot_gen, 0);
+    let version = shadow
+        .db()
+        .shadow_version(file_ino, file_version)
+        .unwrap()
+        .unwrap();
+    assert_eq!(version.dirty_gen, 0);
+    assert_eq!(version.state, VersionState::Clean);
+    assert_eq!(mock.commits().len(), 1, "recovery must not upload");
+    assert_eq!(mock.batch_count(), 1, "recovery must not begin a batch");
+
+    // Adoption does not rotate the file version: an old descriptor or
+    // mapping keeps its object.
+    let file = shadow.db().file_by_name(ROOT_INO, "f").unwrap().unwrap();
+    assert_eq!((file.ino, file.version), (file_ino, file_version));
+
+    // Nothing left to flush, and a second restart asks the server nothing.
+    let statuses = mock.statuses();
+    shadow.fsync(fuse_ino, None).unwrap();
+    assert_eq!(mock.commits().len(), 1);
+    drop(shadow);
+    let shadow = open_shadow(root.path(), &mock);
+    assert_eq!(mock.statuses(), statuses);
+    assert_eq!(
+        shadow.db().shadow_dir(ROOT_INO).unwrap().unwrap().batch_id,
+        None
+    );
+}
+
+#[test]
+fn restart_keeps_an_open_batch_for_the_next_fsync() {
+    let mock = MockRemote::new();
+    let root = tempfile::tempdir().unwrap();
+    let (shadow, _file_ino, _file_version, snapshot_gen) = dirty_root(&mock, root.path());
+    let batch_id = BatchId::from_bytes([0x77; 16]);
+    begin_upload(&mock, batch_id);
+    persist_upload(&shadow, batch_id, snapshot_gen);
+    let fuse_ino = shadow.lookup(1, "f").unwrap().fuse_ino;
+    drop(shadow);
+
+    let shadow = open_shadow(root.path(), &mock);
+    let dir = shadow.db().shadow_dir(ROOT_INO).unwrap().unwrap();
+    assert_eq!(dir.batch_id, Some(batch_id));
+    assert_eq!(dir.upload_state, UploadPhase::Dirty);
+    assert!(!dir.clean());
+    assert_eq!(mock.batch_state(batch_id), Some(BatchState::Open));
+    assert!(mock.commits().is_empty(), "an open batch is not resent");
+
+    // The next fsync starts a new batch and leaves the old one alone.
+    shadow.fsync(fuse_ino, None).unwrap();
+    assert_eq!(mock.commits().len(), 1);
+    assert_ne!(mock.commits()[0].batch_id, batch_id);
+    assert_eq!(mock.batch_state(batch_id), Some(BatchState::Open));
+    assert_eq!(
+        shadow.db().shadow_dir(ROOT_INO).unwrap().unwrap().batch_id,
+        None
+    );
+}
+
+#[test]
+fn restart_clears_an_aborted_batch_and_keeps_dirty() {
+    let mock = MockRemote::new();
+    let root = tempfile::tempdir().unwrap();
+    let (shadow, file_ino, file_version, snapshot_gen) = dirty_root(&mock, root.path());
+    let batch_id = BatchId::from_bytes([0x78; 16]);
+    begin_upload(&mock, batch_id);
+    mock.upload(&UploadRequest::Abort(UploadAbort {
+        batch_id,
+        lock_id: LockId::from_bytes([0x11; 16]),
+    }))
+    .unwrap();
+    persist_upload(&shadow, batch_id, snapshot_gen);
+    drop(shadow);
+
+    let shadow = open_shadow(root.path(), &mock);
+    let dir = shadow.db().shadow_dir(ROOT_INO).unwrap().unwrap();
+    assert_eq!(dir.batch_id, None);
+    assert_eq!(dir.upload_state, UploadPhase::Dirty);
+    assert_eq!(dir.snapshot_gen, 0);
+    assert!(!dir.clean());
+    let version = shadow
+        .db()
+        .shadow_version(file_ino, file_version)
+        .unwrap()
+        .unwrap();
+    assert_eq!(version.dirty_gen, snapshot_gen);
+    assert_eq!(version.state, VersionState::Dirty);
+    assert!(mock.commits().is_empty());
+    assert_eq!(mock.batch_count(), 1, "an aborted batch is not resent");
+}
+
+#[test]
+fn restart_clears_an_unknown_batch_and_keeps_dirty() {
+    let mock = MockRemote::new();
+    let root = tempfile::tempdir().unwrap();
+    let (shadow, file_ino, file_version, snapshot_gen) = dirty_root(&mock, root.path());
+    let batch_id = BatchId::from_bytes([0x79; 16]);
+    persist_upload(&shadow, batch_id, snapshot_gen);
+    drop(shadow);
+
+    let shadow = open_shadow(root.path(), &mock);
+    let dir = shadow.db().shadow_dir(ROOT_INO).unwrap().unwrap();
+    assert_eq!(dir.batch_id, None);
+    assert_eq!(dir.upload_state, UploadPhase::Dirty);
+    assert!(!dir.clean());
+    let version = shadow
+        .db()
+        .shadow_version(file_ino, file_version)
+        .unwrap()
+        .unwrap();
+    assert_eq!(version.dirty_gen, snapshot_gen);
+    assert_eq!(version.state, VersionState::Dirty);
+    assert!(mock.commits().is_empty());
+    assert_eq!(mock.batch_count(), 0, "an unknown batch is not begun");
+}
+
+#[test]
+fn restart_keeps_state_when_batch_status_is_unreachable() {
+    let mock = MockRemote::new();
+    let root = tempfile::tempdir().unwrap();
+    let (shadow, _file_ino, _file_version, snapshot_gen) = dirty_root(&mock, root.path());
+    let batch_id = BatchId::from_bytes([0x7a; 16]);
+    begin_upload(&mock, batch_id);
+    persist_upload(&shadow, batch_id, snapshot_gen);
+    let fuse_ino = shadow.lookup(1, "f").unwrap().fuse_ino;
+    mock.set_failure(FailPoint::BatchStatus, RemoteError::Io("down".to_owned()));
+    drop(shadow);
+
+    // A transport failure never blocks the mount.
+    let shadow = open_shadow(root.path(), &mock);
+    let dir = shadow.db().shadow_dir(ROOT_INO).unwrap().unwrap();
+    assert_eq!(dir.batch_id, Some(batch_id));
+    assert!(!dir.clean());
+
+    // Authentication failure keeps the same state for the next fsync.
+    mock.set_failure(FailPoint::BatchStatus, RemoteError::Unauthenticated);
+    let error = shadow.fsync(fuse_ino, None).unwrap_err();
+    assert!(matches!(
+        error,
+        ShadowError::Remote(RemoteError::Unauthenticated)
+    ));
+    let dir = shadow.db().shadow_dir(ROOT_INO).unwrap().unwrap();
+    assert_eq!(dir.batch_id, Some(batch_id));
+    assert!(!dir.clean());
+    assert!(mock.commits().is_empty());
+    assert_eq!(mock.batch_count(), 1, "an unreachable batch is not resent");
+
+    // Once the server answers, the next fsync starts a new batch.
+    shadow.fsync(fuse_ino, None).unwrap();
+    assert_eq!(mock.commits().len(), 1);
+    assert_ne!(mock.commits()[0].batch_id, batch_id);
+    assert_eq!(mock.batch_count(), 2);
+}
+
+#[test]
+fn restart_adoption_keeps_a_newer_dirty_generation() {
+    let mock = MockRemote::new();
+    let root = tempfile::tempdir().unwrap();
+    let (shadow, file_ino, file_version, snapshot_gen) = dirty_root(&mock, root.path());
+    let before = shadow.db().shadow_dir(ROOT_INO).unwrap().unwrap();
+    let fuse_ino = shadow.lookup(1, "f").unwrap().fuse_ino;
+    shadow.fsync(fuse_ino, None).unwrap();
+    let batch_id = mock.commits()[0].batch_id;
+    let committed_base = mock.base(ROOT_INO);
+    let committed_seq = mock.snapshot_seq();
+    rewind_publish(
+        &shadow,
+        &before,
+        file_ino,
+        file_version,
+        batch_id,
+        snapshot_gen,
+    );
+    // A write that arrived after the snapshot has a newer generation.
+    shadow
+        .db()
+        .write(|tx| {
+            tx.conn().execute(
+                "UPDATE shadow_dirs SET dirty_gen = ?1 WHERE dir_ino = ?2",
+                rusqlite::params![
+                    i64::try_from(snapshot_gen + 1).unwrap(),
+                    ROOT_INO.as_slice()
+                ],
+            )?;
+            tx.conn().execute(
+                "UPDATE shadow_versions SET dirty_gen = ?1 WHERE ino = ?2 AND version = ?3",
+                rusqlite::params![
+                    i64::try_from(snapshot_gen + 1).unwrap(),
+                    file_ino.as_slice(),
+                    i64::try_from(file_version).unwrap(),
+                ],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    drop(shadow);
+
+    let shadow = open_shadow(root.path(), &mock);
+    let dir = shadow.db().shadow_dir(ROOT_INO).unwrap().unwrap();
+    assert_eq!(dir.record.base, committed_base);
+    assert_eq!(dir.snapshot_seq, committed_seq);
+    assert_eq!(dir.uploaded_gen, snapshot_gen);
+    assert!(!dir.clean(), "a write after the snapshot stays dirty");
+    let version = shadow
+        .db()
+        .shadow_version(file_ino, file_version)
+        .unwrap()
+        .unwrap();
+    assert_eq!(version.dirty_gen, snapshot_gen + 1);
+    assert_eq!(version.state, VersionState::Dirty);
+
+    // The next fsync uploads the later content.
+    let handle = shadow.open_file(fuse_ino, true).unwrap();
+    shadow.write(fuse_ino, handle.id, 0, b"world").unwrap();
+    shadow.fsync(fuse_ino, Some(handle.id)).unwrap();
+    assert_eq!(mock.commits().len(), 2);
+    let dir = shadow.db().shadow_dir(ROOT_INO).unwrap().unwrap();
+    assert_eq!(dir.batch_id, None);
+    assert!(dir.clean());
+}
+
+#[test]
+fn publish_committed_never_rolls_back_a_newer_checkout() {
+    let mock = MockRemote::new();
+    let root = tempfile::tempdir().unwrap();
+    let (shadow, _file_ino, _file_version, _snapshot_gen) = dirty_root(&mock, root.path());
+    let dir = shadow.db().shadow_dir(ROOT_INO).unwrap().unwrap();
+    let older = MmBase::new(
+        dir.record.base.epoch,
+        crate::mmap::types::DirSeq::new(dir.record.base.dir_seq.get() + 1),
+        [0x5a; 32],
+    );
+    let adopted = shadow
+        .db()
+        .publish_committed(ROOT_INO, older, dir.snapshot_seq, dir.dirty_gen, 0, None)
+        .unwrap();
+    assert!(!adopted, "an older snapshot must not replace a newer base");
+    let after = shadow.db().shadow_dir(ROOT_INO).unwrap().unwrap();
+    assert_eq!(after.record.base, dir.record.base);
+    assert!(!after.clean(), "dirty generations stay for the next fsync");
+}
+
+#[test]
+fn schema_migration_adds_snapshot_gen_to_an_old_shadow_db() {
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    conn.execute_batch(
+        "CREATE TABLE shadow_dirs (
+           dir_ino BLOB PRIMARY KEY NOT NULL,
+           upload_state TEXT NOT NULL DEFAULT 'idle'
+         ) STRICT, WITHOUT ROWID;",
+    )
+    .unwrap();
+    super::db::migrate(&conn).unwrap();
+    super::db::migrate(&conn).unwrap();
+    let mut stmt = conn.prepare("PRAGMA table_info(shadow_dirs)").unwrap();
+    let names: Vec<String> = stmt
+        .query_map([], |row| row.get(1))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert!(names.iter().any(|name| name == "snapshot_gen"));
 }

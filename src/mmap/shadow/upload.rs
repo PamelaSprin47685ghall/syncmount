@@ -16,7 +16,6 @@ use std::fs::File;
 use std::io::Cursor;
 use std::path::PathBuf;
 
-use crate::mmap::db::MmTx;
 use crate::mmap::manifest::Manifest;
 use crate::mmap::rsync::{Instruction, decode_from, delta_to};
 use crate::mmap::types::{
@@ -93,11 +92,32 @@ impl Shadow {
         Ok((file.dir_ino, row.ino, row.version))
     }
 
-    fn flush_dir_locked(&self, dir: super::ShadowDir) -> Result<(), ShadowError> {
+    fn flush_dir_locked(&self, mut dir: super::ShadowDir) -> Result<(), ShadowError> {
         if dir.local_only {
             // A locally created child directory has no server row yet. Its
             // parent struct changes must commit first; the next fsync retries.
             return Err(ShadowError::Conflict);
+        }
+        if dir.batch_id.is_some() {
+            // A batch from an earlier attempt may have committed after its
+            // answer was lost. Adopt that result before starting another
+            // batch; a transport failure keeps the state for the next fsync.
+            match self.reconcile_batch(&dir) {
+                Ok(_) => {}
+                Err(ShadowError::Remote(super::RemoteError::Unsupported(_))) => {
+                    // The remote has no batch endpoint; a new batch is the
+                    // only way forward.
+                    self.db.clear_batch(dir.record.ino, UploadPhase::Dirty)?;
+                }
+                Err(error) => return Err(error),
+            }
+            dir = self
+                .db
+                .shadow_dir(dir.record.ino)?
+                .ok_or(ShadowError::NotFound)?;
+            if dir.clean() {
+                return Ok(());
+            }
         }
         let snapshot_gen = dir.dirty_gen;
         let batch_id = BatchId::new_random();
@@ -210,6 +230,11 @@ impl Shadow {
             }
         }
 
+        // The generation boundary must survive a crash: a committed batch
+        // adopts exactly the dirty versions it contained, never a write that
+        // arrived after the snapshot.
+        self.db.set_snapshot_gen(dir.record.ino, snapshot_gen)?;
+
         self.db
             .set_upload_phase(dir.record.ino, UploadPhase::Locking, Some(batch_id), None)?;
         let lock = match self.remote.lock(&LockRequest::Acquire {
@@ -308,11 +333,6 @@ impl Shadow {
             .ok_or(ShadowError::NotFound)?;
 
         let files = self.db.files(dir.record.ino)?;
-        let child_dirs: Vec<Ino> = files
-            .iter()
-            .filter(|file| file.kind == EntryKind::Dir && !file.deleted)
-            .map(|file| file.ino)
-            .collect();
         let mut current: Vec<ManifestEntry> = Vec::with_capacity(files.len());
         for file in &files {
             let record = snapshotted_records
@@ -445,16 +465,6 @@ impl Shadow {
             }
         };
 
-        let base_entries: Vec<ManifestEntry> = self
-            .db
-            .files(dir.record.ino)?
-            .iter()
-            .map(|file| {
-                let mut entry = file.manifest_entry(EntryOp::Keep);
-                entry.content_hash = None;
-                entry
-            })
-            .collect();
         let client_id = self.db.client_id()?;
         let batch_record = BatchRecord {
             batch_id,
@@ -472,123 +482,16 @@ impl Shadow {
             bytes: committed.bytes,
             committed_at_ms: now_ms(),
         };
-        self.db.write(|tx| {
-            tx.conn().execute(
-                "UPDATE mm_dirs
-                 SET base_epoch = ?1, base_seq = ?2, dir_version = ?3,
-                     phase = 'ready', updated_at_ms = ?4
-                 WHERE namespace = ?5 AND ino = ?6",
-                rusqlite::params![
-                    i64::try_from(committed.base.epoch)
-                        .map_err(|_| ShadowError::Invalid("epoch does not fit i64"))?,
-                    i64::try_from(committed.base.dir_seq.get())
-                        .map_err(|_| ShadowError::Invalid("dir_seq does not fit i64"))?,
-                    committed.dir_version.as_slice(),
-                    now_ms(),
-                    self.namespace,
-                    dir.record.ino.as_slice(),
-                ],
-            )?;
-            tx.conn().execute(
-                "INSERT INTO mm_dir_versions
-                   (namespace, dir_ino, dir_path, base_epoch, dir_seq, snapshot_seq,
-                    dir_version, updated_at_ms)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
-                 ON CONFLICT(namespace, dir_ino) DO UPDATE SET
-                   dir_path = excluded.dir_path,
-                   base_epoch = excluded.base_epoch,
-                   dir_seq = excluded.dir_seq,
-                   snapshot_seq = excluded.snapshot_seq,
-                   dir_version = excluded.dir_version,
-                   updated_at_ms = excluded.updated_at_ms",
-                rusqlite::params![
-                    self.namespace,
-                    dir.record.ino.as_slice(),
-                    dir.record.path,
-                    i64::try_from(committed.base.epoch)
-                        .map_err(|_| ShadowError::Invalid("epoch does not fit i64"))?,
-                    i64::try_from(committed.base.dir_seq.get())
-                        .map_err(|_| ShadowError::Invalid("dir_seq does not fit i64"))?,
-                    i64::try_from(committed.snapshot_seq.get())
-                        .map_err(|_| ShadowError::Invalid("seq does not fit i64"))?,
-                    committed.dir_version.as_slice(),
-                    now_ms(),
-                ],
-            )?;
-            tx.conn().execute(
-                "DELETE FROM mm_base WHERE namespace = ?1 AND dir_ino = ?2",
-                rusqlite::params![self.namespace, dir.record.ino.as_slice()],
-            )?;
-            for entry in &base_entries {
-                tx.conn().execute(
-                    "INSERT INTO mm_base
-                       (namespace, dir_ino, name, ino, kind, mode, uid, gid, mtime_ns,
-                        size, file_root, content_hash, target)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, NULL, ?12)",
-                    rusqlite::params![
-                        self.namespace,
-                        dir.record.ino.as_slice(),
-                        entry.name,
-                        entry.ino.as_slice(),
-                        entry.kind.as_str(),
-                        i64::from(entry.mode),
-                        i64::from(entry.uid),
-                        i64::from(entry.gid),
-                        entry.mtime_ns,
-                        i64::try_from(entry.size)
-                            .map_err(|_| ShadowError::Invalid("size does not fit i64"))?,
-                        entry.file_root.as_slice(),
-                        entry.target.as_deref(),
-                    ],
-                )?;
-            }
-            tx.conn().execute(
-                "UPDATE shadow_versions
-                 SET dirty_gen = 0,
-                     state = CASE WHEN state = 'dirty' THEN 'clean' ELSE state END,
-                     synced_size = size,
-                     synced_mtime_ns = mtime_ns
-                 WHERE ino IN (
-                   SELECT ino FROM mm_files
-                   WHERE namespace = ?1 AND dir_ino = ?2 AND deleted = 0
-                 ) AND dirty_gen > 0 AND dirty_gen <= ?3",
-                rusqlite::params![
-                    self.namespace,
-                    dir.record.ino.as_slice(),
-                    i64::try_from(snapshot_gen)
-                        .map_err(|_| ShadowError::Invalid("generation does not fit i64"))?,
-                ],
-            )?;
-            tx.conn().execute(
-                "UPDATE shadow_dirs
-                 SET uploaded_gen = MAX(uploaded_gen, ?1),
-                     upload_state = 'idle', batch_id = NULL, lock_id = NULL,
-                     valid_until_ms = ?2
-                 WHERE dir_ino = ?3",
-                rusqlite::params![
-                    i64::try_from(snapshot_gen)
-                        .map_err(|_| ShadowError::Invalid("generation does not fit i64"))?,
-                    now_ms()
-                        .saturating_add(i64::try_from(self.ttl.as_millis()).unwrap_or(i64::MAX)),
-                    dir.record.ino.as_slice(),
-                ],
-            )?;
-            for child in &child_dirs {
-                tx.conn().execute(
-                    "UPDATE shadow_dirs
-                     SET local_only = 0, valid_until_ms = 0, bodies_checked_out = 0
-                     WHERE dir_ino = ?1",
-                    rusqlite::params![child.as_slice()],
-                )?;
-                tx.conn().execute(
-                    "UPDATE mm_dirs SET phase = 'stale'
-                     WHERE namespace = ?1 AND ino = ?2",
-                    rusqlite::params![self.namespace, child.as_slice()],
-                )?;
-            }
-            let _ = tx.put_batch(&batch_record)?;
-            Ok(())
-        })?;
+        let valid_until_ms =
+            now_ms().saturating_add(i64::try_from(self.ttl.as_millis()).unwrap_or(i64::MAX));
+        self.db.publish_committed(
+            dir.record.ino,
+            committed.base,
+            committed.snapshot_seq,
+            snapshot_gen,
+            valid_until_ms,
+            Some(&batch_record),
+        )?;
         Ok(())
     }
 }

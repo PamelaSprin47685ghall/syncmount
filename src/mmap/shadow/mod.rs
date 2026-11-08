@@ -27,6 +27,7 @@ mod db;
 mod layout;
 mod locks;
 mod ops;
+mod recover;
 mod upload;
 
 pub mod remote;
@@ -51,10 +52,11 @@ pub use layout::{OwnerLock, ShadowLayout, hex16, namespace_component};
 pub use locks::{LockTable, RangeLock, flock_exclusive, flock_shared};
 pub use ops::{AttrChange, DirItem, NodeAttr};
 pub use remote::{
-    CheckoutBody, CheckoutEntry, CheckoutOutcome, CheckoutRequest, CheckoutSnapshot, FileData,
-    FileReadRequest, GrantedLock, LockRequest, LockResponse, MmRemote, RemoteError, SignatureFile,
-    SignatureFilePlan, SignaturesRequest, SignaturesResponse, UploadAbort, UploadBegin,
-    UploadCommit, UploadFile, UploadPlan, UploadRequest, UploadResponse, UploadResult,
+    BatchState, BatchStatus, CheckoutBody, CheckoutEntry, CheckoutOutcome, CheckoutRequest,
+    CheckoutSnapshot, FileData, FileReadRequest, GrantedLock, LockRequest, LockResponse, MmRemote,
+    RemoteError, SignatureFile, SignatureFilePlan, SignaturesRequest, SignaturesResponse,
+    UploadAbort, UploadBegin, UploadCommit, UploadFile, UploadPlan, UploadRequest, UploadResponse,
+    UploadResult,
 };
 
 /// The one error every shadow operation returns.
@@ -256,6 +258,7 @@ impl Shadow {
             locks: LockTable::new(),
             _owner: owner,
         };
+        shadow.recover_batches()?;
         shadow.collect_orphan_objects()?;
         Ok(shadow)
     }

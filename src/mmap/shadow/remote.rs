@@ -15,7 +15,7 @@ use std::path::PathBuf;
 
 use crate::mmap::rsync::{Instruction, Signature};
 use crate::mmap::types::{
-    BatchId, DirAttrs, EntryKind, Hash, Ino, LockId, ManifestEntry, MmBase, MmSeq,
+    BatchId, DirAttrs, DirSeq, EntryKind, Hash, Ino, LockId, ManifestEntry, MmBase, MmSeq,
 };
 
 /// One direct entry returned by checkout.
@@ -229,6 +229,37 @@ pub enum UploadResponse {
     Aborted,
 }
 
+/// The server state of one upload batch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BatchState {
+    /// The batch exists and may still be committed or aborted.
+    Open,
+    /// The batch is durable; its result must be adopted, never resent.
+    Committed,
+    /// The batch will never commit.
+    Aborted,
+}
+
+/// One `GET batch/{id}` answer.
+///
+/// The result fields are present only for a committed batch. A committed
+/// batch carries the directory state to adopt without uploading again.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BatchStatus {
+    pub batch_id: BatchId,
+    pub state: BatchState,
+    /// New global sequence, when committed.
+    pub snapshot_seq: Option<MmSeq>,
+    /// New per-directory sequence, when committed.
+    pub base_seq_after: Option<DirSeq>,
+    /// New directory version, when committed.
+    pub dir_version_after: Option<Hash>,
+    /// Manifest hash the batch was begun with.
+    pub manifest_hash: Hash,
+    /// Directory the batch writes.
+    pub dir_path: String,
+}
+
 /// Acquire, renew or release the per-directory upload lease.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LockRequest {
@@ -384,4 +415,16 @@ pub trait MmRemote: Send + Sync {
     fn upload(&self, request: &UploadRequest) -> Result<UploadResponse, RemoteError>;
     fn lock(&self, request: &LockRequest) -> Result<LockResponse, RemoteError>;
     fn file_read(&self, request: &FileReadRequest) -> Result<FileData, RemoteError>;
+
+    /// The server state of one batch id.
+    ///
+    /// A mount calls this at start and before starting a new upload batch, so
+    /// a commit whose local acknowledgement was lost is adopted instead of
+    /// uploaded again. The default keeps the boundary usable for remotes that
+    /// have no batch endpoint; callers then leave the persisted state alone
+    /// and retry on the next start.
+    fn batch_status(&self, batch_id: BatchId) -> Result<BatchStatus, RemoteError> {
+        let _ = batch_id;
+        Err(RemoteError::Unsupported("batch status".to_owned()))
+    }
 }

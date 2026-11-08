@@ -52,6 +52,7 @@ CREATE TABLE IF NOT EXISTS shadow_dirs (
   bodies_checked_out INTEGER NOT NULL DEFAULT 0 CHECK (bodies_checked_out IN (0,1)),
   local_only         INTEGER NOT NULL DEFAULT 0 CHECK (local_only IN (0,1)),
   snapshot_seq       INTEGER NOT NULL DEFAULT 0 CHECK (snapshot_seq >= 0),
+  snapshot_gen       INTEGER NOT NULL DEFAULT 0 CHECK (snapshot_gen >= 0),
   last_checkout_ms   INTEGER NOT NULL DEFAULT 0 CHECK (last_checkout_ms >= 0)
 ) STRICT, WITHOUT ROWID;
 
@@ -98,6 +99,8 @@ pub struct ShadowDir {
     pub bodies_checked_out: bool,
     pub local_only: bool,
     pub snapshot_seq: MmSeq,
+    /// The dirty generation frozen by the upload that owns `batch_id`.
+    pub snapshot_gen: u64,
     pub last_checkout_ms: i64,
 }
 
@@ -247,6 +250,7 @@ impl ShadowDb {
         {
             let tx = db.write()?;
             tx.conn().execute_batch(SHADOW_DDL)?;
+            migrate(tx.conn())?;
             seed(tx.conn())?;
             tx.commit()?;
         }
@@ -863,14 +867,130 @@ impl ShadowDb {
         })
     }
 
-    /// Clear every version dirtied at or below `snapshot_gen`.
-    pub fn clear_dirty_upto(
+    /// Remember the dirty generation frozen by the current upload.
+    ///
+    /// The generation is durable before `BEGIN`, so a committed batch whose
+    /// local acknowledgement was lost can clear exactly the dirty versions it
+    /// contained and leave a later write dirty.
+    pub fn set_snapshot_gen(&self, dir_ino: Ino, generation: u64) -> Result<(), ShadowError> {
+        self.write(|tx| {
+            tx.conn().execute(
+                "UPDATE shadow_dirs SET snapshot_gen = ?1 WHERE dir_ino = ?2",
+                params![to_i64(generation)?, dir_ino.as_slice()],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Forget one batch id and keep the dirty generations for the next fsync.
+    pub fn clear_batch(&self, dir_ino: Ino, phase: UploadPhase) -> Result<(), ShadowError> {
+        self.write(|tx| {
+            tx.conn().execute(
+                "UPDATE shadow_dirs
+                 SET upload_state = ?1, batch_id = NULL, lock_id = NULL,
+                     snapshot_gen = 0
+                 WHERE dir_ino = ?2",
+                params![phase.as_str(), dir_ino.as_slice()],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Adopt one committed batch.
+    ///
+    /// The new base and manifest replace the old ones, dirty generations at
+    /// or below `snapshot_gen` become clean, and the upload bookkeeping
+    /// resets. `batch` is absent when the result came from `GET batch/{id}`,
+    /// which carries no entry count or byte total. Returns `false` when a
+    /// checkout already recorded the same or a newer snapshot; the batch is
+    /// then dropped without touching the newer base.
+    pub fn publish_committed(
         &self,
         dir_ino: Ino,
+        base: MmBase,
+        snapshot_seq: MmSeq,
         snapshot_gen: u64,
-        uploaded_at_ms: i64,
-    ) -> Result<(), ShadowError> {
+        valid_until_ms: i64,
+        batch: Option<&BatchRecord>,
+    ) -> Result<bool, ShadowError> {
         self.write(|tx| {
+            // A checkout may have run between the caller's read and this
+            // transaction. Re-check inside the write lock so a commit can
+            // never roll the directory back.
+            let current_seq: i64 = tx.conn().query_row(
+                "SELECT snapshot_seq FROM shadow_dirs WHERE dir_ino = ?1",
+                params![dir_ino.as_slice()],
+                |row| row.get(0),
+            )?;
+            let current_seq = u64::try_from(current_seq)
+                .map_err(|_| ShadowError::Invalid("negative snapshot sequence"))?;
+            if current_seq >= snapshot_seq.get() {
+                tx.conn().execute(
+                    "UPDATE shadow_dirs
+                     SET upload_state = CASE
+                           WHEN uploaded_gen >= dirty_gen THEN 'idle' ELSE 'dirty' END,
+                         batch_id = NULL, lock_id = NULL, snapshot_gen = 0
+                     WHERE dir_ino = ?1",
+                    params![dir_ino.as_slice()],
+                )?;
+                return Ok(false);
+            }
+            let path: String = tx.conn().query_row(
+                "SELECT path FROM mm_dirs WHERE namespace = ?1 AND ino = ?2",
+                params![self.namespace, dir_ino.as_slice()],
+                |row| row.get(0),
+            )?;
+            tx.conn().execute(
+                "UPDATE mm_dirs
+                 SET base_epoch = ?1, base_seq = ?2, dir_version = ?3,
+                     phase = 'ready', updated_at_ms = ?4
+                 WHERE namespace = ?5 AND ino = ?6",
+                params![
+                    to_i64(base.epoch)?,
+                    to_i64(base.dir_seq.get())?,
+                    base.dir_version.as_slice(),
+                    now_ms(),
+                    self.namespace,
+                    dir_ino.as_slice(),
+                ],
+            )?;
+            tx.conn().execute(
+                "INSERT INTO mm_dir_versions
+                   (namespace, dir_ino, dir_path, base_epoch, dir_seq, snapshot_seq,
+                    dir_version, updated_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                 ON CONFLICT(namespace, dir_ino) DO UPDATE SET
+                   dir_path = excluded.dir_path,
+                   base_epoch = excluded.base_epoch,
+                   dir_seq = excluded.dir_seq,
+                   snapshot_seq = excluded.snapshot_seq,
+                   dir_version = excluded.dir_version,
+                   updated_at_ms = excluded.updated_at_ms",
+                params![
+                    self.namespace,
+                    dir_ino.as_slice(),
+                    path,
+                    to_i64(base.epoch)?,
+                    to_i64(base.dir_seq.get())?,
+                    to_i64(snapshot_seq.get())?,
+                    base.dir_version.as_slice(),
+                    now_ms(),
+                ],
+            )?;
+            tx.conn().execute(
+                "DELETE FROM mm_base WHERE namespace = ?1 AND dir_ino = ?2",
+                params![self.namespace, dir_ino.as_slice()],
+            )?;
+            tx.conn().execute(
+                "INSERT INTO mm_base
+                   (namespace, dir_ino, name, ino, kind, mode, uid, gid, mtime_ns,
+                    size, file_root, content_hash, target)
+                 SELECT namespace, dir_ino, name, ino, kind, mode, uid, gid, mtime_ns,
+                        size, file_root, NULL, target
+                 FROM mm_files
+                 WHERE namespace = ?1 AND dir_ino = ?2 AND deleted = 0",
+                params![self.namespace, dir_ino.as_slice()],
+            )?;
             tx.conn().execute(
                 "UPDATE shadow_versions
                  SET dirty_gen = 0,
@@ -887,11 +1007,40 @@ impl ShadowDb {
                 "UPDATE shadow_dirs
                  SET uploaded_gen = MAX(uploaded_gen, ?1),
                      upload_state = 'idle', batch_id = NULL, lock_id = NULL,
-                     valid_until_ms = ?2
-                 WHERE dir_ino = ?3",
-                params![to_i64(snapshot_gen)?, uploaded_at_ms, dir_ino.as_slice()],
+                     snapshot_gen = 0,
+                     snapshot_seq = MAX(snapshot_seq, ?2),
+                     valid_until_ms = ?3
+                 WHERE dir_ino = ?4",
+                params![
+                    to_i64(snapshot_gen)?,
+                    to_i64(snapshot_seq.get())?,
+                    valid_until_ms,
+                    dir_ino.as_slice(),
+                ],
             )?;
-            Ok(())
+            tx.conn().execute(
+                "UPDATE shadow_dirs
+                 SET local_only = 0, valid_until_ms = 0, bodies_checked_out = 0
+                 WHERE dir_ino IN (
+                   SELECT ino FROM mm_files
+                   WHERE namespace = ?1 AND dir_ino = ?2
+                     AND kind = 'dir' AND deleted = 0
+                 )",
+                params![self.namespace, dir_ino.as_slice()],
+            )?;
+            tx.conn().execute(
+                "UPDATE mm_dirs SET phase = 'stale'
+                 WHERE namespace = ?1 AND ino IN (
+                   SELECT ino FROM mm_files
+                   WHERE namespace = ?1 AND dir_ino = ?2
+                     AND kind = 'dir' AND deleted = 0
+                 )",
+                params![self.namespace, dir_ino.as_slice()],
+            )?;
+            if let Some(batch) = batch {
+                tx.put_batch(batch)?;
+            }
+            Ok(true)
         })
     }
 
@@ -1020,6 +1169,27 @@ impl ShadowDb {
     }
 }
 
+/// Add shadow columns introduced after the first schema.
+pub(super) fn migrate(conn: &Connection) -> Result<(), ShadowError> {
+    let mut columns = conn.prepare("PRAGMA table_info(shadow_dirs)")?;
+    let names = columns.query_map([], |row| row.get::<_, String>(1))?;
+    let mut has_snapshot_gen = false;
+    for name in names {
+        if name? == "snapshot_gen" {
+            has_snapshot_gen = true;
+        }
+    }
+    if !has_snapshot_gen {
+        conn.execute(
+            "ALTER TABLE shadow_dirs
+             ADD COLUMN snapshot_gen INTEGER NOT NULL DEFAULT 0
+             CHECK (snapshot_gen >= 0)",
+            [],
+        )?;
+    }
+    Ok(())
+}
+
 fn seed(conn: &Connection) -> Result<(), ShadowError> {
     conn.execute(
         "INSERT INTO shadow_meta
@@ -1063,7 +1233,7 @@ fn shadow_dir_from_record<T: MmTx>(
         .query_row(
             "SELECT valid_until_ms, dirty_gen, uploaded_gen, upload_state, batch_id,
                     lock_id, dir_handles, bodies_checked_out, local_only, snapshot_seq,
-                    last_checkout_ms
+                    snapshot_gen, last_checkout_ms
              FROM shadow_dirs WHERE dir_ino = ?1",
             params![record.ino.as_slice()],
             |row| {
@@ -1079,6 +1249,7 @@ fn shadow_dir_from_record<T: MmTx>(
                     row.get::<_, i64>(8)?,
                     row.get::<_, i64>(9)?,
                     row.get::<_, i64>(10)?,
+                    row.get::<_, i64>(11)?,
                 ))
             },
         )
@@ -1094,6 +1265,7 @@ fn shadow_dir_from_record<T: MmTx>(
         bodies,
         local_only,
         snapshot_seq,
+        snapshot_gen,
         last_checkout_ms,
     )) = row
     else {
@@ -1116,6 +1288,8 @@ fn shadow_dir_from_record<T: MmTx>(
         snapshot_seq: MmSeq::new(
             u64::try_from(snapshot_seq).map_err(|_| ShadowError::Invalid("negative seq"))?,
         ),
+        snapshot_gen: u64::try_from(snapshot_gen)
+            .map_err(|_| ShadowError::Invalid("negative generation"))?,
         last_checkout_ms,
     }))
 }
@@ -1129,8 +1303,8 @@ pub(super) fn put_shadow_dir_tx(
         "INSERT INTO shadow_dirs
            (dir_ino, valid_until_ms, dirty_gen, uploaded_gen, upload_state, batch_id,
             lock_id, dir_handles, bodies_checked_out, local_only, snapshot_seq,
-            last_checkout_ms)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+            snapshot_gen, last_checkout_ms)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
          ON CONFLICT(dir_ino) DO UPDATE SET
            valid_until_ms = excluded.valid_until_ms,
            dirty_gen = excluded.dirty_gen,
@@ -1142,6 +1316,7 @@ pub(super) fn put_shadow_dir_tx(
            bodies_checked_out = excluded.bodies_checked_out,
            local_only = excluded.local_only,
            snapshot_seq = excluded.snapshot_seq,
+           snapshot_gen = excluded.snapshot_gen,
            last_checkout_ms = excluded.last_checkout_ms",
         params![
             dir.record.ino.as_slice(),
@@ -1155,6 +1330,7 @@ pub(super) fn put_shadow_dir_tx(
             i64::from(dir.bodies_checked_out),
             i64::from(dir.local_only),
             to_i64(dir.snapshot_seq.get())?,
+            to_i64(dir.snapshot_gen)?,
             dir.last_checkout_ms,
         ],
     )?;

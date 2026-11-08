@@ -412,6 +412,7 @@ impl Shadow {
             bodies_checked_out: true,
             local_only: true,
             snapshot_seq: MmSeq::ZERO,
+            snapshot_gen: 0,
             last_checkout_ms: now_ms(),
         };
         let fuse_ino = self.db.write(|tx| {

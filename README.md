@@ -46,7 +46,7 @@ and the next session resends them.
 
 ## Status
 
-v1.1.0, protocol 3.0, payload v3. The 1.0 wire protocol, schema and
+v1.1.1, protocol 3.0, payload v3. The 1.0 wire protocol, schema and
 `/private` and `/public` behaviour are unchanged; 1.1 adds the independent
 `--mmap` namespaces (`/private-mm`, `/public-mm`) served by `mm-server` and
 mounted by `mm-client` over a local shadow tree. 1.0 and 1.1 can share a host
@@ -671,7 +671,7 @@ CI asserts a size below 15 MiB and no `NEEDED` entries. See
 
 ```bash
 ./install.sh                      # latest release into ~/.local/bin
-./install.sh --version 1.1.0 --prefix /usr/local
+./install.sh --version 1.1.1 --prefix /usr/local
 ```
 
 The script downloads the tarball, verifies its sha256, installs the binary and
