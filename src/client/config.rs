@@ -26,8 +26,6 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-
-
 /// Environment variable carrying the master password.
 pub const ENV_MASTER_PASSWORD: &str = "SYNCMOUNT_MASTER_PASSWORD";
 /// Environment variable carrying a path to the master password.
@@ -266,10 +264,7 @@ pub struct Config {
 
 impl Config {
     /// Validate `mountpoint` and assemble the configuration.
-    pub fn new(
-        endpoint: Endpoint,
-        mountpoint: impl Into<PathBuf>,
-    ) -> Result<Self, ConfigError> {
+    pub fn new(endpoint: Endpoint, mountpoint: impl Into<PathBuf>) -> Result<Self, ConfigError> {
         let mountpoint = mountpoint.into();
         validate_mountpoint(&mountpoint)?;
         let run_dir = env::var_os(ENV_RUN_DIR)

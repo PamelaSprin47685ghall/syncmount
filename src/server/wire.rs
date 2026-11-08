@@ -412,10 +412,7 @@ pub fn event_for(op: &WireOp, planned: &Op, state_before: &State, session: [u8; 
             None,
         ),
         Op::SetAttr {
-            path,
-            attrs,
-            size,
-            ..
+            path, attrs, size, ..
         } => (
             EventPayload::Setattr {
                 ino: ino_bytes(resolve_or(state_before, path, op)),
@@ -521,9 +518,7 @@ pub fn reject_body(
     }
     let reason = reject.reason.as_bytes();
     let encoded = state
-        .and_then(|state| {
-            bincode::serde::encode_to_vec(state, bincode::config::standard()).ok()
-        })
+        .and_then(|state| bincode::serde::encode_to_vec(state, bincode::config::standard()).ok())
         .unwrap_or_default();
     let full = HEADER + encoded.len() + reason.len() <= detail_max;
     let mut out = Vec::with_capacity(if full {
@@ -692,7 +687,11 @@ fn seal_replay_frame(
     let mut header = FrameHeader::new(msg_type, flags, 0, Seq::UNSEQUENCED);
     let sealed =
         Sealer::with_session_key(&ring.session_key(), nonces).seal(&mut header, &prefix, body)?;
-    Ok(encode_frame(&FrameRef::new(&header, &prefix, sealed.as_bytes()))?)
+    Ok(encode_frame(&FrameRef::new(
+        &header,
+        &prefix,
+        sealed.as_bytes(),
+    ))?)
 }
 
 /// Rewrite the sequence number of one encoded frame.
@@ -1629,12 +1628,7 @@ mod tests {
             path: b"/f".to_vec(),
             mtime_ns: 20,
         };
-        let draft = event_for(
-            &wire_op(OpClass::UNLINK, "/f"),
-            &unlink,
-            &state,
-            SESSION,
-        );
+        let draft = event_for(&wire_op(OpClass::UNLINK, "/f"), &unlink, &state, SESSION);
         assert_eq!(
             draft.payload,
             EventPayload::Unlink {
@@ -1787,8 +1781,7 @@ mod tests {
         }
         .encode()
         .unwrap();
-        let decoded =
-            crate::protocol::ErrorMessage::decode(&encoded, &Limits::protocol()).unwrap();
+        let decoded = crate::protocol::ErrorMessage::decode(&encoded, &Limits::protocol()).unwrap();
         assert_eq!(decoded.detail, &body[..]);
     }
 

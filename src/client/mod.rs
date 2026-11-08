@@ -35,16 +35,22 @@ use std::path::PathBuf;
 #[cfg(feature = "fuse")]
 use std::process::Command;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(feature = "fuse")]
+use std::time::Instant;
 
 use crate::protocol::crypto::PskKeyRing;
+#[cfg(feature = "fuse")]
 use crate::store::runtime_dir::RuntimeDir;
 
 /// Consecutive short sessions allowed before the mount gives up.
+#[cfg(feature = "fuse")]
 const RECONNECT_ATTEMPTS: u32 = 6;
 /// First reconnect delay; doubles per attempt up to 32x.
+#[cfg(feature = "fuse")]
 const RECONNECT_BASE: Duration = Duration::from_millis(100);
 /// A session that lived this long resets the reconnect budget.
+#[cfg(feature = "fuse")]
 const HEALTHY_SESSION: Duration = Duration::from_secs(10);
 
 pub use config::{Config, Tuning};
@@ -196,16 +202,14 @@ impl Client {
             // and the server replays the missing events. The first dial is
             // not a retry: a misconfigured endpoint still fails fast.
             let retryable = exit.reason == "resync"
-                || (attempts > 0
-                    && matches!(exit.reason, "dial" | "dial timeout" | "handshake"));
+                || (attempts > 0 && matches!(exit.reason, "dial" | "dial timeout" | "handshake"));
             if retryable {
                 // A slow client may be kicked repeatedly while it is still
                 // applying events. Progress (or a long healthy session) is
                 // what resets the budget, not a clean exit.
                 let applied_after = store.applied_seq().unwrap_or(0);
                 if exit.reason == "resync"
-                    && (applied_after > applied_before
-                        || started.elapsed() >= HEALTHY_SESSION)
+                    && (applied_after > applied_before || started.elapsed() >= HEALTHY_SESSION)
                 {
                     attempts = 0;
                 }
@@ -272,6 +276,7 @@ impl Client {
         Err(ClientError::NoFuse)
     }
 
+    #[cfg(feature = "fuse")]
     fn start_status(&self, store: &Arc<ClientDb>) -> Option<tokio::task::JoinHandle<()>> {
         let base = env::var_os("SYNCMOUNT_RUN_DIR")
             .map(PathBuf::from)
@@ -302,6 +307,7 @@ impl Client {
     }
 }
 
+#[cfg(feature = "fuse")]
 fn transport_endpoint(config: &Config) -> Result<crate::transport::Endpoint, ClientError> {
     let url = format!(
         "{}://{}:{}{}",
@@ -314,6 +320,7 @@ fn transport_endpoint(config: &Config) -> Result<crate::transport::Endpoint, Cli
         .map_err(|error| ClientError::Config(format!("endpoint: {error}")))
 }
 
+#[cfg(feature = "fuse")]
 fn build_status(
     mount_id: &str,
     store: &ClientDb,
@@ -366,6 +373,7 @@ pub fn database_path(config: &Config) -> PathBuf {
     base.join(namespace).join("client.db")
 }
 
+#[cfg(feature = "fuse")]
 fn spawn_signal_task(shutdown: tokio::sync::mpsc::Sender<()>) {
     tokio::spawn(async move {
         #[cfg(unix)]

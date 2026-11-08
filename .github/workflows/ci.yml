@@ -21,44 +21,47 @@ jobs:
       - name: fmt
         run: cargo fmt --all -- --check
       - name: clippy
-        run: cargo clippy --locked --all-targets --features testkit -- -D warnings
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
       - name: clippy (server-only)
         run: cargo clippy --locked --all-targets --no-default-features -- -D warnings
-      - name: test
-        run: cargo test --locked --features testkit --lib --tests
+      - name: test (unit)
+        run: cargo test --locked --lib --all-features
+      - name: test (replay throughput)
+        run: cargo test --locked --test replay_throughput -- --nocapture
 
   fuse:
-    name: fuse (conditional)
+    name: fuse (real mount)
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.85.0
       - name: Install fuse3
         run: |
+          set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y fuse3
           sudo rm -f /usr/local/bin/fusermount3
           echo user_allow_other | sudo tee -a /etc/fuse.conf
-      - name: Probe /dev/fuse
-        id: probe
+      - name: Preflight FUSE
         run: |
-          if [ -r /dev/fuse ] && [ -w /dev/fuse ]; then
-            echo "available=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "available=false" >> "$GITHUB_OUTPUT"
-            echo "SKIP: /dev/fuse is not readable and writable on this runner"
-          fi
-      - name: FUSE tests
-        if: steps.probe.outputs.available == 'true'
+          set -euo pipefail
+          ls -l /dev/fuse
+          command -v fusermount3
+          fusermount3 --version
+      - name: Mount tests (src/fuse/sqlite.rs)
         env:
-          FUSERMOUNT_PATH: /usr/bin/fusermount3
           SYNCMOUNT_REQUIRE_FUSE: "1"
-        run: |
-          if [ ! -f tests/fuse_mount.rs ]; then
-            echo "SKIP: tests/fuse_mount.rs lands with W13"
-            exit 0
-          fi
-          cargo test --locked --features testkit,fuse-tests --test fuse_mount -- --nocapture
+        run: cargo test --locked --lib --features fuse-tests mount_tests -- --nocapture
+      - name: End-to-end tests
+        env:
+          SYNCMOUNT_REQUIRE_FUSE: "1"
+          FUSERMOUNT_PATH: /usr/bin/fusermount3
+        run: cargo test --locked --test e2e_sqlite -- --test-threads=1 --nocapture
+      - name: Round-trip tests
+        env:
+          SYNCMOUNT_REQUIRE_FUSE: "1"
+          FUSERMOUNT_PATH: /usr/bin/fusermount3
+        run: cargo test --locked --test rtt_blackhole -- --test-threads=1 --nocapture
 
   msrv:
     name: msrv 1.85.0 / musl
@@ -68,14 +71,23 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.85.0
         with:
           targets: x86_64-unknown-linux-musl
+      - name: Install musl toolchain
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
       - name: check (all targets)
-        run: cargo +1.85.0 check --locked --all-targets --features testkit
+        run: cargo +1.85.0 check --locked --all-targets --all-features
       - name: build (host)
         run: cargo +1.85.0 build --locked --profile dist
       - name: build (musl static)
+        env:
+          CC_x86_64_unknown_linux_musl: musl-gcc
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
         run: cargo +1.85.0 build --locked --profile dist --target x86_64-unknown-linux-musl
       - name: Assert static binary
         run: |
+          set -euo pipefail
           bin=target/x86_64-unknown-linux-musl/dist/syncmount
           file "$bin"
           if ldd "$bin" 2>&1 | grep -q '=>'; then

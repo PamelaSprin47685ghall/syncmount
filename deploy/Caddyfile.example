@@ -1,0 +1,75 @@
+# syncmount 1.0.0 Caddy example: plain HTTP on :80, no TLS.
+# Replace the example hostnames before use. Keep the three host matchers and
+# the two path matchers; do not use handle_path, which would strip the
+# namespace prefix.
+{
+	auto_https off
+	admin off
+	persist_config off
+	servers :80 {
+		timeouts {
+			read_body_idle -1s
+			write_idle -1s
+		}
+	}
+}
+
+:80 {
+	log {
+		format json
+	}
+
+	@health {
+		host sync.example.com sync-v4.example.com sync-v6.example.com
+		path /__syncmount/healthz
+	}
+	handle @health {
+		reverse_proxy 127.0.0.1:8081 {
+			transport http {
+				versions 1.1
+			}
+		}
+	}
+
+	@private {
+		host sync.example.com sync-v4.example.com sync-v6.example.com
+		path /private/*
+	}
+	handle @private {
+		reverse_proxy 127.0.0.1:8081 {
+			flush_interval -1
+			health_uri /__syncmount/healthz
+			health_interval 30s
+			health_timeout 5s
+			health_status 200
+			health_fails 3
+			health_passes 1
+			transport http {
+				versions 1.1
+			}
+		}
+	}
+
+	@public {
+		host sync.example.com sync-v4.example.com sync-v6.example.com
+		path /public/*
+	}
+	handle @public {
+		reverse_proxy 127.0.0.1:8082 {
+			flush_interval -1
+			health_uri /__syncmount/healthz
+			health_interval 30s
+			health_timeout 5s
+			health_status 200
+			health_fails 3
+			health_passes 1
+			transport http {
+				versions 1.1
+			}
+		}
+	}
+
+	handle {
+		respond "not found" 404
+	}
+}

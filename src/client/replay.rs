@@ -279,10 +279,7 @@ impl ClientDb {
             // own event is the only thing that can rebuild it. Apply it like
             // any other event and acknowledge the row; the older-echo hazard
             // does not exist on an empty tree.
-            let replaying_local = tx
-                .meta_i64(super::db::KEY_REPLAY_LOCAL)
-                .unwrap_or(0)
-                != 0;
+            let replaying_local = tx.meta_i64(super::db::KEY_REPLAY_LOCAL).unwrap_or(0) != 0;
             // Our own echo acknowledges the outbox row. Data operations stay
             // ack-only: the local effect was committed in the same transaction
             // that created that row, and the local state may have advanced past
@@ -308,12 +305,7 @@ impl ClientDb {
                             .as_deref()
                             .ok_or(DbError::Corrupt("rename event without a destination"))?;
                         Self::apply_own_rename(
-                            &tx,
-                            event.seq,
-                            *ino,
-                            old_path,
-                            new_path,
-                            *mtime_ns,
+                            &tx, event.seq, *ino, old_path, new_path, *mtime_ns,
                         )?;
                     }
                     EventPayload::Link { ino, mtime_ns } => {
@@ -444,10 +436,7 @@ impl ClientDb {
 
     /// Delete an outbox row (and any coalesced members stored in `undo`).
     /// Returns the chunk hashes whose refcount must be refreshed.
-    fn ack_outbox(
-        tx: &WriteTx<'_>,
-        op_id: [u8; 16],
-    ) -> Result<Option<Vec<[u8; 32]>>, DbError> {
+    fn ack_outbox(tx: &WriteTx<'_>, op_id: [u8; 16]) -> Result<Option<Vec<[u8; 32]>>, DbError> {
         let exists: bool = tx.conn().query_row(
             "SELECT EXISTS(SELECT 1 FROM outbox WHERE op_id = ?1)",
             [op_id.as_slice()],
@@ -458,9 +447,11 @@ impl ClientDb {
         }
         let undo: Option<Vec<u8>> = tx
             .conn()
-            .query_row("SELECT undo FROM outbox WHERE op_id = ?1", [op_id.as_slice()], |row| {
-                row.get::<_, Option<Vec<u8>>>(0)
-            })
+            .query_row(
+                "SELECT undo FROM outbox WHERE op_id = ?1",
+                [op_id.as_slice()],
+                |row| row.get::<_, Option<Vec<u8>>>(0),
+            )
             .optional()?
             .flatten();
         let mut members = vec![op_id];
@@ -475,9 +466,9 @@ impl ClientDb {
         let mut hashes = Vec::new();
         for member in members {
             {
-                let mut stmt = tx.conn().prepare(
-                    "SELECT chunk_hash FROM outbox_chunks WHERE op_id = ?1",
-                )?;
+                let mut stmt = tx
+                    .conn()
+                    .prepare("SELECT chunk_hash FROM outbox_chunks WHERE op_id = ?1")?;
                 let mut rows = stmt.query([member.as_slice()])?;
                 while let Some(row) = rows.next()? {
                     let bytes: Vec<u8> = row.get(0)?;
@@ -523,8 +514,8 @@ impl ClientDb {
                 } => (*mode, *uid, *gid, *mtime_ns),
                 _ => return Err(DbError::Corrupt("not a create payload")),
             };
-            let mut root = Self::object_in(tx, ROOT_INO)?
-                .ok_or(DbError::Corrupt("root object is missing"))?;
+            let mut root =
+                Self::object_in(tx, ROOT_INO)?.ok_or(DbError::Corrupt("root object is missing"))?;
             root.mode = mode;
             root.uid = uid;
             root.gid = gid;
@@ -544,7 +535,16 @@ impl ClientDb {
                 gid,
                 mtime_ns,
                 file_root,
-            } => (*ino, ObjectKind::File, *mode, *uid, *gid, *mtime_ns, *file_root, None),
+            } => (
+                *ino,
+                ObjectKind::File,
+                *mode,
+                *uid,
+                *gid,
+                *mtime_ns,
+                *file_root,
+                None,
+            ),
             EventPayload::CreateDir {
                 ino,
                 mode,
@@ -552,7 +552,16 @@ impl ClientDb {
                 gid,
                 mtime_ns,
                 file_root,
-            } => (*ino, ObjectKind::Dir, *mode, *uid, *gid, *mtime_ns, *file_root, None),
+            } => (
+                *ino,
+                ObjectKind::Dir,
+                *mode,
+                *uid,
+                *gid,
+                *mtime_ns,
+                *file_root,
+                None,
+            ),
             EventPayload::Symlink {
                 ino,
                 mode,
@@ -577,7 +586,14 @@ impl ClientDb {
         // the whole subtree first. There is nowhere to attach the name, so
         // skip; the server's own later events settle the object.
         let Some(parent) = Self::live_dir_in(tx, parent_path)? else {
-            Self::note_skip(tx, seq, "create", ino, Some(path), "parent directory is gone")?;
+            Self::note_skip(
+                tx,
+                seq,
+                "create",
+                ino,
+                Some(path),
+                "parent directory is gone",
+            )?;
             return Ok(());
         };
 
@@ -664,8 +680,10 @@ impl ClientDb {
             return Ok(());
         };
         let existing = Self::object_chunks_in(tx, ino)?;
-        let mut by_no: BTreeMap<u32, ChunkRef> =
-            existing.iter().map(|chunk| (chunk.chunk_no, chunk.clone())).collect();
+        let mut by_no: BTreeMap<u32, ChunkRef> = existing
+            .iter()
+            .map(|chunk| (chunk.chunk_no, chunk.clone()))
+            .collect();
 
         let mut chunks = chunks.to_vec();
         if chunks.is_empty() {
@@ -674,14 +692,13 @@ impl ClientDb {
                 let mut cursor = 0usize;
                 let mut chunk_no = (base / u64::from(crate::store::sqlite::CHUNK_BYTES)) as u32;
                 while cursor < bytes.len() {
-                    let take = (bytes.len() - cursor)
-                        .min(crate::store::sqlite::CHUNK_BYTES as usize);
+                    let take =
+                        (bytes.len() - cursor).min(crate::store::sqlite::CHUNK_BYTES as usize);
                     let slice = &bytes[cursor..cursor + take];
                     chunks.push(ChunkRef {
                         chunk_no,
                         hash: crate::store::sqlite::chunk_hash(slice),
-                        offset: u64::from(chunk_no)
-                            * u64::from(crate::store::sqlite::CHUNK_BYTES),
+                        offset: u64::from(chunk_no) * u64::from(crate::store::sqlite::CHUNK_BYTES),
                         len: take as u32,
                     });
                     cursor += take;
@@ -698,7 +715,9 @@ impl ClientDb {
                     Some(slice)
                 }
                 Some(_) => {
-                    return Err(DbError::Corrupt("write stream is shorter than its chunk list"))
+                    return Err(DbError::Corrupt(
+                        "write stream is shorter than its chunk list",
+                    ));
                 }
                 None => None,
             };
@@ -745,8 +764,8 @@ impl ClientDb {
         let refs = Self::assemble_chunks(tx, size, &by_no)?;
         let computed_root = crate::store::sqlite::file_root(ObjectKind::File, None, &refs);
         object.size = size;
-        object.block_count = u32::try_from(refs.len())
-            .map_err(|_| DbError::Corrupt("too many chunks"))?;
+        object.block_count =
+            u32::try_from(refs.len()).map_err(|_| DbError::Corrupt("too many chunks"))?;
         object.file_root = if file_root == [0u8; 32] {
             computed_root
         } else {
@@ -774,8 +793,10 @@ impl ClientDb {
             return Ok(());
         };
         let existing = Self::object_chunks_in(tx, ino)?;
-        let mut by_no: BTreeMap<u32, ChunkRef> =
-            existing.iter().map(|chunk| (chunk.chunk_no, chunk.clone())).collect();
+        let mut by_no: BTreeMap<u32, ChunkRef> = existing
+            .iter()
+            .map(|chunk| (chunk.chunk_no, chunk.clone()))
+            .collect();
         let keep = size.div_ceil(u64::from(sqlite::CHUNK_BYTES)) as u32;
         by_no.retain(|chunk_no, _| *chunk_no < keep);
         if size > object.size {
@@ -787,9 +808,7 @@ impl ClientDb {
                 let chunk = tx
                     .chunk(existing.hash)?
                     .ok_or(DbError::MissingChunk(existing.hash))?;
-                let mut bytes = chunk
-                    .data
-                    .ok_or(DbError::MissingChunk(existing.hash))?;
+                let mut bytes = chunk.data.ok_or(DbError::MissingChunk(existing.hash))?;
                 let wanted = (size % u64::from(sqlite::CHUNK_BYTES)) as usize;
                 bytes.truncate(wanted);
                 let reference = Self::put_chunk_ref(tx, chunk_no, &bytes)?;
@@ -799,8 +818,8 @@ impl ClientDb {
         let refs = Self::assemble_chunks(tx, size, &by_no)?;
         let computed_root = crate::store::sqlite::file_root(ObjectKind::File, None, &refs);
         object.size = size;
-        object.block_count = u32::try_from(refs.len())
-            .map_err(|_| DbError::Corrupt("too many chunks"))?;
+        object.block_count =
+            u32::try_from(refs.len()).map_err(|_| DbError::Corrupt("too many chunks"))?;
         object.file_root = if file_root == [0u8; 32] {
             computed_root
         } else {
@@ -865,11 +884,25 @@ impl ClientDb {
             return Ok(());
         };
         let Some(old_parent) = Self::live_dir_in(tx, old_parent_path)? else {
-            Self::note_skip(tx, seq, "rename", ino, Some(old_path), "source parent is gone")?;
+            Self::note_skip(
+                tx,
+                seq,
+                "rename",
+                ino,
+                Some(old_path),
+                "source parent is gone",
+            )?;
             return Ok(());
         };
         let Some(new_parent) = Self::live_dir_in(tx, new_parent_path)? else {
-            Self::note_skip(tx, seq, "rename", ino, Some(old_path), "destination parent is gone")?;
+            Self::note_skip(
+                tx,
+                seq,
+                "rename",
+                ino,
+                Some(old_path),
+                "destination parent is gone",
+            )?;
             return Ok(());
         };
         // The server stamps the moved object and both parents, whether or not
@@ -1025,8 +1058,7 @@ impl ClientDb {
         path: &str,
         mtime_ns: Option<i64>,
     ) -> Result<(), DbError> {
-        let (parent_path, name) =
-            split_path(path).ok_or(DbError::Corrupt("link at the root"))?;
+        let (parent_path, name) = split_path(path).ok_or(DbError::Corrupt("link at the root"))?;
         let Some(parent) = Self::live_dir_in(tx, parent_path)? else {
             Self::note_skip(tx, seq, "link", ino, Some(path), "parent directory is gone")?;
             return Ok(());
@@ -1069,15 +1101,21 @@ impl ClientDb {
         is_dir: bool,
         mtime_ns: Option<i64>,
     ) -> Result<(), DbError> {
-        let (parent_path, name) =
-            split_path(path).ok_or(DbError::Corrupt("unlink of the root"))?;
+        let (parent_path, name) = split_path(path).ok_or(DbError::Corrupt("unlink of the root"))?;
         let Some(parent) = Self::live_dir_in(tx, parent_path)? else {
             // The client applied a later deletion of the parent first. Drop a
             // name row left behind by an earlier directory conflict so the
             // path cannot resurrect, then skip.
             Self::drop_unreachable_name(tx, seq, path)?;
             Self::settle_removed(tx, seq, ino, is_dir, mtime_ns)?;
-            Self::note_skip(tx, seq, "remove", ino, Some(path), "parent directory is gone")?;
+            Self::note_skip(
+                tx,
+                seq,
+                "remove",
+                ino,
+                Some(path),
+                "parent directory is gone",
+            )?;
             return Ok(());
         };
         if let Some(mtime_ns) = mtime_ns {
@@ -1131,8 +1169,7 @@ impl ClientDb {
         path: &str,
         mtime_ns: Option<i64>,
     ) -> Result<(), DbError> {
-        let (parent_path, name) =
-            split_path(path).ok_or(DbError::Corrupt("link at the root"))?;
+        let (parent_path, name) = split_path(path).ok_or(DbError::Corrupt("link at the root"))?;
         let Some(parent) = Self::live_dir_in(tx, parent_path)? else {
             Self::note_skip(tx, seq, "link", ino, Some(path), "parent directory is gone")?;
             return Ok(());
@@ -1332,19 +1369,17 @@ impl ClientDb {
     /// only detaches the directory's own name. The rows stay reachable by
     /// `path`, so a later removal of the parent would otherwise leave them
     /// behind for good.
-    fn drop_unreachable_name(
-        tx: &WriteTx<'_>,
-        seq: i64,
-        path: &str,
-    ) -> Result<(), DbError> {
+    fn drop_unreachable_name(tx: &WriteTx<'_>, seq: i64, path: &str) -> Result<(), DbError> {
         let Some((_, name)) = split_path(path) else {
             return Ok(());
         };
         let row: Option<(Vec<u8>, Vec<u8>)> = tx
             .conn()
-            .query_row("SELECT parent, ino FROM names WHERE path = ?1", [path], |row| {
-                Ok((row.get(0)?, row.get(1)?))
-            })
+            .query_row(
+                "SELECT parent, ino FROM names WHERE path = ?1",
+                [path],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
             .optional()?;
         let Some((parent, ino)) = row else {
             return Ok(());
@@ -1372,7 +1407,7 @@ impl ClientDb {
             seq,
             kind,
             ino = ?ino,
-            path = ?path,
+            path_hash = ?path.map(super::status::path_hash_prefix),
             reason,
             "skipping an event the local tree has already overtaken"
         );
@@ -1396,7 +1431,7 @@ impl ClientDb {
             seq,
             kind,
             ino = ?ino,
-            path = ?path,
+            path_hash = ?path.map(super::status::path_hash_prefix),
             reason,
             "the local tree already holds the event's effect"
         );
@@ -1459,7 +1494,6 @@ impl ClientDb {
             .transpose()
     }
 
-
     /// Record the server epoch without clearing the local tree.
     ///
     /// The first client of an empty server keeps its tree and seeds it; only
@@ -1508,9 +1542,7 @@ impl ClientDb {
         Self::check_replica_rows(tx.conn())
     }
 
-    fn check_replica_rows(
-        conn: &rusqlite::Connection,
-    ) -> Result<Vec<ReplicaIssue>, DbError> {
+    fn check_replica_rows(conn: &rusqlite::Connection) -> Result<Vec<ReplicaIssue>, DbError> {
         let (objects, names) = Self::replica_rows(conn)?;
         let mut issues = Vec::new();
         if !objects
@@ -1689,9 +1721,7 @@ impl ClientDb {
                         .get(&name.parent)
                         .is_some_and(|parent| !parent.deleted && parent.kind.is_dir());
                     let ino_ok = name.ino != ROOT_INO
-                        && objects
-                            .get(&name.ino)
-                            .is_some_and(|object| !object.deleted);
+                        && objects.get(&name.ino).is_some_and(|object| !object.deleted);
                     if parent_ok && ino_ok {
                         kept.push(name);
                     } else {
@@ -1856,7 +1886,8 @@ impl ClientDb {
         self.write(|tx| {
             tx.conn().execute("DELETE FROM object_chunks", [])?;
             tx.conn().execute("DELETE FROM names", [])?;
-            tx.conn().execute("DELETE FROM objects WHERE ino <> ?1", [ROOT_INO.as_slice()])?;
+            tx.conn()
+                .execute("DELETE FROM objects WHERE ino <> ?1", [ROOT_INO.as_slice()])?;
             tx.conn().execute(
                 "DELETE FROM chunks WHERE hash NOT IN (SELECT chunk_hash FROM outbox_chunks)",
                 [],
@@ -1868,8 +1899,10 @@ impl ClientDb {
             )?;
             // A `failed` row is a tombstone: the server never applied it and
             // must not receive it again. Only an in-flight row is retried.
-            tx.conn()
-                .execute("UPDATE outbox SET state = 'pending' WHERE state = 'sent'", [])?;
+            tx.conn().execute(
+                "UPDATE outbox SET state = 'pending' WHERE state = 'sent'",
+                [],
+            )?;
             tx.set_meta_i64(super::db::KEY_REPLAY_LOCAL, 1)?;
             let root = Object {
                 ino: ROOT_INO,
@@ -2289,8 +2322,8 @@ impl ClientDb {
             let ino: Option<Vec<u8>> = row.get(4)?;
             let payload: Vec<u8> = row.get(5)?;
             let state_text: String = row.get(6)?;
-            let state = OutboxState::parse(&state_text)
-                .ok_or(DbError::Corrupt("unknown outbox state"))?;
+            let state =
+                OutboxState::parse(&state_text).ok_or(DbError::Corrupt("unknown outbox state"))?;
             let seq: i64 = row.get(7)?;
             let decoded = EventPayload::decode(kind, &payload)?;
             out.push(super::db::OutboxOp {
@@ -2341,18 +2374,12 @@ impl ClientDb {
     }
 
     /// Mark rows sent, and record the coalesced members on the first row.
-    pub fn mark_sent(
-        &self,
-        op_id: [u8; 16],
-        members: &[[u8; 16]],
-    ) -> Result<(), DbError> {
+    pub fn mark_sent(&self, op_id: [u8; 16], members: &[[u8; 16]]) -> Result<(), DbError> {
         self.write(|tx| {
             if members.len() > 1 {
-                let bytes = bincode::serde::encode_to_vec(
-                    members.to_vec(),
-                    bincode::config::standard(),
-                )
-                .map_err(|_| DbError::Corrupt("cannot encode coalesced members"))?;
+                let bytes =
+                    bincode::serde::encode_to_vec(members.to_vec(), bincode::config::standard())
+                        .map_err(|_| DbError::Corrupt("cannot encode coalesced members"))?;
                 tx.conn().execute(
                     "UPDATE outbox SET undo = ?2 WHERE op_id = ?1 AND state = 'pending'",
                     params![op_id.as_slice(), bytes],
@@ -2375,8 +2402,10 @@ impl ClientDb {
     /// Reset `sent` back to `pending` after a crash or a new connection.
     pub fn reset_sent(&self) -> Result<(), DbError> {
         self.write(|tx| {
-            tx.conn()
-                .execute("UPDATE outbox SET state = 'pending' WHERE state = 'sent'", [])?;
+            tx.conn().execute(
+                "UPDATE outbox SET state = 'pending' WHERE state = 'sent'",
+                [],
+            )?;
             Ok(())
         })
     }
@@ -2446,7 +2475,11 @@ impl ClientDb {
         let Some((parent_path, name)) = state.path.rsplit_once('/') else {
             return Ok(());
         };
-        let parent_path = if parent_path.is_empty() { "/" } else { parent_path };
+        let parent_path = if parent_path.is_empty() {
+            "/"
+        } else {
+            parent_path
+        };
         let local_parent: Option<Ino> = if parent_path == "/" {
             Some(ROOT_INO)
         } else {
@@ -2523,8 +2556,7 @@ impl ClientDb {
             let op_id: [u8; 16] = op_id
                 .try_into()
                 .map_err(|_| DbError::Corrupt("outbox op_id is not 16 bytes"))?;
-            let kind = EventKind::parse(&kind)
-                .ok_or(DbError::Corrupt("unknown outbox kind"))?;
+            let kind = EventKind::parse(&kind).ok_or(DbError::Corrupt("unknown outbox kind"))?;
             let payload = EventPayload::decode(kind, &payload)?;
             let data = Self::outbox_data_in(&tx, &op_id)?;
             Self::apply_local_outbox_payload(
@@ -2588,7 +2620,13 @@ impl ClientDb {
             } => {
                 if let Some(size) = size {
                     Self::apply_truncate(
-                        tx, seq, *ino, *size, [0u8; 32], mtime_ns.unwrap_or(0), path,
+                        tx,
+                        seq,
+                        *ino,
+                        *size,
+                        [0u8; 32],
+                        mtime_ns.unwrap_or(0),
+                        path,
                     )?;
                 }
                 Self::apply_setattr_attrs(tx, seq, *ino, mode, uid, gid, mtime_ns)?;
@@ -2629,9 +2667,8 @@ impl ClientDb {
                LEFT JOIN chunks c ON c.hash = oc.chunk_hash
               WHERE oc.op_id = ?1 ORDER BY oc.chunk_no",
         )?;
-        let rows = statement.query_map([op_id.as_slice()], |row| {
-            row.get::<_, Option<Vec<u8>>>(0)
-        })?;
+        let rows =
+            statement.query_map([op_id.as_slice()], |row| row.get::<_, Option<Vec<u8>>>(0))?;
         let mut data = Vec::new();
         let mut any = false;
         for row in rows {
@@ -2652,9 +2689,7 @@ mod tests {
     use super::*;
     use crate::client::db::{ClientDb, DbError};
     use crate::client::ops::{AttrChange, CreateAttrs};
-    use crate::store::sqlite::{
-        ChunkRef, EventPayload, ObjectKind, ROOT_INO, V1_SETATTR_BYTES,
-    };
+    use crate::store::sqlite::{ChunkRef, EventPayload, ObjectKind, ROOT_INO, V1_SETATTR_BYTES};
     use std::ffi::OsStr;
 
     fn open() -> (tempfile::TempDir, ClientDb) {
@@ -2668,7 +2703,8 @@ mod tests {
         let mut offset = 0u64;
         let mut chunk_no = 0u32;
         while offset < data.len() as u64 {
-            let end = ((offset as usize) + crate::store::sqlite::CHUNK_BYTES as usize).min(data.len());
+            let end =
+                ((offset as usize) + crate::store::sqlite::CHUNK_BYTES as usize).min(data.len());
             let bytes = &data[offset as usize..end];
             chunks.push(ChunkRef {
                 chunk_no,
@@ -2707,12 +2743,30 @@ mod tests {
             file_root: crate::store::sqlite::file_root(ObjectKind::File, None, &[]),
         };
         let outcome = db
-            .apply_remote(1, 1, Some([0xa1; 16]), "ok", &create, Some("/a"), None, None)
+            .apply_remote(
+                1,
+                1,
+                Some([0xa1; 16]),
+                "ok",
+                &create,
+                Some("/a"),
+                None,
+                None,
+            )
             .unwrap();
         assert_eq!(outcome, super::super::db::ApplyOutcome::Applied);
         let (write, _) = write_payload(ino, b"hello");
         let outcome = db
-            .apply_remote(2, 1, Some([0xa2; 16]), "ok", &write, Some("/a"), None, Some(b"hello"))
+            .apply_remote(
+                2,
+                1,
+                Some([0xa2; 16]),
+                "ok",
+                &write,
+                Some("/a"),
+                None,
+                Some(b"hello"),
+            )
             .unwrap();
         assert_eq!(outcome, super::super::db::ApplyOutcome::Applied);
         assert_eq!(db.read_at(ino, 0, 5).unwrap(), b"hello");
@@ -2720,7 +2774,16 @@ mod tests {
         assert_eq!(db.lookup_by_path("/a").unwrap().size, 5);
 
         let duplicate = db
-            .apply_remote(2, 1, Some([0xa2; 16]), "ok", &write, Some("/a"), None, Some(b"hello"))
+            .apply_remote(
+                2,
+                1,
+                Some([0xa2; 16]),
+                "ok",
+                &write,
+                Some("/a"),
+                None,
+                Some(b"hello"),
+            )
             .unwrap();
         assert_eq!(duplicate, super::super::db::ApplyOutcome::Duplicate);
         assert_eq!(db.applied_seq().unwrap(), 2);
@@ -2738,8 +2801,17 @@ mod tests {
             mtime_ns: 1,
             file_root: crate::store::sqlite::file_root(ObjectKind::File, None, &[]),
         };
-        db.apply_remote(1, 1, Some([0xc1; 16]), "ok", &create, Some("/a"), None, None)
-            .unwrap();
+        db.apply_remote(
+            1,
+            1,
+            Some([0xc1; 16]),
+            "ok",
+            &create,
+            Some("/a"),
+            None,
+            None,
+        )
+        .unwrap();
         let (write, _) = write_payload(ino, b"hello");
         db.apply_remote(
             2,
@@ -2756,7 +2828,16 @@ mod tests {
         // A pre-upgrade row changes attributes only: the size must not move.
         let legacy = EventPayload::decode(EventKind::Setattr, &V1_SETATTR_BYTES).unwrap();
         let outcome = db
-            .apply_remote(3, 1, Some([0xc3; 16]), "ok", &legacy, Some("/a"), None, None)
+            .apply_remote(
+                3,
+                1,
+                Some([0xc3; 16]),
+                "ok",
+                &legacy,
+                Some("/a"),
+                None,
+                None,
+            )
             .unwrap();
         assert_eq!(outcome, super::super::db::ApplyOutcome::Applied);
         let object = db.lookup_by_path("/a").unwrap();
@@ -2773,8 +2854,17 @@ mod tests {
             mtime_ns: Some(9),
             size: Some(3),
         };
-        db.apply_remote(4, 1, Some([0xc4; 16]), "ok", &current, Some("/a"), None, None)
-            .unwrap();
+        db.apply_remote(
+            4,
+            1,
+            Some([0xc4; 16]),
+            "ok",
+            &current,
+            Some("/a"),
+            None,
+            None,
+        )
+        .unwrap();
         let object = db.lookup_by_path("/a").unwrap();
         assert_eq!(object.mode, 0o600);
         assert_eq!(object.size, 3);
@@ -2794,23 +2884,23 @@ mod tests {
             mtime_ns: 1,
             file_root: crate::store::sqlite::file_root(ObjectKind::File, None, &[]),
         };
-        db.apply_remote(1, 1, Some([0xb1; 16]), "ok", &create, Some("/a"), None, None)
-            .unwrap();
+        db.apply_remote(
+            1,
+            1,
+            Some([0xb1; 16]),
+            "ok",
+            &create,
+            Some("/a"),
+            None,
+            None,
+        )
+        .unwrap();
         let (write, _) = write_payload(ino, b"hello");
 
         // The STREAM_DATA fragment was lost: `data` is None and the chunk is
         // not cached locally. The event must not advance the watermark.
         let error = db
-            .apply_remote(
-                2,
-                1,
-                Some([0xb2; 16]),
-                "ok",
-                &write,
-                Some("/a"),
-                None,
-                None,
-            )
+            .apply_remote(2, 1, Some([0xb2; 16]), "ok", &write, Some("/a"), None, None)
             .unwrap_err();
         assert!(matches!(error, DbError::MissingChunk(_)));
         assert_eq!(db.applied_seq().unwrap(), 1);
@@ -2913,12 +3003,23 @@ mod tests {
             mtime_ns: 1,
             file_root: crate::store::sqlite::file_root(ObjectKind::Dir, None, &[]),
         };
-        db.apply_remote(1, 1, Some([0xb1; 16]), "ok", &create, Some("/d"), None, None)
-            .unwrap();
+        db.apply_remote(
+            1,
+            1,
+            Some([0xb1; 16]),
+            "ok",
+            &create,
+            Some("/d"),
+            None,
+            None,
+        )
+        .unwrap();
         assert!(db.lookup_by_path("/d").is_ok());
         db.create_file(ino, OsStr::new("local"), CreateAttrs::new(0o644, 0, 0))
             .unwrap();
-        let pending = db.outbox_count(super::super::db::OutboxState::Pending).unwrap();
+        let pending = db
+            .outbox_count(super::super::db::OutboxState::Pending)
+            .unwrap();
         assert!(pending > 0);
 
         db.reset_epoch(2).unwrap();
@@ -2928,7 +3029,8 @@ mod tests {
         assert_eq!(db.lookup_by_path("/d").unwrap_err().errno(), Errno::ENOENT);
         // Local intent survives; the tree it referred to does not.
         assert_eq!(
-            db.outbox_count(super::super::db::OutboxState::Pending).unwrap(),
+            db.outbox_count(super::super::db::OutboxState::Pending)
+                .unwrap(),
             pending
         );
     }
@@ -2945,11 +3047,22 @@ mod tests {
             mtime_ns: 1,
             file_root: crate::store::sqlite::file_root(ObjectKind::Dir, None, &[]),
         };
-        db.apply_remote(1, 1, Some([0xb1; 16]), "ok", &create, Some("/d"), None, None)
-            .unwrap();
+        db.apply_remote(
+            1,
+            1,
+            Some([0xb1; 16]),
+            "ok",
+            &create,
+            Some("/d"),
+            None,
+            None,
+        )
+        .unwrap();
         db.create_file(ino, OsStr::new("local"), CreateAttrs::new(0o644, 0, 0))
             .unwrap();
-        let pending = db.outbox_count(super::super::db::OutboxState::Pending).unwrap();
+        let pending = db
+            .outbox_count(super::super::db::OutboxState::Pending)
+            .unwrap();
 
         db.fast_forward(2, 9).unwrap();
 
@@ -2960,7 +3073,8 @@ mod tests {
         assert!(db.has_content().unwrap());
         // Local intent survives; it is not part of the adopted watermark.
         assert_eq!(
-            db.outbox_count(super::super::db::OutboxState::Pending).unwrap(),
+            db.outbox_count(super::super::db::OutboxState::Pending)
+                .unwrap(),
             pending
         );
     }
@@ -2993,13 +3107,17 @@ mod tests {
         // The pre-seed create/write rows were folded into the snapshot and
         // replaced by the deterministic seed rows.
         assert_eq!(
-            source.outbox_count(super::super::db::OutboxState::Pending).unwrap(),
+            source
+                .outbox_count(super::super::db::OutboxState::Pending)
+                .unwrap(),
             report.events
         );
         let again = source.seed(1).unwrap();
         assert_eq!(again.events, 0);
         assert_eq!(
-            source.outbox_count(super::super::db::OutboxState::Pending).unwrap(),
+            source
+                .outbox_count(super::super::db::OutboxState::Pending)
+                .unwrap(),
             report.events
         );
 
@@ -3031,10 +3149,17 @@ mod tests {
             assert_eq!(outcome, super::super::db::ApplyOutcome::Applied);
         }
         assert_eq!(target.lookup_by_path("/d/f").unwrap().size, 11);
-        assert_eq!(target.read_at(target.lookup_by_path("/d/f").unwrap().ino, 0, 11).unwrap(), b"hello world");
+        assert_eq!(
+            target
+                .read_at(target.lookup_by_path("/d/f").unwrap().ino, 0, 11)
+                .unwrap(),
+            b"hello world"
+        );
         assert_eq!(target.lookup_by_path("/empty").unwrap().size, 0);
         assert_eq!(
-            target.readlink(target.lookup_by_path("/link").unwrap().ino).unwrap(),
+            target
+                .readlink(target.lookup_by_path("/link").unwrap().ino)
+                .unwrap(),
             b"d/f"
         );
         assert_eq!(target.applied_seq().unwrap(), rows.len() as i64);
@@ -3122,7 +3247,10 @@ mod tests {
         .unwrap();
         assert!(db.lookup_by_path("/d/g").is_err());
         assert!(db.getattr(file_ino).is_err());
-        assert!(matches!(db.lookup_by_path("/d/g"), Err(DbError::Errno(Errno::ENOENT))));
+        assert!(matches!(
+            db.lookup_by_path("/d/g"),
+            Err(DbError::Errno(Errno::ENOENT))
+        ));
     }
 
     fn dir_payload(ino: Ino) -> EventPayload {
@@ -3225,9 +3353,18 @@ mod tests {
         );
 
         assert_eq!(db.applied_seq().unwrap(), 7);
-        assert!(matches!(db.lookup_by_path("/d"), Err(DbError::Errno(Errno::ENOENT))));
-        assert!(matches!(db.lookup_by_path("/d/f"), Err(DbError::Errno(Errno::ENOENT))));
-        assert!(matches!(db.lookup_by_path("/d/g"), Err(DbError::Errno(Errno::ENOENT))));
+        assert!(matches!(
+            db.lookup_by_path("/d"),
+            Err(DbError::Errno(Errno::ENOENT))
+        ));
+        assert!(matches!(
+            db.lookup_by_path("/d/f"),
+            Err(DbError::Errno(Errno::ENOENT))
+        ));
+        assert!(matches!(
+            db.lookup_by_path("/d/g"),
+            Err(DbError::Errno(Errno::ENOENT))
+        ));
         assert!(db.getattr(file_ino).is_err());
         // The write, the rename and the unlink diverged; the rmdir's name was
         // already gone (the ordinary echo path).
@@ -3626,14 +3763,7 @@ mod tests {
         let f = [0x71u8; 16];
         let ghost = [0x72u8; 16];
         replay(&db, 1, &file_payload_mtime(f, 10), "/f", None, None);
-        replay(
-            &db,
-            2,
-            &file_payload_mtime(ghost, 10),
-            "/ghost",
-            None,
-            None,
-        );
+        replay(&db, 2, &file_payload_mtime(ghost, 10), "/ghost", None, None);
         db.write(|tx| {
             // A tombstone that still carries a name: the name is invisible
             // through the mount but breaks the object/name invariant.
@@ -3650,12 +3780,16 @@ mod tests {
         .unwrap();
 
         let issues = db.check_replica().unwrap();
-        assert!(issues
-            .iter()
-            .any(|issue| matches!(issue, ReplicaIssue::NameToDeletedObject { .. })));
-        assert!(issues
-            .iter()
-            .any(|issue| matches!(issue, ReplicaIssue::PathMismatch { .. })));
+        assert!(
+            issues
+                .iter()
+                .any(|issue| matches!(issue, ReplicaIssue::NameToDeletedObject { .. }))
+        );
+        assert!(
+            issues
+                .iter()
+                .any(|issue| matches!(issue, ReplicaIssue::PathMismatch { .. }))
+        );
 
         let report = db.repair_replica_metadata().unwrap();
         assert_eq!(report.names_removed, 1);

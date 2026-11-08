@@ -650,8 +650,7 @@ fn u_store_sqlite_gc_reclaims_only_unreferenced_chunks() {
     {
         let tx = db.write().unwrap();
         tx.put_chunk(live.hash, 4, Some(live_data)).unwrap();
-        tx.put_chunk(event_only.hash, 10, Some(event_data))
-            .unwrap();
+        tx.put_chunk(event_only.hash, 10, Some(event_data)).unwrap();
         tx.put_chunk(orphan_hash, 6, Some(orphan_data)).unwrap();
         tx.put_object(&file).unwrap();
         tx.put_name(ROOT_INO, "f", ino(2), "/f").unwrap();
@@ -671,11 +670,7 @@ fn u_store_sqlite_gc_reclaims_only_unreferenced_chunks() {
                     offset: 0,
                     len: 10,
                     size: 10,
-                    file_root: file_root(
-                        ObjectKind::File,
-                        None,
-                        std::slice::from_ref(&event_only),
-                    ),
+                    file_root: file_root(ObjectKind::File, None, std::slice::from_ref(&event_only)),
                     mtime_ns: 2_000,
                     chunks: vec![event_only.clone()],
                 },
@@ -752,13 +747,8 @@ fn u_store_sqlite_client_watermark_refreshes_state_hash() {
     {
         let tx = db.write().unwrap();
         tx.put_chunk(chunk.hash, 5, Some(data)).unwrap();
-        tx.put_object(&file_object(
-            ino(2),
-            5,
-            std::slice::from_ref(&chunk),
-            1,
-        ))
-        .unwrap();
+        tx.put_object(&file_object(ino(2), 5, std::slice::from_ref(&chunk), 1))
+            .unwrap();
         tx.put_name(ROOT_INO, "f", ino(2), "/f").unwrap();
         tx.set_object_chunks(ino(2), std::slice::from_ref(&chunk))
             .unwrap();

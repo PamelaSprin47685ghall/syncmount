@@ -1,4 +1,8 @@
-//! syncmount — end-to-end encrypted, eventually consistent FUSE filesystem.
+//! syncmount — server-authoritative encrypted, eventually consistent FUSE
+//! filesystem.
+//!
+//! The transport is encrypted, but this is not end-to-end encryption: the
+//! server holds the master key and stores plaintext state.
 //!
 //! Module tree and dependency direction are fixed by the build skeleton
 //! (`docs/build.md`, W1). Leaves are `protocol` and `transport`; `client`

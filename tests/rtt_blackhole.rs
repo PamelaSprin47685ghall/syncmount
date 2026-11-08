@@ -586,13 +586,15 @@ fn wait_file_matches_server(mount: &Path, rel: &str, server_db: &Path, proc: &mu
 
 /// Wait until the server's authoritative content for one path is `expected`.
 fn wait_server_content(server_db: &Path, path: &str, expected: &[u8]) {
-    wait_until("server authoritative content", READY, || {
-        match server_content(server_db, path) {
+    wait_until(
+        "server authoritative content",
+        READY,
+        || match server_content(server_db, path) {
             Some(bytes) if bytes == expected => Ok(true),
             Some(bytes) => Err(format!("server content is {} B", bytes.len())),
             None => Err("server has no content for the path".to_owned()),
-        }
-    });
+        },
+    );
 }
 
 fn wait_synced(client_db: &Path, server_db: &Path) {

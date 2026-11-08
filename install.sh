@@ -3,7 +3,7 @@
 #
 # Usage:
 #   ./install.sh                      install the latest release to ~/.local/bin
-#   ./install.sh --version 0.1.0      install a specific version
+#   ./install.sh --version 1.0.0      install a specific version
 #   ./install.sh --prefix /usr/local  install under /usr/local (may need sudo)
 #
 # Environment:
@@ -17,8 +17,7 @@
 
 set -euo pipefail
 
-REPOSITORY=${SYNCMOUNT_REPOSITORY:-syncmount/syncmount}
-TARGET=x86_64-unknown-linux-musl
+REPOSITORY=${SYNCMOUNT_REPOSITORY:-PamelaSprin47685ghall/syncmount}
 VERSION=${SYNCMOUNT_VERSION:-}
 PREFIX=${PREFIX:-$HOME/.local}
 BASE_URL=${SYNCMOUNT_BASE_URL:-}
@@ -29,7 +28,7 @@ install.sh — download, verify and install a syncmount release.
 
 Usage:
   ./install.sh                      install the latest release to ~/.local/bin
-  ./install.sh --version 0.1.0      install a specific version
+  ./install.sh --version 1.0.0      install a specific version
   ./install.sh --prefix /usr/local  install under /usr/local (may need sudo)
 
 Environment:
@@ -64,8 +63,9 @@ case "$(uname -s)" in
     *) echo "syncmount supports Linux only (found $(uname -s))" >&2; exit 2 ;;
 esac
 case "$(uname -m)" in
-    x86_64|amd64) ;;
-    *) echo "no release for architecture $(uname -m); only $TARGET is published" >&2; exit 2 ;;
+    x86_64|amd64) TARGET=x86_64-unknown-linux-musl ;;
+    aarch64|arm64) TARGET=aarch64-unknown-linux-musl ;;
+    *) echo "no release for architecture $(uname -m); only x86_64 and aarch64 are published" >&2; exit 2 ;;
 esac
 
 for tool in curl tar sha256sum; do

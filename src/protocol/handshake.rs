@@ -109,11 +109,7 @@ impl ClientHandshake {
     ///
     /// [`HandshakeError::WrongPhase`], or a crypto error from key derivation
     /// or sealing.
-    pub fn hello(
-        &self,
-        nonces: &NonceMinter,
-        ctrl: &CtrlPrefix,
-    ) -> Result<Hello, HandshakeError> {
+    pub fn hello(&self, nonces: &NonceMinter, ctrl: &CtrlPrefix) -> Result<Hello, HandshakeError> {
         self.expect_phase(ClientPhase::HelloSent)?;
         let keys = self.ring.auth_keys(&self.client_nonce)?;
         let auth = Auth {
@@ -503,16 +499,10 @@ impl ServerHandshake {
         // The proof covers the sealed ACCEPT, so hash a body that already
         // carries it. `proof_input` excludes only F_SERVER_PROOF, and the
         // placeholder proof value never enters the hash.
-        let placeholder = welcome.encode_with_proof_and_accept(
-            &[0u8; WELCOME_PROOF_LEN],
-            &sealed_accept,
-        )?;
+        let placeholder =
+            welcome.encode_with_proof_and_accept(&[0u8; WELCOME_PROOF_LEN], &sealed_accept)?;
         let body_hash = Welcome::proof_input(&placeholder, &FrameLimits::default())?;
-        let proof = keys.seal_welcome_proof(
-            &hello.client_nonce,
-            &body_hash,
-            &input.proof_nonce,
-        )?;
+        let proof = keys.seal_welcome_proof(&hello.client_nonce, &body_hash, &input.proof_nonce)?;
         debug_assert_eq!(proof.len(), WELCOME_PROOF_LEN);
 
         let body = welcome.encode_with_proof_and_accept(&proof, &sealed_accept)?;
@@ -951,8 +941,12 @@ mod tests {
         // A tampered proof fails.
         let nonces = NonceMinter::with_instance(6);
         let (mut client, reply) = pair(0x01, [0x22; 32], &nonces);
-        let mut proof = Welcome::server_proof(&reply.body, &limits).unwrap().unwrap();
-        let accept = Welcome::sealed_accept(&reply.body, &limits).unwrap().unwrap();
+        let mut proof = Welcome::server_proof(&reply.body, &limits)
+            .unwrap()
+            .unwrap();
+        let accept = Welcome::sealed_accept(&reply.body, &limits)
+            .unwrap()
+            .unwrap();
         proof[0] ^= 1;
         let body = reply
             .welcome
@@ -966,8 +960,12 @@ mod tests {
         // A tampered plaintext field fails even with the original proof.
         let nonces = NonceMinter::with_instance(7);
         let (mut client, reply) = pair(0x01, [0x23; 32], &nonces);
-        let proof = Welcome::server_proof(&reply.body, &limits).unwrap().unwrap();
-        let accept = Welcome::sealed_accept(&reply.body, &limits).unwrap().unwrap();
+        let proof = Welcome::server_proof(&reply.body, &limits)
+            .unwrap()
+            .unwrap();
+        let accept = Welcome::sealed_accept(&reply.body, &limits)
+            .unwrap()
+            .unwrap();
         let mut tampered = reply.welcome;
         tampered.epoch = tampered.epoch.wrapping_add(1);
         let body = tampered
@@ -981,7 +979,9 @@ mod tests {
         // A tampered ACCEPT with a valid proof fails the AEAD tag.
         let nonces = NonceMinter::with_instance(8);
         let (mut client, reply) = pair(0x01, [0x24; 32], &nonces);
-        let mut accept = Welcome::sealed_accept(&reply.body, &limits).unwrap().unwrap();
+        let mut accept = Welcome::sealed_accept(&reply.body, &limits)
+            .unwrap()
+            .unwrap();
         let last = accept.len() - 1;
         accept[last] ^= 1;
         let placeholder = reply
@@ -1049,12 +1049,7 @@ mod tests {
         };
         let context = accept_context(&[0x22; 32], &input().server_nonce);
         let sealed = keys
-            .seal_detached(
-                ACCEPT_DOMAIN,
-                &context,
-                &bad_accept.encode(),
-                &[0x79; 12],
-            )
+            .seal_detached(ACCEPT_DOMAIN, &context, &bad_accept.encode(), &[0x79; 12])
             .unwrap();
         let sealed: [u8; ACCEPT_SEALED_LEN] = sealed.try_into().unwrap();
         let placeholder = reply
@@ -1145,9 +1140,11 @@ mod tests {
 
         let fresh = client_with(ring(0x01), [0x23; 32], ProtoVersion::CURRENT);
         let fresh_hello = seal_hello(&fresh, &nonces);
-        assert!(guard
-            .check_and_record(fresh_hello.client_nonce, NOW + 2)
-            .is_ok());
+        assert!(
+            guard
+                .check_and_record(fresh_hello.client_nonce, NOW + 2)
+                .is_ok()
+        );
     }
 
     #[test]
@@ -1225,7 +1222,9 @@ mod tests {
         let reply = server.on_hello(&hello, input()).unwrap();
         let _ = client.on_welcome(&reply.welcome, &reply.body, NOW).unwrap();
         assert!(matches!(
-            client.on_welcome(&reply.welcome, &reply.body, NOW).unwrap_err(),
+            client
+                .on_welcome(&reply.welcome, &reply.body, NOW)
+                .unwrap_err(),
             HandshakeError::WrongPhase {
                 expected: ClientPhase::HelloSent,
                 actual: ClientPhase::Steady

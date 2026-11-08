@@ -1,11 +1,11 @@
 [package]
 name = "syncmount"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT OR Apache-2.0"
-description = "End-to-end encrypted, eventually consistent FUSE filesystem"
-repository = "https://github.com/syncmount/syncmount"
+description = "Server-authoritative encrypted FUSE filesystem; the server holds the master key"
+repository = "https://github.com/PamelaSprin47685ghall/syncmount"
 readme = "README.md"
 keywords = ["fuse", "filesystem", "sync", "encryption"]
 categories = ["filesystem", "network-programming"]

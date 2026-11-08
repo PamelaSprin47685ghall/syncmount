@@ -31,8 +31,8 @@
 //! then calls `Attach`. An unauthenticated peer never enters the online table.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, PoisonError};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
@@ -1799,9 +1799,7 @@ impl SequencerCore {
                     // ORDERED would expose a gap. Relay traffic has its own
                     // flow control, so only a stalled relay queue ends the
                     // session.
-                    if seq.is_some()
-                        || session.outbox.queued.since_drain() > DRAIN_GRACE
-                    {
+                    if seq.is_some() || session.outbox.queued.since_drain() > DRAIN_GRACE {
                         session.state = SessionState::Kicking;
                         kicked.push((*session_id, KickReason::QueueOverflow));
                         tracing::warn!(

@@ -29,16 +29,14 @@ use super::status::{Conntrace, Counters, TraceEntry};
 use super::writer::{CoalesceTuning, Coalescer, LocalOp, LocalSeq, QueuedOp, Span, WireOp};
 use crate::protocol::crypto::{NonceMinter, Opener, PskKeyRing, Sealer, SessionKey};
 use crate::protocol::fragment::{CHUNK_PLAIN, Fragmenter};
-use crate::protocol::handshake::{
-    CLIENT_HANDSHAKE_TIMEOUT_MS, ClientHandshake, HandshakeError,
-};
+use crate::protocol::handshake::{CLIENT_HANDSHAKE_TIMEOUT_MS, ClientHandshake, HandshakeError};
 use crate::protocol::messages::{
     CompactionState, Error as ErrorMessage, FieldMap, Kick, OpClass, Ping, Pong, SyncEnd,
     WcpWriter, Welcome, fid,
 };
 use crate::protocol::{
-    Caps, CtrlPrefix, Flags, FrameBuf, FrameDecoder, FrameEncoder, FrameHeader, FrameRef,
-    Limits, MsgType, OpId, Prefix, RoutePrefix, Seq, SessionId, StreamId,
+    Caps, CtrlPrefix, Flags, FrameBuf, FrameDecoder, FrameEncoder, FrameHeader, FrameRef, Limits,
+    MsgType, OpId, Prefix, RoutePrefix, Seq, SessionId, StreamId,
 };
 use crate::store::sqlite::{ChunkRef, EventKind, EventPayload, RejectState};
 use crate::transport::{DialOptions, Endpoint, EventsStream, HttpTransport, RpcStream, Transport};
@@ -604,7 +602,15 @@ async fn handshake(
     let hello = client.hello(&nonces, &ctrl)?.encode()?;
     let prefix = Prefix::Ctrl(ctrl);
     let header = FrameHeader::new(MsgType::HELLO, Flags::CTRL, 0, Seq::UNSEQUENCED);
-    send_frame(&mut transport, &header, &prefix, &hello, counters, conntrace).await?;
+    send_frame(
+        &mut transport,
+        &header,
+        &prefix,
+        &hello,
+        counters,
+        conntrace,
+    )
+    .await?;
 
     let limits = Limits::default();
     let mut decoder = FrameDecoder::new(limits);
@@ -814,14 +820,7 @@ async fn downlink(
                             {
                                 return;
                             }
-                            match decode_ordered(
-                                &store,
-                                &opener,
-                                &mut data,
-                                &frame,
-                                epoch,
-                                true,
-                            ) {
+                            match decode_ordered(&store, &opener, &mut data, &frame, epoch, true) {
                                 Ok(Some(event)) => event,
                                 Ok(None) => {
                                     tracing::error!(
@@ -839,9 +838,8 @@ async fn downlink(
                                 Err(error) => {
                                     tracing::error!(event = "apply", seq = frame.header.seq.get(), error = %error, "cannot decode an event");
                                     Counters::bump(&counters.materialize_errors);
-                                    let _ = signal
-                                        .send(Signal::Fatal(format!("apply: {error}")))
-                                        .await;
+                                    let _ =
+                                        signal.send(Signal::Fatal(format!("apply: {error}"))).await;
                                     return;
                                 }
                             }
@@ -849,9 +847,7 @@ async fn downlink(
                         Err(error) => {
                             tracing::error!(event = "apply", seq = frame.header.seq.get(), error = %error, "cannot decode an event");
                             Counters::bump(&counters.materialize_errors);
-                            let _ = signal
-                                .send(Signal::Fatal(format!("apply: {error}")))
-                                .await;
+                            let _ = signal.send(Signal::Fatal(format!("apply: {error}"))).await;
                             return;
                         }
                     };
@@ -897,9 +893,11 @@ async fn downlink(
                     if let Ok(body) = (Pong { server_time: now }).encode() {
                         let mut header =
                             FrameHeader::new(MsgType::PONG, Flags::ENC, 0, Seq::UNSEQUENCED);
-                        if let Ok(sealed) = Sealer::with_session_key(&key, &nonces)
-                            .seal(&mut header, &Prefix::None, &body)
-                        {
+                        if let Ok(sealed) = Sealer::with_session_key(&key, &nonces).seal(
+                            &mut header,
+                            &Prefix::None,
+                            &body,
+                        ) {
                             if let Ok(bytes) = FrameEncoder::with_capacity(
                                 crate::protocol::HEADER_LEN + sealed.as_bytes().len(),
                             )
@@ -937,7 +935,9 @@ async fn downlink(
                             return;
                         }
                     }
-                    let _ = signal.send(Signal::Fatal("unreadable KICK".to_owned())).await;
+                    let _ = signal
+                        .send(Signal::Fatal("unreadable KICK".to_owned()))
+                        .await;
                     return;
                 }
                 MsgType::ERROR => {
@@ -969,7 +969,9 @@ async fn downlink(
                             .send(Signal::Fatal(format!("server error: {:?}", error.reason)))
                             .await;
                     } else {
-                        let _ = signal.send(Signal::Fatal("unreadable ERROR".to_owned())).await;
+                        let _ = signal
+                            .send(Signal::Fatal("unreadable ERROR".to_owned()))
+                            .await;
                     }
                     return;
                 }
@@ -1260,7 +1262,8 @@ async fn settle_batch(
     gate: &WriteGate,
     signal: &mpsc::Sender<Signal>,
 ) -> bool {
-    let last = match flush_replay(store, pending, pending_bytes, watermark, counters, signal).await {
+    let last = match flush_replay(store, pending, pending_bytes, watermark, counters, signal).await
+    {
         Ok(last) => last,
         Err(()) => return false,
     };
@@ -1309,7 +1312,9 @@ fn synthesize_payload(
     // A pre-version-3 server wrote zero for the timestamped classes. Zero is
     // not a usable operation timestamp there, so treat it as absent instead
     // of stamping the parents with the Unix epoch.
-    let timestamped_mtime = raw_mtime.filter(|value| *value != 0).map(|value| value as i64);
+    let timestamped_mtime = raw_mtime
+        .filter(|value| *value != 0)
+        .map(|value| value as i64);
     let uid = fields.u32(fid::F_UID).ok().flatten().unwrap_or(0);
     let gid = fields.u32(fid::F_GID).ok().flatten().unwrap_or(0);
     Ok(match class {
@@ -1381,7 +1386,9 @@ fn synthesize_payload(
         OpClass::SYNC_CTRL => EventPayload::SyncCtrl { code: 0 },
         _ => {
             let _ = path2;
-            return Err(DbError::Corrupt("unsupported ORDERED class without a payload"));
+            return Err(DbError::Corrupt(
+                "unsupported ORDERED class without a payload",
+            ));
         }
     })
 }
@@ -1519,16 +1526,8 @@ async fn uplink(
 
         if page.is_empty() {
             if let Some(wire) = coalescer.due(started.elapsed()) {
-                if let Err(error) = send_wire(
-                    &mut rpc,
-                    &store,
-                    &sealer,
-                    &wire,
-                    &[],
-                    &counters,
-                    &conntrace,
-                )
-                .await
+                if let Err(error) =
+                    send_wire(&mut rpc, &store, &sealer, &wire, &[], &counters, &conntrace).await
                 {
                     let _ = signal.send(uplink_signal(error)).await;
                     return;
@@ -1547,13 +1546,7 @@ async fn uplink(
                     Ok(Some(wire)) => {
                         let members = members_for(&page, &wire);
                         if let Err(error) = send_wire(
-                            &mut rpc,
-                            &store,
-                            &sealer,
-                            &wire,
-                            &members,
-                            &counters,
-                            &conntrace,
+                            &mut rpc, &store, &sealer, &wire, &members, &counters, &conntrace,
                         )
                         .await
                         {
@@ -1570,13 +1563,7 @@ async fn uplink(
                         if let Some(wire) = coalescer.flush_all() {
                             let members = members_for(&page, &wire);
                             if let Err(error) = send_wire(
-                                &mut rpc,
-                                &store,
-                                &sealer,
-                                &wire,
-                                &members,
-                                &counters,
-                                &conntrace,
+                                &mut rpc, &store, &sealer, &wire, &members, &counters, &conntrace,
                             )
                             .await
                             {
@@ -1593,13 +1580,7 @@ async fn uplink(
                         };
                         let members = vec![op.clone()];
                         if let Err(error) = send_wire(
-                            &mut rpc,
-                            &store,
-                            &sealer,
-                            &wire,
-                            &members,
-                            &counters,
-                            &conntrace,
+                            &mut rpc, &store, &sealer, &wire, &members, &counters, &conntrace,
                         )
                         .await
                         {
@@ -1620,13 +1601,7 @@ async fn uplink(
                 if let Some(wire) = coalescer.flush_all() {
                     let members = members_for(&page, &wire);
                     if let Err(error) = send_wire(
-                        &mut rpc,
-                        &store,
-                        &sealer,
-                        &wire,
-                        &members,
-                        &counters,
-                        &conntrace,
+                        &mut rpc, &store, &sealer, &wire, &members, &counters, &conntrace,
                     )
                     .await
                     {
@@ -1654,13 +1629,7 @@ async fn uplink(
         if let Some(wire) = coalescer.flush_all() {
             let members = members_for(&page, &wire);
             if let Err(error) = send_wire(
-                &mut rpc,
-                &store,
-                &sealer,
-                &wire,
-                &members,
-                &counters,
-                &conntrace,
+                &mut rpc, &store, &sealer, &wire, &members, &counters, &conntrace,
             )
             .await
             {
@@ -1874,7 +1843,15 @@ async fn send_wire(
     let body = encode_fields(&fields)?;
     let mut header = FrameHeader::new(MsgType::ORDERED, Flags::ENC, 0, Seq::UNSEQUENCED);
     let sealed = sealer.seal(&mut header, &Prefix::None, &body)?;
-    send_raw(rpc, &header, &Prefix::None, sealed.as_bytes(), counters, conntrace).await
+    send_raw(
+        rpc,
+        &header,
+        &Prefix::None,
+        sealed.as_bytes(),
+        counters,
+        conntrace,
+    )
+    .await
 }
 
 /// The wire class for one buffered write.
@@ -1904,8 +1881,9 @@ async fn send_meta(
         .or_else(|| op.ino.and_then(|ino| store.path_of(ino).ok()))
         .ok_or_else(|| SessionError::Fatal("outbox row has no path".to_owned()))?;
     let object = op.ino.and_then(|ino| store.getattr(ino).ok());
-    let (fallback_mtime, uid, gid) =
-        object.as_ref().map_or((super::db::now_ns(), 0, 0), |object| {
+    let (fallback_mtime, uid, gid) = object
+        .as_ref()
+        .map_or((super::db::now_ns(), 0, 0), |object| {
             (object.mtime_ns, object.uid, object.gid)
         });
     // The payload is the operation's authoritative timestamp. In particular
@@ -1999,7 +1977,15 @@ async fn send_meta(
     let body = encode_fields(&fields)?;
     let mut header = FrameHeader::new(MsgType::ORDERED, Flags::ENC, 0, Seq::UNSEQUENCED);
     let sealed = sealer.seal(&mut header, &Prefix::None, &body)?;
-    send_raw(rpc, &header, &Prefix::None, sealed.as_bytes(), counters, conntrace).await
+    send_raw(
+        rpc,
+        &header,
+        &Prefix::None,
+        sealed.as_bytes(),
+        counters,
+        conntrace,
+    )
+    .await
 }
 
 async fn send_stream(
@@ -2037,7 +2023,15 @@ async fn send_stream(
             Seq::UNSEQUENCED,
         );
         let sealed = sealer.seal(&mut header, &prefix, fragment.plaintext)?;
-        send_raw(rpc, &header, &prefix, sealed.as_bytes(), counters, conntrace).await?;
+        send_raw(
+            rpc,
+            &header,
+            &prefix,
+            sealed.as_bytes(),
+            counters,
+            conntrace,
+        )
+        .await?;
     }
     Ok(())
 }
@@ -2077,7 +2071,10 @@ fn encode_fields(fields: &[(u8, Vec<u8>)]) -> Result<Vec<u8>, SessionError> {
 }
 
 fn wire_client_id(store: &ClientDb) -> Vec<u8> {
-    store.client_id().map(|id| id.to_vec()).unwrap_or_else(|_| vec![0u8; 16])
+    store
+        .client_id()
+        .map(|id| id.to_vec())
+        .unwrap_or_else(|_| vec![0u8; 16])
 }
 
 fn unix_millis() -> u64 {
@@ -2093,7 +2090,6 @@ fn unix_seconds() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map_or(0, |duration| duration.as_secs())
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -2154,28 +2150,46 @@ mod tests {
 
     #[test]
     fn fast_forward_adopts_the_compacted_watermark() {
-        assert_eq!(fast_forward_target(&compacted_welcome(), 7, 300, true), Some(20));
+        assert_eq!(
+            fast_forward_target(&compacted_welcome(), 7, 300, true),
+            Some(20)
+        );
     }
 
     #[test]
     fn fast_forward_rejects_a_watermark_off_the_compaction_point() {
         // A lagging replica replays: the synthetic log starts at 1, so its
         // watermark cannot be trusted as the pre-compaction state.
-        assert_eq!(fast_forward_target(&compacted_welcome(), 7, 299, true), None);
+        assert_eq!(
+            fast_forward_target(&compacted_welcome(), 7, 299, true),
+            None
+        );
         // A watermark past the compaction point names a state the compacted
         // log cannot describe; this is corruption, not a fast-forward.
-        assert_eq!(fast_forward_target(&compacted_welcome(), 7, 301, true), None);
+        assert_eq!(
+            fast_forward_target(&compacted_welcome(), 7, 301, true),
+            None
+        );
     }
 
     #[test]
     fn fast_forward_requires_the_epoch_before_the_compaction() {
-        assert_eq!(fast_forward_target(&compacted_welcome(), 6, 300, true), None);
-        assert_eq!(fast_forward_target(&compacted_welcome(), 8, 300, true), None);
+        assert_eq!(
+            fast_forward_target(&compacted_welcome(), 6, 300, true),
+            None
+        );
+        assert_eq!(
+            fast_forward_target(&compacted_welcome(), 8, 300, true),
+            None
+        );
     }
 
     #[test]
     fn fast_forward_rejects_an_empty_tree_after_content_existed() {
-        assert_eq!(fast_forward_target(&compacted_welcome(), 7, 300, false), None);
+        assert_eq!(
+            fast_forward_target(&compacted_welcome(), 7, 300, false),
+            None
+        );
 
         let mut empty = compacted_welcome();
         empty.compacted_from_seq = 0;

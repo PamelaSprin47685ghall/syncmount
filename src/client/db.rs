@@ -447,12 +447,7 @@ impl ClientDb {
     pub(crate) fn refresh_state_hash_pending(&self) -> Result<bool, DbError> {
         // The common case is nothing to do; avoid taking the writer lock for
         // an empty transaction on every background tick.
-        if self
-            .read()?
-            .meta_i64(keys::STATE_HASH_PENDING)
-            .unwrap_or(0)
-            == 0
-        {
+        if self.read()?.meta_i64(keys::STATE_HASH_PENDING).unwrap_or(0) == 0 {
             return Ok(false);
         }
         let mut db = self.lock_writer();
@@ -1351,7 +1346,11 @@ mod tests {
     fn a_pending_state_hash_is_drained_without_a_new_batch() {
         let (_dir, db) = open();
         let file = db
-            .create_file(ROOT_INO, OsStr::new("f"), CreateAttrs::new(0o644, 1000, 1000))
+            .create_file(
+                ROOT_INO,
+                OsStr::new("f"),
+                CreateAttrs::new(0o644, 1000, 1000),
+            )
             .unwrap();
         db.write_at(file.ino, 0, b"hello").unwrap();
         let tree = db.read().unwrap().state_hash().unwrap();
@@ -1507,7 +1506,11 @@ mod tests {
     fn a_sparse_writeback_commit_carries_a_contiguous_chunk_run() {
         let (_dir, db) = open();
         let file = db
-            .create_file(ROOT_INO, OsStr::new("sparse"), CreateAttrs::new(0o644, 0, 0))
+            .create_file(
+                ROOT_INO,
+                OsStr::new("sparse"),
+                CreateAttrs::new(0o644, 0, 0),
+            )
             .unwrap();
         db.write_at(file.ino, 0, b"A").unwrap();
         db.write_at(file.ino, 200_000, b"B").unwrap();
@@ -1542,12 +1545,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             rows,
-            vec![
-                (0, 65_536),
-                (1, 65_536),
-                (2, 65_536),
-                (3, 3_393),
-            ]
+            vec![(0, 65_536), (1, 65_536), (2, 65_536), (3, 3_393),]
         );
     }
 

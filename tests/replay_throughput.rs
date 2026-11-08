@@ -329,11 +329,7 @@ fn spawn_client_with_meta(
 }
 
 /// Open one replica and its observability handles without starting a session.
-fn client_parts(
-    dir: &std::path::Path,
-    name: &str,
-    stale: Option<(i64, i64)>,
-) -> Replica {
+fn client_parts(dir: &std::path::Path, name: &str, stale: Option<(i64, i64)>) -> Replica {
     let db_path = dir.join(format!("{name}.db"));
     let db = Arc::new(ClientDb::open(&db_path, [7u8; 16]).unwrap());
     if let Some((epoch, applied)) = stale {
@@ -819,9 +815,7 @@ async fn a_stalled_replay_resyncs_and_finishes_from_the_cursor() {
     let driver = tokio::spawn({
         let endpoint = endpoint.clone();
         let ring = ring.clone();
-        async move {
-            drive_sessions(replica, endpoint, ring, "stalled".to_owned(), shutdown_rx).await
-        }
+        async move { drive_sessions(replica, endpoint, ring, "stalled".to_owned(), shutdown_rx).await }
     });
 
     let started = Instant::now();

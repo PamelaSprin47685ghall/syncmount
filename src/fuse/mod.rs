@@ -51,9 +51,11 @@ mod tests {
     fn mount_config_is_local_and_auto_unmounting() {
         let config = mount_config();
         assert!(config.mount_options.contains(&MountOption::AutoUnmount));
-        assert!(config
-            .mount_options
-            .contains(&MountOption::FSName("syncmount".to_string())));
+        assert!(
+            config
+                .mount_options
+                .contains(&MountOption::FSName("syncmount".to_string()))
+        );
         assert!(matches!(config.acl, SessionACL::RootAndOwner));
         assert_eq!(config.n_threads, Some(8));
         assert!(config.clone_fd);

@@ -28,9 +28,8 @@ use crate::protocol::crypto::{NonceMinter, Opener, PskSalt, Sealer};
 use crate::protocol::handshake::{HelloInput, NonceReplayGuard, ServerHandshake};
 use crate::protocol::messages::{Message, Pong, WelcomeLimits, decode_plain, decode_sealed};
 use crate::protocol::{
-    Caps, ErrorMessage, Flags, FrameBuf, FrameDecoder, FrameHeader, FrameRef, KickReason,
-    MsgType, Prefix, PrefixKind, ResyncMode, RoutePrefix, Seq, SessionId, StreamId, TrnReason,
-    encode_frame,
+    Caps, ErrorMessage, Flags, FrameBuf, FrameDecoder, FrameHeader, FrameRef, KickReason, MsgType,
+    Prefix, PrefixKind, ResyncMode, RoutePrefix, Seq, SessionId, StreamId, TrnReason, encode_frame,
 };
 use crate::store::sqlite::EventPayload;
 use crate::transport::{AcceptedHttp, BodyStream, MpscSender, PeerId};
@@ -249,17 +248,7 @@ async fn advance(
     frame: FrameBuf,
 ) -> Result<Flow, ()> {
     match phase {
-        Phase::Hello => {
-            start_hello(
-                context,
-                phase,
-                writer_closed,
-                peer,
-                nonce,
-                frame,
-            )
-            .await
-        }
+        Phase::Hello => start_hello(context, phase, writer_closed, peer, nonce, frame).await,
         Phase::Steady(session) => handle_frame(context, session, frame).await,
     }
 }
@@ -298,14 +287,8 @@ async fn start_hello(
         session_ttl_s: context.config.welcome.session_ttl_s,
         max_sessions: context.config.welcome.max_sessions,
     };
-    let mut handshake = ServerHandshake::new(
-        ring,
-        epoch,
-        current_seq,
-        compaction,
-        limits,
-        server_caps(),
-    );
+    let mut handshake =
+        ServerHandshake::new(ring, epoch, current_seq, compaction, limits, server_caps());
 
     let session_id = random_session_id();
     let server_nonce = random_32();

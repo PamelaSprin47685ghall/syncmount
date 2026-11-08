@@ -828,7 +828,11 @@ impl ClientDb {
                 } else {
                     change.mtime_ns.map(|_| mtime_ns)
                 },
-                size: if size_changed { Some(object.size) } else { None },
+                size: if size_changed {
+                    Some(object.size)
+                } else {
+                    None
+                },
             };
             Self::enqueue(tx, op_id, &payload, Some(&path), None, &touched, seq)?;
             Ok(object)

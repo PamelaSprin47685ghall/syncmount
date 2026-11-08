@@ -17,8 +17,7 @@
 //! Every client uses one fixed 16-byte `ClusterId`,
 //! `BLAKE3("sm/v1/cluster\0" ‖ "default")[0..16]`. The URL never takes part:
 //! scheme, host, port, and prefix only choose the connection target, and the
-//! server still routes by URL path as its namespace. `cluster_for` keeps the
-//! old URL-derived id only to read caches written before the cutover.
+//! server still routes by URL path as its namespace.
 //!
 //! # Status data source
 //!
@@ -100,7 +99,7 @@ const VALUE_FLAGS: [&str; 9] = [
 #[derive(Debug, Parser)]
 #[command(
     name = "syncmount",
-    about = "End-to-end encrypted, eventually consistent FUSE filesystem",
+    about = "Server-authoritative encrypted FUSE filesystem; the server holds the master key",
     long_about = None,
     version = version::SOFTWARE_VERSION,
     arg_required_else_help = true
@@ -223,10 +222,6 @@ pub struct ImportArgs {
     #[arg(long)]
     pub seed: bool,
 
-    /// Cluster id as 32 hex characters; the default is derived from the PSK.
-    #[arg(long, value_name = "HEX")]
-    pub cluster: Option<String>,
-
     /// Read the master password from this file (mode 0600).
     #[arg(long, value_name = "PATH")]
     pub key_file: Option<PathBuf>,
@@ -267,7 +262,6 @@ pub struct ConntraceArgs {
     #[arg(long, default_value_t = 100, value_name = "N")]
     pub limit: usize,
 }
-
 
 /// Errors that terminate the process.
 #[derive(Debug, thiserror::Error)]
@@ -511,13 +505,8 @@ fn run_client_fuse(args: ClientArgs) -> Result<(), CliError> {
 // ---------------------------------------------------------------------------
 
 fn run_import(args: ImportArgs) -> Result<(), CliError> {
-    let cluster = match args.cluster.as_deref() {
-        Some(text) => parse_cluster(text)?,
-        None => {
-            let master = load_master(args.key_file.as_deref())?;
-            namespace_id(&master)
-        }
-    };
+    let master = load_master(args.key_file.as_deref())?;
+    let cluster = namespace_id(&master);
     let db_path = args
         .db
         .clone()
@@ -552,15 +541,6 @@ fn run_import(args: ImportArgs) -> Result<(), CliError> {
         );
     }
     Ok(())
-}
-
-fn parse_cluster(text: &str) -> Result<[u8; 16], CliError> {
-    let bytes = hex::decode(text)
-        .map_err(|error| CliError::Usage(format!("invalid --cluster hex: {error}")))?;
-    let bytes: [u8; 16] = bytes
-        .try_into()
-        .map_err(|_| CliError::Usage("--cluster must be exactly 32 hex characters".to_owned()))?;
-    Ok(bytes)
 }
 
 /// `SYNCMOUNT_STATE_DIR` / XDG data directory + namespace, matching the
@@ -766,7 +746,9 @@ fn run_server(args: ServerArgs) -> Result<(), CliError> {
     runtime.block_on(async move {
         let server = Server::bind(config.clone(), master)
             .await
-            .map_err(|error| CliError::Startup(format!("cannot start server on {listen}: {error}")))?;
+            .map_err(|error| {
+                CliError::Startup(format!("cannot start server on {listen}: {error}"))
+            })?;
         let addr = server.local_addr().map_err(|error| {
             CliError::Startup(format!("cannot read the listen address: {error}"))
         })?;
@@ -1155,16 +1137,15 @@ mod tests {
         assert_eq!(args[1], "status");
     }
 
-
     #[test]
-    fn u_cluster_name_flag_is_rejected() {
+    fn u_import_cluster_flag_is_rejected() {
         let parsed = Cli::try_parse_from(argv(&[
             "syncmount",
-            "client",
-            "--cluster-name",
-            "prod",
-            "http://127.0.0.1:8080/sync",
-            "/mnt/x",
+            "import",
+            "--from",
+            "/tmp/tree",
+            "--cluster",
+            "00000000000000000000000000000000",
         ]));
         assert!(parsed.is_err());
     }

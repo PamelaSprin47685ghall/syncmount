@@ -42,8 +42,8 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use rusqlite::{params, Connection, OpenFlags};
-use rustix::process::{kill_process, Pid, Signal};
+use rusqlite::{Connection, OpenFlags, params};
+use rustix::process::{Pid, Signal, kill_process};
 use serde_json::Value;
 use tempfile::TempDir;
 
@@ -134,10 +134,7 @@ impl Env {
         let deadline = Instant::now() + READY;
         loop {
             if let Some(status) = proc.try_wait() {
-                panic!(
-                    "server exited before listening: {status}\n{}",
-                    proc.tail()
-                );
+                panic!("server exited before listening: {status}\n{}", proc.tail());
             }
             if TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_ok() {
                 break;
@@ -382,15 +379,15 @@ impl Client {
         let label = format!("{} mounted", self.name);
         wait_until(&label, READY, || {
             if let Some(status) = self.proc.try_wait() {
-                return Err(format!(
-                    "client exited with {status}\n{}",
-                    self.proc.tail()
-                ));
+                return Err(format!("client exited with {status}\n{}", self.proc.tail()));
             }
             if is_mounted(&self.mountpoint) {
                 Ok(true)
             } else {
-                Err(format!("{} is not in /proc/mounts", self.mountpoint.display()))
+                Err(format!(
+                    "{} is not in /proc/mounts",
+                    self.mountpoint.display()
+                ))
             }
         });
     }
@@ -516,6 +513,16 @@ fn free_port() -> u16 {
 }
 
 fn fuse_available() -> Result<(), String> {
+    let probe = fuse_probe();
+    if let Err(reason) = &probe {
+        if std::env::var("SYNCMOUNT_REQUIRE_FUSE").as_deref() == Ok("1") {
+            panic!("FUSE is required but unavailable: {reason}");
+        }
+    }
+    probe
+}
+
+fn fuse_probe() -> Result<(), String> {
     let device = Path::new("/dev/fuse");
     if !device.exists() {
         return Err("/dev/fuse is missing".to_owned());
@@ -665,8 +672,10 @@ fn db_i64(path: &Path, key: &str) -> Option<i64> {
 
 fn db_blob(path: &Path, key: &str) -> Option<Vec<u8>> {
     let conn = open_ro(path)?;
-    conn.query_row("SELECT value FROM meta WHERE key = ?1", [key], |row| row.get(0))
-        .ok()
+    conn.query_row("SELECT value FROM meta WHERE key = ?1", [key], |row| {
+        row.get(0)
+    })
+    .ok()
 }
 
 fn db_count(path: &Path, sql: &str) -> Option<i64> {
@@ -720,10 +729,10 @@ fn db_attrs(path: &Path, name: &str) -> Option<(i64, u32, u32, u32)> {
 /// Assert that every named directory matches the server's attributes.
 fn assert_attrs_match(server_db: &Path, client_db: &Path, paths: &[&str]) {
     for path in paths {
-        let server = db_attrs(server_db, path)
-            .unwrap_or_else(|| panic!("server has no live {path}"));
-        let client = db_attrs(client_db, path)
-            .unwrap_or_else(|| panic!("client has no live {path}"));
+        let server =
+            db_attrs(server_db, path).unwrap_or_else(|| panic!("server has no live {path}"));
+        let client =
+            db_attrs(client_db, path).unwrap_or_else(|| panic!("client has no live {path}"));
         assert_eq!(client, server, "{path} attributes differ");
     }
 }
@@ -777,12 +786,7 @@ fn assert_replica_rows_consistent(db: &Path) {
         ),
     ];
     for (label, sql) in checks {
-        assert_eq!(
-            db_count(db, sql),
-            Some(0),
-            "{label} in {}",
-            db.display()
-        );
+        assert_eq!(db_count(db, sql), Some(0), "{label} in {}", db.display());
     }
 }
 
@@ -924,29 +928,35 @@ fn retryable(error: &std::io::Error) -> bool {
 
 fn write_retry(mount: &Path, rel: &str, data: &[u8]) {
     let path = mount.join(rel);
-    wait_until(&format!("write {rel}"), READY, || match fs::write(&path, data) {
-        Ok(()) => Ok(true),
-        Err(error) if retryable(&error) => Err(error.to_string()),
-        Err(error) => Err(format!("write {rel}: {error}")),
+    wait_until(&format!("write {rel}"), READY, || {
+        match fs::write(&path, data) {
+            Ok(()) => Ok(true),
+            Err(error) if retryable(&error) => Err(error.to_string()),
+            Err(error) => Err(format!("write {rel}: {error}")),
+        }
     });
 }
 
 fn mkdir_retry(mount: &Path, rel: &str) {
     let path = mount.join(rel);
-    wait_until(&format!("mkdir {rel}"), READY, || match fs::create_dir(&path) {
-        Ok(()) => Ok(true),
-        Err(error) if error.kind() == ErrorKind::AlreadyExists => Ok(true),
-        Err(error) => Err(format!("mkdir {rel}: {error}")),
+    wait_until(&format!("mkdir {rel}"), READY, || {
+        match fs::create_dir(&path) {
+            Ok(()) => Ok(true),
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => Ok(true),
+            Err(error) => Err(format!("mkdir {rel}: {error}")),
+        }
     });
 }
 
 fn rename_retry(mount: &Path, from: &str, to: &str) {
-    wait_until(&format!("rename {from} -> {to}"), READY, || {
-        match fs::rename(mount.join(from), mount.join(to)) {
+    wait_until(
+        &format!("rename {from} -> {to}"),
+        READY,
+        || match fs::rename(mount.join(from), mount.join(to)) {
             Ok(()) => Ok(true),
             Err(error) => Err(format!("rename: {error}")),
-        }
-    });
+        },
+    );
 }
 
 fn unlink_retry(mount: &Path, rel: &str) {
@@ -959,18 +969,22 @@ fn unlink_retry(mount: &Path, rel: &str) {
 }
 
 fn symlink_retry(mount: &Path, rel: &str, target: &str) {
-    wait_until(&format!("symlink {rel}"), READY, || {
-        match std::os::unix::fs::symlink(target, mount.join(rel)) {
+    wait_until(
+        &format!("symlink {rel}"),
+        READY,
+        || match std::os::unix::fs::symlink(target, mount.join(rel)) {
             Ok(()) => Ok(true),
             Err(error) => Err(format!("symlink: {error}")),
-        }
-    });
+        },
+    );
 }
 
 fn wait_file(mount: &Path, rel: &str, expected: &[u8]) {
     let path = mount.join(rel);
-    wait_until(&format!("{rel} == {} bytes", expected.len()), READY, || {
-        match fs::read(&path) {
+    wait_until(
+        &format!("{rel} == {} bytes", expected.len()),
+        READY,
+        || match fs::read(&path) {
             Ok(bytes) if bytes == expected => Ok(true),
             Ok(bytes) => Err(format!(
                 "{rel}: {} bytes, blake3={}",
@@ -978,23 +992,29 @@ fn wait_file(mount: &Path, rel: &str, expected: &[u8]) {
                 blake3::hash(&bytes).to_hex()
             )),
             Err(error) => Err(format!("read {rel}: {error}")),
-        }
-    });
+        },
+    );
 }
 
 fn wait_absent(mount: &Path, rel: &str) {
     let path = mount.join(rel);
-    wait_until(&format!("{rel} absent"), READY, || match fs::symlink_metadata(&path) {
-        Err(error) if error.kind() == ErrorKind::NotFound => Ok(true),
-        Err(error) => Err(format!("stat {rel}: {error}")),
-        Ok(_) => Err(format!("{rel} is still present")),
-    });
+    wait_until(
+        &format!("{rel} absent"),
+        READY,
+        || match fs::symlink_metadata(&path) {
+            Err(error) if error.kind() == ErrorKind::NotFound => Ok(true),
+            Err(error) => Err(format!("stat {rel}: {error}")),
+            Ok(_) => Err(format!("{rel} is still present")),
+        },
+    );
 }
 
 fn wait_readlink(mount: &Path, rel: &str, expected: &str) {
     let path = mount.join(rel);
-    wait_until(&format!("readlink {rel} == {expected}"), READY, || {
-        match fs::read_link(&path) {
+    wait_until(
+        &format!("readlink {rel} == {expected}"),
+        READY,
+        || match fs::read_link(&path) {
             Ok(target) => {
                 if target.to_str() == Some(expected) {
                     Ok(true)
@@ -1003,8 +1023,8 @@ fn wait_readlink(mount: &Path, rel: &str, expected: &str) {
                 }
             }
             Err(error) => Err(format!("readlink {rel}: {error}")),
-        }
-    });
+        },
+    );
 }
 
 fn sha_file(mount: &Path, rel: &str) -> String {
@@ -1115,7 +1135,10 @@ fn seed_upload_then_second_client_replays_from_zero() {
     );
     wait_synced(&mut a2, &server);
     assert_eq!(
-        db_count(&server.db, "SELECT COUNT(*) FROM names WHERE path = '/seed.txt'"),
+        db_count(
+            &server.db,
+            "SELECT COUNT(*) FROM names WHERE path = '/seed.txt'"
+        ),
         Some(1),
         "the server must have the seeded entry"
     );
@@ -1131,10 +1154,7 @@ fn seed_upload_then_second_client_replays_from_zero() {
     b.wait_mounted();
     wait_synced(&mut b, &server);
     assert_eq!(db_i64(&b.db, "epoch"), Some(1));
-    assert_eq!(
-        db_i64(&b.db, "applied_seq"),
-        db_i64(&server.db, "seq")
-    );
+    assert_eq!(db_i64(&b.db, "applied_seq"), db_i64(&server.db, "seq"));
     assert_attrs_match(&server.db, &b.db, &["/"]);
     wait_file(&b.mountpoint, "seed.txt", &content);
     wait_file(&a2.mountpoint, "seed.txt", &content);
@@ -1203,7 +1223,10 @@ fn two_clients_converge_on_write_rename_unlink() {
         sha_file(&b.mountpoint, "from-b.txt")
     );
     assert_eq!(
-        db_count(&server.db, "SELECT COUNT(*) FROM names WHERE path = '/b.txt'"),
+        db_count(
+            &server.db,
+            "SELECT COUNT(*) FROM names WHERE path = '/b.txt'"
+        ),
         Some(0)
     );
     assert_eq!(
@@ -1244,7 +1267,10 @@ fn eleven_clients_write_4k_concurrently_without_a_gap() {
     }
 
     let payload = vec![0x5au8; 4096];
-    let mounts: Vec<PathBuf> = clients.iter().map(|client| client.mountpoint.clone()).collect();
+    let mounts: Vec<PathBuf> = clients
+        .iter()
+        .map(|client| client.mountpoint.clone())
+        .collect();
     std::thread::scope(|scope| {
         for (index, mount) in mounts.iter().enumerate() {
             let mount = mount.clone();
@@ -1280,11 +1306,7 @@ fn eleven_clients_write_4k_concurrently_without_a_gap() {
     }
     for index in 0..11 {
         let reader = &clients[(index + 1) % 11];
-        wait_file(
-            &reader.mountpoint,
-            &format!("c{index}-39.bin"),
-            &payload,
-        );
+        wait_file(&reader.mountpoint, &format!("c{index}-39.bin"), &payload);
     }
     for client in &mut clients {
         assert!(
@@ -1461,8 +1483,8 @@ fn server_restart_compacts_and_clients_fast_forward() {
             ino: file_ino,
             mtime_ns: Some(1_700_000_000_000_000_000),
         }
-            .encode()
-            .expect("link payload"),
+        .encode()
+        .expect("link payload"),
     );
     let mut a2 = env.client("a2", "a.db", &env.key, &server);
     a2.wait_mounted();
@@ -1976,10 +1998,7 @@ fn rejected_op_is_point_to_point_and_outbox_marks_failed() {
     wait_file(&b2.mountpoint, "clash.txt", b"original\n");
 
     wait_until("the status counter ops_rejected", READY, || {
-        Ok(b2
-            .status_u64(&["counters", "ops_rejected"])
-            .unwrap_or(0)
-            >= 1)
+        Ok(b2.status_u64(&["counters", "ops_rejected"]).unwrap_or(0) >= 1)
     });
     assert_eq!(
         b2.status_u64(&["outbox", "ops"]),
@@ -2234,15 +2253,7 @@ fn version_1_setattr_rows_replay_after_upgrade() {
     let ino = ino_at(&a_db, "/old.txt").expect("author inode");
     let payload = v1_setattr_payload(ino, 0o640);
     let op_id = random_op_id();
-    insert_outbox(
-        &a_db,
-        op_id,
-        "setattr",
-        "/old.txt",
-        None,
-        ino,
-        &payload,
-    );
+    insert_outbox(&a_db, op_id, "setattr", "/old.txt", None, ino, &payload);
     {
         let conn = Connection::open(&a_db).expect("author db");
         conn.execute(
@@ -2377,15 +2388,17 @@ fn fuse_hardlink_converges() {
     write_retry(&a.mountpoint, "orig.txt", b"hardlink content\n");
     wait_file(&b.mountpoint, "orig.txt", b"hardlink content\n");
     let mut last = String::new();
-    wait_until("hard link orig.txt -> hard.txt", READY, || {
-        match fs::hard_link(a.mountpoint.join("orig.txt"), a.mountpoint.join("hard.txt")) {
+    wait_until(
+        "hard link orig.txt -> hard.txt",
+        READY,
+        || match fs::hard_link(a.mountpoint.join("orig.txt"), a.mountpoint.join("hard.txt")) {
             Ok(()) => Ok(true),
             Err(error) => {
                 last = error.to_string();
                 Err(error.to_string())
             }
-        }
-    });
+        },
+    );
     let _ = last;
     wait_file(&b.mountpoint, "hard.txt", b"hardlink content\n");
     wait_synced(&mut a, &server);

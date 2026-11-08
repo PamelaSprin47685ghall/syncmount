@@ -1,4 +1,4 @@
-.TH SYNCMOUNT 1 "2026-11-07" "syncmount 0.1.0" "User Commands"
+.TH SYNCMOUNT 1 "2026-11-08" "syncmount 1.0.0" "User Commands"
 .SH NAME
 syncmount \- server-authoritative, eventually consistent FUSE filesystem
 .SH SYNOPSIS
@@ -58,9 +58,9 @@ mounts one namespace as a local directory.
 The server owns the authoritative tree, assigns a total order, appends an
 event log and streams that log to every client.
 A client keeps a full SQLite replica. A write buffers in memory and returns;
-a background commit every 100 ms, or flush, close, fsync, truncate, unlink or
-rename, writes it to the replica and the durable outbox. Namespace operations
-commit before returning.
+a background commit every 100 ms, or flush, close, fsync, truncate, a
+size-changing setattr, unlink or rename, writes it to the replica and the
+durable outbox. Namespace operations commit before returning.
 The mountpoint is a view over the replica database; it is not a backing
 directory.
 .PP
@@ -80,7 +80,7 @@ frames; steady-state frames are sealed under a per-session key.
 A wrong password fails at the sealed
 .B AUTH
 in
-.B HELLO .
+.BR HELLO .
 .PP
 This is not end-to-end encryption.
 The server holds the master password, decrypts every operation, applies it to
@@ -91,15 +91,21 @@ See
 .I docs/threat-model.md
 in the source distribution.
 .PP
-A client that loses its transport or is kicked unmounts and exits with status
-10.
-The replica and the outbox stay in the client database; the next start resends
+A client that loses its transport, overflows the server queue or is kicked as
+.B Stalled
+reconnects in process from its durable
+.I applied_seq
+with a bounded backoff.
+It exits with status 10 only when that budget is exhausted, or when a terminal
+kick or a protocol violation ends the mount.
+The replica and the outbox stay in the client database; a new process resends
 pending and previously sent operations.
-An epoch change clears the replica and replays the compacted event log from
-zero; pending outbox rows survive.
+An epoch change normally clears the replica and replays the compacted event log
+from zero, except for a drained client that adopts the compaction point.
+Pending outbox rows survive.
 .PP
 The 16-byte namespace id is
-.BR BLAKE3("sm/v2/namespace" || PSK)[..16] .
+.BR BLAKE3("sm/v2/namespace\e0" || PSK)[..16] .
 It is derived from the password, not from the URL.
 The URL only chooses the connection target and the HTTP namespace prefix.
 Every client and the server must use the same password; a different password
@@ -109,7 +115,8 @@ derives a different id and a different key.
 .B client \fIURL MOUNTPOINT\fR
 Mount the namespace at
 .I MOUNTPOINT
-and run until the transport fails or a signal arrives.
+and run until a signal arrives, the reconnect budget is exhausted, or a
+terminal kick ends the mount.
 .I MOUNTPOINT
 must be an existing absolute directory.
 The path of
@@ -139,7 +146,9 @@ master password, and serves
 .B {prefix}/rpc
 and
 .B {prefix}/events
-over HTTP/1.1.
+over HTTP/1.1, plus an absolute
+.B GET /__syncmount/healthz
+that returns a JSON status document.
 The listen address is chosen by
 .B \-\-listen
 or
@@ -156,7 +165,7 @@ Directories, regular files, symbolic links and hard links are preserved,
 including mode, owner, group and modification time.
 Regular files are split into 64 KiB BLAKE3-addressed chunks.
 Inodes are deterministic:
-.BR BLAKE3("sm/v2/import" || path)[..16] ,
+.BR BLAKE3("sm/v2/import\e0" || path)[..16] ,
 so importing the same tree on several machines yields the same ids.
 Re-running an import against the same database is a no-op.
 Names that belonged to the old daemon
@@ -338,12 +347,6 @@ Generate the deterministic seed outbox events after importing.
 The client would generate the same events on its first connection to an empty
 server; this option makes the upload inspectable offline.
 .TP
-.BI \-\-cluster " HEX"
-Use an explicit 16-byte namespace id, written as 32 hex characters.
-Without it the id is derived from the master password, exactly as
-.B client
-does.
-.TP
 .BI \-\-key\-file " PATH"
 Read the master password from
 .IR PATH .
@@ -460,44 +463,59 @@ for
 Success, including a clean unmount after a signal.
 .TP
 .B 1
-Usage error, including an unknown argument or the refused
-.BR \-\-key .
-A second instance on the same database is a startup failure (exit 2).
+Usage error detected by syncmount: the refused
+.BR \-\-key ,
+an invalid URL or listen address.
 .TP
 .B 2
-Startup failure: bad URL, missing or unreadable password, unusable
-mountpoint, bind failure, missing FUSE prerequisites, a handshake or dial
-failure, or an unavailable status document.
+Argument parsing failure (for example an unknown option, an unknown
+subcommand or a missing value; clap exits 2) or startup failure: missing or
+unreadable password, unusable mountpoint, bind failure, missing FUSE
+prerequisites, an initial handshake or dial failure, a second process on the
+same database, or an unavailable status document.
 .TP
 .B 3
 Reserved for a corrupt audit journal.
-The v2 client keeps no audit journal and does not return this status.
+The 1.0.0 client keeps no audit journal and does not return this status.
 .TP
 .B 4
 Authentication failure: the server rejected the sealed
 .B AUTH
 in
-.B HELLO ,
+.BR HELLO ,
 or the
 .B WELCOME
 proof did not verify.
 .TP
 .B 10
-The transport failed or the client was kicked; the mount has been released.
+The reconnect budget was exhausted, or a terminal kick or protocol violation
+ended the session; the mount has been released.
 The durable outbox is kept and resent on the next start.
-A unit that restarts the mount must treat this status as final; see
+See
 .BR SYSTEMD .
 .SH SYSTEMD
-The client exits with status 10 whenever it loses the cluster.
-A unit that restarts on failure would restart it into the same failure, so
-list 10 in
+The client reconnects in process after a transport close, a
+.B QueueOverflow
+or
+.B Stalled
+kick, or a replay stall.
+It exits with status 10 only after the bounded reconnect budget is exhausted
+or after a terminal kick.
+Use
+.B Restart=always
+so that an exit with status 10 is restarted; the new process resends the
+outbox.
+Statuses 2 and 4 are argument, configuration or credential errors and do not
+improve with a restart: list them in
 .BR RestartPreventExitStatus .
-Status 4 is also non-retryable until the password is fixed; list it as well if
-the unit should stop on a wrong password.
+Set
+.B StartLimitIntervalSec=0
+so repeated reconnects are not rate-limited.
 .PP
 .nf
 [Unit]
 Description=syncmount private client
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -508,8 +526,8 @@ Environment=SYNCMOUNT_RUN_DIR=/run/syncmount-private
 Environment=SYNCMOUNT_STATE_DIR=/home/user/.local/state/private
 Environment=SYNCMOUNT_MASTER_PASSWORD_FILE=/home/user/.config/syncmount/master.pass
 ExecStart=/usr/local/bin/syncmount client http://sync.example.com/private /home/user/private
-Restart=on-failure
-RestartPreventExitStatus=10 4
+Restart=always
+RestartPreventExitStatus=2 4
 
 [Install]
 WantedBy=multi-user.target
@@ -528,12 +546,15 @@ creates the directory and removes it when the unit stops.
 The mountpoint must already exist and be accessible to the same user.
 The password file must be owned by and readable by that user.
 .PP
-Statuses 1 and 2 are configuration errors and do not improve with a restart.
+Statuses 2 and 4 are argument, configuration or credential errors and do not
+improve with a restart.
 Status 3 is reserved.
-A clean unmount after a signal exits 0 and is not restarted by
-.BR Restart=on\-failure .
-The client does not reconnect on its own: after the network returns, start the
-unit again; the outbox is resent from the client database.
+A clean unmount after a signal exits 0; it is not restarted when the unit is
+stopped with
+.BR systemctl\ stop .
+Status 10 means the in-process reconnect budget ran out;
+.B Restart=always
+starts a fresh process and the outbox is resent from the client database.
 .SH EXAMPLES
 Start a server and mount it on one host:
 .PP
@@ -592,7 +613,18 @@ SETATTR operation with one outbox row; the client commits the new size, chunk
 list and metadata together, and the server applies them in one transaction. A
 crash leaves an operation fully visible or completely absent. A crash,
 disconnect or kick keeps the outbox, and the next session resends it.
-There is no in-process reconnect and no offline mode.
+A transport close, a
+.B QueueOverflow
+or
+.B Stalled
+kick, or a replay stall reconnects in process from
+.I applied_seq
+with a bounded budget; exhausting that budget exits with status 10.
+There is no offline mode.
+Both ends enable TCP keepalive (60 s idle, 10 s interval, 3 probes), and the
+client sends a sealed
+.B PING
+every second carrying its applied watermark.
 .PP
 The outbox has a soft resident-memory budget of 1 GiB and one million
 operations.
@@ -618,10 +650,15 @@ so a resend after a lost acknowledgement does not create a second event.
 A server rejection marks the outbox row
 .B failed
 and records the errno.
-The local SQLite effect is not rolled back.
-A rejected namespace operation can leave the replica diverged until an epoch
-change or a new import; writes to an existing path converge by
-last-writer-wins.
+Later pending operations on the same inode are marked
+.B failed
+too.
+The ERROR detail carries the server's state for the affected path when it
+fits the 512-byte budget; the client replaces that path locally.
+A larger state payload becomes a resync marker: the client records the
+tombstone, reconnects and replays the server log.
+Other paths and pending operations are untouched; writes to an existing path
+converge by last-writer-wins.
 .PP
 The server has a per-session downlink budget of 32 MiB and 512 data frames and
 kicks a consumer that cannot drain it with
@@ -632,8 +669,13 @@ is kicked as
 .B Regression
 or
 .BR Overclaim .
-A kicked client unmounts and exits with status 10; the next start replays and
-resends.
+.B QueueOverflow
+and
+.B Stalled
+kicks reconnect from
+.IR applied_seq .
+Every other kick, or a protocol violation, unmounts and exits with status 10;
+the next start replays and resends.
 .PP
 Graceful shutdown drains for at most 30 seconds, compacts the event log and
 kicks every session with
@@ -643,12 +685,38 @@ Compaction advances the epoch, resets
 to zero, rebuilds a minimal replayable log for the live tree and leaves
 .I replay_floor
 at one.
-A client that sees a different epoch clears its replica and replays from zero.
+A client that sees a different epoch normally clears its replica and replays
+from zero.
+The exception is a drained client whose durable epoch is the one before the
+compaction and whose
+.I applied_seq
+equals the pre-compaction sequence: it keeps its tree and adopts the new epoch
+without replaying.
 A crash skips compaction; the next start resumes
 .I epoch
 and
 .I seq
 from the database.
+.PP
+.B meta.state_hash
+is a BLAKE3 digest of the object table, including inode ids.
+The server writes it at compaction and at clean shutdown.
+The client refreshes it during replay after 4096 events or 300 seconds; a
+smaller batch marks it pending for the background checkpoint thread, which
+drains it within 60 seconds.
+It is a diagnostic value, not a cross-cluster consensus value.
+.PP
+The server collects orphan chunks at startup, at most every 3600 seconds, and
+immediately after compaction.
+A periodic pass deletes only when the last compaction is at least 3600 seconds
+old; compaction itself collects without delay.
+.B VACUUM
+is not run automatically; freed pages are reused by later writes.
+.PP
+Events use payload version 3.
+A 1.0.0 binary decodes payload v1 and v2 as well; a pre-1.0.0 binary cannot
+decode v3, so rolling back after a v3 record requires restoring the databases
+backed up before the upgrade.
 .PP
 Only valid UTF-8 names are accepted, at most 255 bytes and free of
 .B /
@@ -661,6 +729,8 @@ Extended attributes are not stored:
 .B getxattr
 returns
 .BR ENODATA ,
+.B listxattr
+returns an empty list,
 .B setxattr
 and
 .B removexattr

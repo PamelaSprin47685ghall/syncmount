@@ -1,8 +1,9 @@
 # Known limitations
 
-Status: normative design boundary for syncmount v2 (protocol 3.0). This
-document states the guarantees the design makes, the guarantees it weakens,
-and the behaviour it refuses. It describes the design, not a particular build.
+Status: normative design boundary for syncmount 1.0.0 (protocol 3.0, payload
+v3). This document states the guarantees the design makes, the guarantees it
+weakens, and the behaviour it refuses. It describes the design, not a
+particular build.
 
 Where this document says **best effort**, the operation is accepted and does
 not fail because of the weak semantics. The result is whatever local execution
@@ -82,10 +83,10 @@ A server rejection does **not** roll back unrelated local work. The outbox row
 stays in the local database as a `failed` tombstone with the server's errno;
 the server never applies it, and ordinary reconnects do not resend it. The
 affected path is repaired from the server: the ERROR detail carries the
-server's snapshot when it fits the 512-byte detail budget, and a larger
-snapshot falls back to a resync marker, so the client records the tombstone,
-reconnects and replays the server log. Other paths and pending operations are
-untouched. Writes to an existing path are last-writer-wins and do converge.
+server's state when it fits the 512-byte detail budget; a larger state falls
+back to a resync marker, so the client records the tombstone, reconnects and
+replays the server log. Other paths and pending operations are untouched.
+Writes to an existing path are last-writer-wins and do converge.
 
 ### 1.3 The outbox is durable
 
@@ -115,22 +116,31 @@ means the client's SQLite disk is full.
 
 ### 1.4 `fsync` is local only
 
-`fsync(2)` and `fdatasync(2)` run `PRAGMA wal_checkpoint(TRUNCATE)` on the
-client database. They make the local SQLite file durable; they do not wait for
-a cluster acknowledgement and do not make the data visible to other clients.
-The remote copy becomes visible when the server commits and broadcasts the
-event.
+`fsync(2)` and `fdatasync(2)` first commit every buffered write, then fsync
+the client WAL file. They do not run `wal_checkpoint(TRUNCATE)`; a background
+thread copies WAL pages back with a PASSIVE checkpoint, which never blocks the
+writer or waits for a long read. They make the local WAL durable; they do not
+wait for a cluster acknowledgement and do not make the data visible to other
+clients. The remote copy becomes visible when the server commits and
+broadcasts the event.
 
-The client database uses WAL and `synchronous=FULL`, so a committed
-transaction survives a crash even before the checkpoint. `syncfs(2)` is not a
-cluster barrier.
+The client database uses WAL and `synchronous=NORMAL`: a committed transaction
+survives a process crash, while a recent transaction can be lost in a power
+failure and is recovered by replay. The server database uses
+`synchronous=FULL`, because a confirmed event must survive a power loss and
+`seq` must never move backwards. `syncfs(2)` is not a cluster barrier.
 
 ### 1.5 Disconnect, remount and replay
 
-A transport failure, kick or protocol violation unmounts the client and exits
-with status 10. There is no in-process reconnect and no offline mode. The
-replica and the outbox stay in `client.db`; the next start resends pending and
-previously sent operations.
+A transport close, a `QueueOverflow` or `Stalled` kick, or a replay stall
+reconnects in process from the durable `applied_seq` with a bounded backoff. A
+session that applies events, or lives 10 seconds, resets that budget. If the
+budget is exhausted, the client exits with status 10. Every other kick (for
+example `Regression`, `Overclaim`, `EpochMismatch` or
+`ServerShutdown`), a protocol violation or a fatal local error unmounts and
+exits 10.
+There is no offline mode. The replica and the outbox stay in `client.db`; a
+new process resends pending and previously sent operations.
 
 A reconnect above `applied_seq == 0` replays the server's event log from
 `applied_seq + 1`. A different epoch normally clears the replica tables,
@@ -164,6 +174,10 @@ The client sends a sealed `PING` every second carrying its `applied_seq`. The
 server uses that watermark for drain, for regression/overclaim checks and for
 diagnostics.
 
+Both ends also enable TCP keepalive: 60 seconds idle, a 10-second probe
+interval and 3 probes. The kernel removes a dead peer before the application
+sees a timeout; the sealed `PING` is the application-level liveness signal.
+
 The server kicks a session when:
 
 - its outbound queue cannot take a sequenced frame (32 MiB or 512 data
@@ -171,14 +185,17 @@ The server kicks a session when:
   so the session ends instead;
 - its reported watermark goes backwards (`Regression`);
 - its reported watermark exceeds `current_seq` (`Overclaim`);
+- its applied watermark does not move for 30 seconds while the server still
+  owes events (`Stalled`);
 - the server compacts or shuts down (`EpochMismatch` or `ServerShutdown`).
 
-A `QueueOverflow` kick does not unmount: the client reconnects from its
-durable `applied_seq` with a bounded backoff, and a session that applies
-events resets that budget. Only a client that makes no progress across
-several attempts exits with status 10. Any other kick unmounts and exits 10.
-Lag diagnostics are not a kick: a slow but progressing client may stay slow
-for as long as it keeps making progress.
+A `QueueOverflow` or `Stalled` kick does not unmount: the client reconnects
+from its durable `applied_seq` with a bounded backoff, and a session that
+applies events resets that budget. Only a client that makes no progress across
+several attempts exits with status 10. Every other kick (for example
+`Regression`, `Overclaim`, `EpochMismatch` or `ServerShutdown`) unmounts and
+exits 10. Lag diagnostics are not a kick: a slow but progressing client may
+stay slow for as long as it keeps making progress.
 
 Watermarks prove liveness and replay position, not content correctness. There
 is no independent fsck and no content-level verification pass. A client can be
@@ -235,16 +252,42 @@ transfer: a client that has been offline replays every event after its
 watermark, and a client that returns after a compaction either fast-forwards
 from the pre-compaction point or replays the synthetic log from the beginning.
 
+The server collects orphan chunks at startup, at most every 3600 seconds, and
+immediately after compaction. A periodic pass deletes only when the last
+compaction is at least 3600 seconds old; the compaction transaction has
+already dropped every event that could reference an orphan, so it collects
+without delay. Collection deletes chunk rows only. `VACUUM` is not run
+automatically; freed pages are reused by later writes.
+
 ### 1.8 State hashes are local diagnostics
 
 `state_hash` is a BLAKE3 digest of the object table, including the 128-bit
-inode ids. The server writes it on compaction and on a clean shutdown. The
-client refreshes it from replay: a batch that moves `applied_seq` rewrites the
-digest after 4096 events or 300 seconds, and otherwise marks
-`meta.state_hash_pending`, which the background checkpoint thread drains
-within a minute. It is useful for comparing two databases that were built
-from the same import, but it is not a cross-cluster consensus value and two
-independently written databases need not agree.
+inode ids. On the server, `meta.state_hash` is a checkpoint digest written at
+compaction and at clean shutdown. On a client it is a diagnostic value: a
+batch that moves `applied_seq` rewrites the digest after 4096 events or 300
+seconds, and otherwise marks `meta.state_hash_pending`, which the background
+checkpoint thread drains within 60 seconds. It is useful for comparing two
+databases that were built from the same import, but it is not a cross-cluster
+consensus value, no protocol decision reads it, and two independently written
+databases need not agree.
+
+### 1.9 Payload versions and upgrade
+
+Event payloads are versioned. Version 3 is current: it appends an optional
+`mtime_ns` to `rename`, `unlink`, `rmdir` and `link`, so the event carries the
+implicit timestamp change those operations make to the object and its parents.
+Version 2 added `size` to `setattr`; a version-1 `setattr` decodes as an
+attribute-only change. A 1.0.0 binary decodes v1, v2 and v3. A pre-1.0.0
+binary cannot decode v3, so once a new server has written a v3 record a
+rollback fails unless the databases are restored from a backup taken before
+the upgrade.
+
+Protocol 3.0 is a clean break from protocol 2.0. 1.0.0 does not interoperate
+with any earlier release, and mixed-version operation is unsupported. Upgrade
+every client before the server, but keep the clients stopped until the server
+is upgraded: a 1.0.0 client sends payload v3 in its operations, which an old
+server cannot decode. See the "Upgrade to 1.0.0" section of
+[`../README.md`](../README.md).
 
 ## 2. POSIX surface
 
@@ -330,7 +373,7 @@ set the practical envelope.
 | Server outbound bandwidth × online clients | The hard bottleneck. The server sends every event to every client, so aggregate write throughput is roughly link bandwidth / (N−1). |
 | Full local copy | Every client keeps the full tree and chunk bytes in `client.db`; the server keeps the same data plus the event log. Plan disk for both. |
 | Join replay | A new client replays every event after its watermark. After compaction the log is minimal but still one create, one write and one setattr per live object. A large tree takes time to join; there is no bulk tree transfer. |
-| SQLite single writer | The client serialises FUSE writers through one connection; the server runs one store thread. Commit latency is dominated by `synchronous=FULL` fsync. |
+| SQLite single writer | The client serialises FUSE writers through one connection; the server runs one store thread. Client commits use `synchronous=NORMAL`; a server group commit waits for one `synchronous=FULL` fsync. |
 | Event log growth | Events accumulate until a graceful shutdown compacts them. A long-running server needs disk headroom for the log plus the live tree. |
 | Whole-file buffering | `PWRITE` and `TRUNCATE` need the complete post-operation file bytes. The server refuses a result above 4 GiB. |
 | Payload ceiling | One wire write aggregate and one event payload are capped at 4 MiB. A larger write is split by the client. |
@@ -365,8 +408,9 @@ operations and deny service. There is no per-client credential, no ACL, no
 role and no read restriction: every password holder is equal.
 
 There is no perfect forward secrecy. A leaked password decrypts past and
-future traffic. ChaCha8-Poly1305 (default) and ChaCha20-Poly1305 (selectable)
-both have this property.
+future traffic. ChaCha8-Poly1305 is the default; a build with the
+`reduced-round` feature disabled uses ChaCha20-Poly1305. Neither changes this
+property.
 
 There is no in-band password rotation and no revocation list. Changing the
 password derives a new namespace id, so existing client databases refuse to
@@ -385,7 +429,7 @@ read everything.
 
 Use full-disk or volume encryption when the host disk is not trusted. Protect
 backups at least as strictly as the live database. There is no separate
-client key file in v2; the password file and the databases are equivalent
+client key file in 1.0.0; the password file and the databases are equivalent
 secrets.
 
 ### 4.4 The link
@@ -409,8 +453,9 @@ decryption or at the handshake proof. Rate limiting, connection quotas and a
 reverse proxy are operational controls, not protocol guarantees.
 
 A queue overflow, a watermark regression/overclaim or a server shutdown kicks
-a client. A malicious server can force an unmount; that affects availability,
-not the stored data.
+a client. A queue overflow or `Stalled` kick only forces a reconnect; a
+terminal kick forces an unmount. A malicious server can force either, which
+affects availability, not the stored data.
 
 ### 4.6 Local users and the mount
 
@@ -432,8 +477,11 @@ mount owner.
   `--db` paths or distinct `SYNCMOUNT_STATE_DIR` values. The client takes an
   exclusive `flock` on the database file; a second process fails at startup.
 - One server process per namespace. There is no leader election, no failover
-  and no multi-server consensus. A graceful shutdown compacts and kicks every
-  client; a crash resumes `epoch` and `seq` from the database.
+  and no multi-server consensus. `server.db` is a single SQLite file, so its
+  loss or corruption stops every writer; clients keep readable replicas but
+  cannot commit until the file is restored from backup. A graceful shutdown
+  compacts and kicks every client; a crash resumes `epoch` and `seq` from the
+  database.
 - The reference deployment runs two namespaces on one host, on loopback ports
   8081 and 8082, with separate server databases and one shared password file.
   Caddy must forward the namespace prefix unchanged and must disable
@@ -452,7 +500,7 @@ mount owner.
   A build that does not understand the schema refuses to open the database
   rather than migrating silently.
 
-## 6. Explicitly not in v2
+## 6. Explicitly not in 1.0.0
 
 These are scope exclusions, not bugs and not promises:
 
@@ -489,11 +537,12 @@ These are scope exclusions, not bugs and not promises:
 > no forward secrecy, no rotation and no revocation. Use full-disk encryption
 > when the host disk is not trusted.
 >
-> Every write commits to the local SQLite database and the durable outbox
-> before it returns. A crash or disconnect keeps the outbox; the next session
-> resends it. `fsync` only guarantees the local SQLite file, not that other
-> clients have the data. A row marked `sent` is not retried until the next
-> session resets it to `pending`.
+> A write enters a per-inode memory buffer and returns. The background writer
+> commits it to the local SQLite database and the durable outbox within
+> 100 ms, or on flush, fsync, close or a namespace operation. A crash or
+> disconnect keeps the outbox; the next session resends it. `fsync` only
+> guarantees the local WAL, not that other clients have the data. A row marked
+> `sent` is not retried until the next session resets it to `pending`.
 >
 > Other clients see changes after a convergence delay (about 0.1 s on a LAN,
 > about 1 s on a public network); reads during that window can return old
@@ -503,8 +552,8 @@ These are scope exclusions, not bugs and not promises:
 > A server rejection marks the outbox row `failed` but does not roll back
 > unrelated local work. The row stays as a tombstone with the server's errno;
 > the server never applies it, and ordinary reconnects do not resend it. The
-> affected path is repaired from the server snapshot or by a full replay when
-> the snapshot exceeds the ERROR detail budget; writes to an existing path
+> affected path is repaired from the server state or by a full replay when
+> the state exceeds the ERROR detail budget; writes to an existing path
 > converge by last-writer-wins.
 >
 > Names must be valid UTF-8 and at most 255 bytes. xattrs, POSIX ACLs, `fcntl`

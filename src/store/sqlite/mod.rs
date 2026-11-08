@@ -47,18 +47,18 @@ mod types;
 #[cfg(test)]
 mod tests;
 
+#[cfg(test)]
+pub(crate) use event::V1_SETATTR_BYTES;
 pub use event::{
     EventDraft, EventKind, EventPayload, EventRow, InsertedEvent, MAX_PAYLOAD_BYTES,
     PAYLOAD_VERSION, PAYLOAD_VERSION_V1,
 };
-#[cfg(test)]
-pub(crate) use event::V1_SETATTR_BYTES;
 pub use hash::{chunk_hash, file_root};
 pub use schema::{CHUNK_BYTES, ROOT_INO, ROOT_MODE, ROOT_NLINK, keys};
 pub use types::{Chunk, ChunkRef, MetaValue, Name, Object, ObjectKind, OpId, RejectState};
 
-use std::fmt;
 use std::cell::Cell;
+use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
@@ -727,7 +727,9 @@ impl ReadPoolInner {
     fn reap_locked(&self, state: &mut PoolState) -> usize {
         let timeout = self.config.idle_timeout;
         let before = state.idle.len();
-        state.idle.retain(|reader| reader.last_used.elapsed() < timeout);
+        state
+            .idle
+            .retain(|reader| reader.last_used.elapsed() < timeout);
         let removed = before - state.idle.len();
         state.live = state.live.saturating_sub(removed);
         removed
@@ -841,30 +843,14 @@ impl WriteTx<'_> {
             if due {
                 if let Ok(state) = hash::state_hash(&self.tx) {
                     meta_set(&self.tx, keys::STATE_HASH, MetaValue::Blob(state.to_vec()))?;
-                    meta_set(
-                        &self.tx,
-                        keys::STATE_HASH_SEQ,
-                        MetaValue::Integer(applied),
-                    )?;
+                    meta_set(&self.tx, keys::STATE_HASH_SEQ, MetaValue::Integer(applied))?;
                     meta_set(&self.tx, keys::STATE_HASH_AT, MetaValue::Integer(now))?;
-                    meta_set(
-                        &self.tx,
-                        keys::STATE_HASH_PENDING,
-                        MetaValue::Integer(0),
-                    )?;
+                    meta_set(&self.tx, keys::STATE_HASH_PENDING, MetaValue::Integer(0))?;
                 } else {
-                    meta_set(
-                        &self.tx,
-                        keys::STATE_HASH_PENDING,
-                        MetaValue::Integer(1),
-                    )?;
+                    meta_set(&self.tx, keys::STATE_HASH_PENDING, MetaValue::Integer(1))?;
                 }
             } else {
-                meta_set(
-                    &self.tx,
-                    keys::STATE_HASH_PENDING,
-                    MetaValue::Integer(1),
-                )?;
+                meta_set(&self.tx, keys::STATE_HASH_PENDING, MetaValue::Integer(1))?;
             }
         }
         self.tx.commit()?;
@@ -1519,9 +1505,7 @@ impl WriteTx<'_> {
                 operation: "gc_orphan_chunks",
             });
         }
-        let orphans: i64 = self
-            .tx
-            .query_row(GC_COUNT_ORPHANS, [], |row| row.get(0))?;
+        let orphans: i64 = self.tx.query_row(GC_COUNT_ORPHANS, [], |row| row.get(0))?;
         let compacted_at = meta_i64(&self.tx, keys::COMPACTED_AT)?;
         if compacted_at <= 0 || compacted_at > older_than {
             return Ok(GcReport {
@@ -1530,9 +1514,7 @@ impl WriteTx<'_> {
                 freed_bytes: 0,
             });
         }
-        let freed_bytes: i64 = self
-            .tx
-            .query_row(GC_BYTES_ORPHANS, [], |row| row.get(0))?;
+        let freed_bytes: i64 = self.tx.query_row(GC_BYTES_ORPHANS, [], |row| row.get(0))?;
         let deleted = self.tx.execute(GC_DELETE_ORPHANS, [])?;
         Ok(GcReport {
             orphans: u64::try_from(orphans).unwrap_or(0),

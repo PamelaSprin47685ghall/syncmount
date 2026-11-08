@@ -99,7 +99,12 @@ impl Harness {
         applied: Seq,
         epoch_seen: u64,
         fast_forward: bool,
-    ) -> (SessionId, AttachReply, mpsc::Receiver<Bytes>, mpsc::Receiver<Bytes>) {
+    ) -> (
+        SessionId,
+        AttachReply,
+        mpsc::Receiver<Bytes>,
+        mpsc::Receiver<Bytes>,
+    ) {
         let (outbox, data, ctrl) = Outbox::new(&self.config.outbox);
         let session_id = SessionId(rand::random::<u128>().max(1));
         let reply = self
@@ -484,23 +489,17 @@ async fn attach_fast_forwards_the_drained_replica() {
 
     // The drained replica applied exactly the pre-compaction sequence. The
     // server starts replay after the synthetic log it already represents.
-    let (_, reply, _, _) = harness
-        .attach_reply(2, Seq(1), harness.epoch, true)
-        .await;
+    let (_, reply, _, _) = harness.attach_reply(2, Seq(1), harness.epoch, true).await;
     assert_eq!(reply.replay_from, Seq(compacted.get() + 1));
     assert_eq!(reply.current_seq, compacted);
 
     // A lagging replica must replay the whole synthetic log.
-    let (_, reply, _, _) = harness
-        .attach_reply(3, Seq(0), harness.epoch, true)
-        .await;
+    let (_, reply, _, _) = harness.attach_reply(3, Seq(0), harness.epoch, true).await;
     assert_eq!(reply.replay_from, Seq(1));
 
     // A client that did not negotiate the capability is never fast-forwarded,
     // even when its watermark happens to match.
-    let (_, reply, _, _) = harness
-        .attach_reply(4, Seq(1), harness.epoch, false)
-        .await;
+    let (_, reply, _, _) = harness.attach_reply(4, Seq(1), harness.epoch, false).await;
     assert_eq!(reply.replay_from, Seq(1));
 
     // A replica already at the compacted watermark in the new epoch catches
@@ -521,9 +520,7 @@ async fn attach_fast_forwards_the_drained_replica() {
         .await
         .unwrap();
     let _ = recv_seq(&mut writer_data).await;
-    let (_, reply, _, _) = harness
-        .attach_reply(7, Seq(1), harness.epoch, true)
-        .await;
+    let (_, reply, _, _) = harness.attach_reply(7, Seq(1), harness.epoch, true).await;
     assert!(reply.current_seq > compacted);
     assert_eq!(reply.replay_from, Seq(compacted.get() + 1));
 
@@ -543,9 +540,7 @@ async fn a_fast_forwarded_session_counts_as_drained() {
 
     let report = harness.sequencer.compact().await.unwrap();
     let compacted = Seq(report.compacted_seq as u64);
-    let (_, reply, _, _) = harness
-        .attach_reply(2, Seq(1), harness.epoch, true)
-        .await;
+    let (_, reply, _, _) = harness.attach_reply(2, Seq(1), harness.epoch, true).await;
     assert_eq!(reply.replay_from, Seq(compacted.get() + 1));
 
     // The adopted watermark is the session's watermark, so drain sees a
@@ -555,7 +550,10 @@ async fn a_fast_forwarded_session_counts_as_drained() {
         .drain(Duration::from_millis(200))
         .await
         .unwrap();
-    assert!(!drain.timed_out, "fast-forwarded session must not delay drain");
+    assert!(
+        !drain.timed_out,
+        "fast-forwarded session must not delay drain"
+    );
     assert_eq!(drain.applied_min, compacted);
 
     let _ = harness.stop().await;
@@ -758,13 +756,7 @@ async fn a_live_pwrite_broadcast_carries_the_server_file() {
     let _ = recv_ordered(&mut data).await;
 
     let patch = b"Z";
-    let mut pwrite = request(write_op(
-        [6; 16],
-        "/w",
-        patch,
-        OpClass::PWRITE,
-        Some(0),
-    ));
+    let mut pwrite = request(write_op([6; 16], "/w", patch, OpClass::PWRITE, Some(0)));
     pwrite.content = Some(patch.to_vec());
     harness.sequencer.ordered(author, pwrite).await.unwrap();
 
@@ -774,10 +766,9 @@ async fn a_live_pwrite_broadcast_carries_the_server_file() {
         let frame = recv_seq(&mut data).await;
         match frame.header.msg_type {
             MsgType::STREAM_DATA => {
-                let opened =
-                    crate::protocol::crypto::Opener::with_session_key(&ring.session_key())
-                        .open(&frame.header, &frame.prefix, &frame.body)
-                        .unwrap();
+                let opened = crate::protocol::crypto::Opener::with_session_key(&ring.session_key())
+                    .open(&frame.header, &frame.prefix, &frame.body)
+                    .unwrap();
                 stream.extend_from_slice(opened.as_slice());
             }
             MsgType::ORDERED => break frame,
@@ -1041,9 +1032,7 @@ async fn replayed_hello_is_closed_before_welcome() {
         .await
         .unwrap();
     replay.send(hello_frame).await.unwrap();
-    if let Ok(Ok(Some(bytes))) =
-        tokio::time::timeout(Duration::from_secs(3), replay.recv()).await
-    {
+    if let Ok(Ok(Some(bytes))) = tokio::time::timeout(Duration::from_secs(3), replay.recv()).await {
         let frame = decode(&bytes);
         assert_ne!(
             frame.header.msg_type,
@@ -1087,7 +1076,9 @@ async fn group_commit_broadcasts_a_batch_in_sequence_order() {
     let read = db.read().unwrap();
     for index in 1..=3u8 {
         assert!(
-            read.object_by_path(&format!("/f{index}")).unwrap().is_some(),
+            read.object_by_path(&format!("/f{index}"))
+                .unwrap()
+                .is_some(),
             "/f{index} must be committed"
         );
     }

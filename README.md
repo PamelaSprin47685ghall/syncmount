@@ -3,11 +3,13 @@
 Server-authoritative, eventually consistent FUSE filesystem backed by SQLite.
 
 One binary is both the client and the server. A client mounts a namespace as a
-local directory, commits every local change to its own SQLite database before
-returning, and synchronises through a durable outbox. The server owns the
-authoritative tree, assigns one total order, appends an event log and streams
-that log to every client. A client's mountpoint is a view over its replica
-database; it is not a backing directory.
+local directory, buffers each write in memory and returns, and synchronises
+through a durable outbox. A background thread commits the buffer to its own
+SQLite database and the outbox within 100 ms, or sooner on flush, fsync, close
+or a namespace operation. The server owns the authoritative tree, assigns one
+total order, appends an event log and streams that log to every client. A
+client's mountpoint is a view over its replica database; it is not a backing
+directory.
 
 **This is not end-to-end encryption.** The server holds the master password,
 decrypts every operation, applies it to a plaintext SQLite database and serves
@@ -37,20 +39,61 @@ zero, except for a drained client that adopts the compaction point.
 
 The client has no backing tree. Every FUSE callback reads a SQLite read transaction or
 runs one local-first `BEGIN IMMEDIATE` transaction that updates the replica and
-appends the matching outbox row in the same commit. Writes return after the
-local commit, not after a network round trip. The outbox is durable: a crash,
-disconnect or kick keeps the rows, and the next session resends them.
+appends the matching outbox row in the same commit. A write returns after it
+enters the memory buffer, not after a local commit and not after a network
+round trip. The outbox is durable: a crash, disconnect or kick keeps the rows,
+and the next session resends them.
 
 ## Status
 
-v0.1.0, protocol 3.0. The v1 identity and join machinery has been removed;
-protocol 3.0 is a clean break from the 2.0 wire format, and 1.0 and 2.0 peers
-are rejected during negotiation.
+v1.0.0, protocol 3.0, payload v3. 1.0.0 is a clean break from every earlier
+release: there is no supported mixed-version cluster. Protocol 1.0 and 2.0
+peers are rejected during negotiation. Payload v1 and v2 records remain
+decodable, but an older binary cannot read a v3 record.
 
 The current implementation covers the shared SQLite store, the server
 sequencer and event log, the PSK handshake, the FUSE-over-SQLite client, the
 durable outbox, deterministic replay, import, drain/compaction and the 12-host
 reference deployment.
+
+## Upgrade to 1.0.0
+
+1.0.0 is **not compatible** with any earlier release. A mixed cluster is
+unsupported: finish the upgrade with every client and the server on 1.0.0. The
+wire protocol is 3.0 and events use payload v3.
+
+Replace every client binary first, then the server, but keep the clients
+stopped until the server is upgraded. These steps assume the old server already
+speaks protocol 3.0; from an older protocol major, stop the cluster and rebuild
+or re-import under 1.0.0.
+
+1. Stop each client and let it unmount cleanly.
+2. Back up `client.db` together with `client.db-wal` for every mount, and
+   `server.db` with `server.db-wal`.
+3. Replace every client binary and keep the clients stopped. A 1.0.0 client
+   sends payload v3 in its operations, which the old server cannot decode.
+4. Stop the old server gracefully, replace its binary, and start the 1.0.0
+   server. New operations write payload v3 immediately, and the first graceful
+   shutdown compacts the log into v3 records.
+5. Start the clients. A 1.0.0 client decodes v1 and v2 payloads, so it can
+   replay an event log written by the old server.
+
+Do not run an old client against a 1.0.0 server. The server writes every new
+event as payload v3, which an old binary cannot decode; the client exits 10 at
+the first such event. A pre-3.0 client may instead fail negotiation and report
+exit 4. A v3 record is unreadable by every older binary, so a rollback after
+the new server has written one fails unless the backups above are restored.
+
+Existing databases are readable: payload v1 and v2 decode, and the schema is
+unchanged. A clean rebuild or re-import is still the safer path across this
+boundary, because it also removes replicas that were already divergent. After
+a graceful compaction, a client that was drained at the compaction point
+(`epoch = compacted_epoch - 1`, `applied_seq = compacted_from_seq`, non-empty
+tree, fast-forward capability negotiated) adopts the new epoch without
+replaying; every other client replays from zero.
+
+Keep the service alive with the systemd settings below: `Restart=always`,
+`RestartPreventExitStatus=2 4`, and `StartLimitIntervalSec=0`.
 
 ## Quick start
 
@@ -118,7 +161,7 @@ id and new databases.
 
 | Command | Purpose |
 |---|---|
-| `syncmount client URL MOUNTPOINT` | Mount the replica and run until the transport fails or a signal arrives. |
+| `syncmount client URL MOUNTPOINT` | Mount the replica and run until unmounted, a signal arrives, or the reconnect budget is exhausted. |
 | `syncmount server URL` | Run the authoritative sequencer; `--listen`/`--port` choose the bind address. |
 | `syncmount import --from DIR` | Import a POSIX tree into a client database without mounting it. |
 | `syncmount status [--json]` | Read the per-mount status file under the runtime base (default `/run/syncmount`). |
@@ -141,17 +184,18 @@ Import options: `--from DIR`, `--db PATH` (default `SYNCMOUNT_DB`, otherwise
 the client state directory plus the namespace), `--namespace NAME` (default
 `root`, used only for the default database path), `--replace` (clear the
 existing tree, outbox and chunks first), `--seed` (generate the deterministic
-seed outbox events now), `--cluster HEX` (override the PSK-derived namespace
-id), and `--key-file PATH`. An import is idempotent; run it on a quiescent tree
-before the first client start, then let that client seed the empty server. All
-clients of one namespace must import the same tree.
+seed outbox events now), and `--key-file PATH`. An import is idempotent; run it
+on a quiescent tree before the first client start, then let that client seed
+the empty server. All clients of one namespace must import the same tree.
 
-Exit status: `0` success, `1` usage error (including the refused `--key`), `2` startup failure,
-`3` reserved (a corrupt audit journal; no audit journal exists in v2), `4`
-authentication failure (wrong master password), `10` disconnected or kicked
-after the mount was released. A systemd unit that restarts on failure must list
-`10` in `RestartPreventExitStatus`; see the SYSTEMD section of
-`man/syncmount.1`.
+Exit status: `0` success, `1` usage error detected by syncmount (the refused
+`--key`, an invalid URL or listen address), `2` argument parsing failure (for
+example an unknown option or missing value; clap exits 2) or startup failure,
+`3` reserved (a corrupt audit journal; no audit journal exists in 1.0.0), `4`
+authentication failure (wrong master password), `10` disconnected after the
+reconnect budget was exhausted or after a terminal kick. A systemd unit should
+use `Restart=always`, list `2` and `4` in `RestartPreventExitStatus`, and set
+`StartLimitIntervalSec=0`; see the SYSTEMD section of `man/syncmount.1`.
 
 ## Deployment
 
@@ -169,9 +213,9 @@ mounts two namespaces, so each host has two `client.db` files and two FUSE
 mounts. The server keeps `/etc/syncmount/master.pass` (0600, root). A client
 running as a non-root user cannot read that file because the password file
 must be owned by the effective user; give each mount user its own 0600 file
-(for example `~/.config/syncmount/master.pass`). The pre-v2 backup is kept at
-`$HOME/syncmount-backup-pre-v2-<timestamp>` with checksum and size
-inventories; it is not deleted automatically.
+(for example `~/.config/syncmount/master.pass`). A backup from an earlier
+migration is kept at `$HOME/syncmount-backup-pre-v2-<timestamp>` with checksum
+and size inventories; it is not deleted automatically.
 
 Caddy fronts the two server processes. The sync URL stays plain HTTP; the
 client has no TLS stack. The public tree may also be published read-only over
@@ -225,6 +269,7 @@ A system-level client unit runs as the mounting user:
 ```ini
 [Unit]
 Description=syncmount private client
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -235,8 +280,8 @@ Environment=SYNCMOUNT_RUN_DIR=/run/syncmount-private
 Environment=SYNCMOUNT_STATE_DIR=/home/user/.local/state/private
 Environment=SYNCMOUNT_MASTER_PASSWORD_FILE=/home/user/.config/syncmount/master.pass
 ExecStart=/usr/local/bin/syncmount client http://sync.example.com/private /home/user/private
-Restart=on-failure
-RestartPreventExitStatus=10
+Restart=always
+RestartPreventExitStatus=2 4
 
 [Install]
 WantedBy=multi-user.target
@@ -245,12 +290,16 @@ WantedBy=multi-user.target
 `RuntimeDirectory` gives the unit a writable `/run/syncmount-private`;
 `SYNCMOUNT_STATE_DIR` holds the client database at
 `$SYNCMOUNT_STATE_DIR/<namespace>/client.db`. The password file must be mode
-0600, owned by and readable by `User=`. `RestartPreventExitStatus=10` makes a
-disconnect final: the unit does not reconnect on its own, so start it again
-after the network or the sequencer returns. The `/public` cluster uses the same
-shape with `syncmount-public`, `/run/syncmount-public`, its own state directory,
-mountpoint and unit name. Set the same `SYNCMOUNT_RUN_DIR` when running
-`syncmount status`.
+0600, owned by and readable by `User=`. The client reconnects in-process after
+a transport close, a `QueueOverflow` or `Stalled` kick, or a replay stall; it
+exits 10 only when the bounded budget is exhausted or a terminal kick arrives.
+`Restart=always` then starts a fresh process, which resends the outbox.
+Statuses 2 (argument or startup failure) and 4 (wrong password) are
+configuration errors and stop the unit until fixed. `StartLimitIntervalSec=0`
+removes the start-rate limit so repeated restarts are not throttled. The
+`/public` cluster uses the same shape with `syncmount-public`,
+`/run/syncmount-public`, its own state directory, mountpoint and unit name. Set
+the same `SYNCMOUNT_RUN_DIR` when running `syncmount status`.
 
 ## Consistency and durability
 
@@ -302,31 +351,43 @@ echo is matched by `op_id` and only acknowledges the outbox row; it never
 re-applies the payload, so an older echo cannot shrink a file that newer local
 writes have extended. A rename or link echo is applied: the server resolves
 paths, so its event may name a different inode than the optimistic local
-operation. A rejection does not roll back the local SQLite effect. The outbox
-row stays in the local database as a `failed` tombstone with the server's
-errno; the server never applies it, and ordinary reconnects do not resend or
-repair it. A rejected namespace operation (for example a create that lost a
-race) leaves the local name and object graph as the local transaction wrote it.
-The replica can stay diverged until an epoch change or a new import. Writes to
-an existing path are last-writer-wins and do converge.
+operation. A rejection does not roll back unrelated local work. The outbox row
+becomes a `failed` tombstone with the server's errno, and later pending
+operations on the same inode are tombstoned too, so they cannot recreate the
+lost race. The ERROR detail carries the server's authoritative state for
+the affected path when it fits the 512-byte budget; the client replaces that
+path locally. A state payload that does not fit becomes a resync marker: the
+client records the tombstone, reconnects and replays the server log. Other
+paths and pending operations are untouched. Writes to an existing path are
+last-writer-wins and do converge.
 
-`fsync`/`fdatasync` first commit every buffered write, then run
-`PRAGMA wal_checkpoint(TRUNCATE)` on the client database. They make the local
-SQLite file durable; they do not wait for the cluster. The database uses WAL
-and `synchronous=FULL`, so a committed transaction survives a crash even
-before the checkpoint. Closing a file (`flush`/`release`) commits that file
-but does not checkpoint the WAL.
+`fsync`/`fdatasync` first commit every buffered write, then fsync the client
+WAL file. They do not run `wal_checkpoint(TRUNCATE)`: a background thread
+copies WAL pages back with a PASSIVE checkpoint, which never blocks the writer
+or waits for a long read. The client database uses WAL and
+`synchronous=NORMAL`; the server database uses `synchronous=FULL`, because a
+confirmed event must survive a power loss. `fsync` makes the local WAL
+durable; it does not wait for the cluster. Closing a file (`flush`/`release`)
+commits that file but does not checkpoint the WAL.
 
-A transport disconnect or a `QueueOverflow` kick reconnects in-process from
-`applied_seq` with a bounded backoff; after the budget is exhausted the
-process exits with status 10. Any other kick, or a protocol violation,
-unmounts the client and exits 10. There is no offline mode. The outbox
-survives a restart, so pending and previously sent operations are resent. An
-epoch change normally clears the replica tables and replays the compacted
-stream from zero; pending outbox rows survive that reset too. A drained
-client that applied exactly the sequence immediately before the compaction
-is the exception: it keeps its tree and adopts the new epoch without a
-replay (see below).
+A transport close, a `QueueOverflow` or `Stalled` kick, or a replay stall
+reconnects in-process from `applied_seq` with a bounded backoff; a session that
+applies events, or lives 10 seconds, resets the budget. If the budget is
+exhausted, the process exits with status 10. Every other kick (for example
+`Regression`, `Overclaim`, `EpochMismatch` or `ServerShutdown`), a protocol
+violation or a fatal local error unmounts the client and exits 10. There is no
+offline mode. The outbox survives a restart, so pending and previously sent
+operations are resent. An epoch change normally clears the replica tables and
+replays the compacted stream from zero; pending outbox rows survive that reset
+too. A drained client that applied exactly the sequence immediately before the
+compaction is the exception: it keeps its tree and adopts the new epoch
+without a replay (see below).
+
+Both ends enable TCP keepalive (60 s idle, 10 s probe interval, 3 probes), and
+the client sends a sealed `PING` every second carrying its `applied_seq`. The
+server uses that watermark for drain, regression/overclaim checks and lag
+diagnostics; a session that stops reporting progress is eventually kicked as
+`Stalled`.
 
 A client whose replica is behind replays the server's event log from
 `applied_seq + 1`. Writes return `EROFS` during `JOINING`, but reads are
@@ -341,6 +402,21 @@ dropped unless the queue has stopped draining. A watermark
 that regresses or exceeds the server's `current_seq` is kicked as `Regression`
 or `Overclaim`. Lag diagnostics are not a kick: a slow but progressing client
 may stay slow. See [`docs/known-limitations.md`](docs/known-limitations.md).
+
+`meta.state_hash` is a BLAKE3 digest of the object table, including inode ids.
+On the server it is a checkpoint digest written at compaction and at clean
+shutdown. On a client it is a diagnostic value: replay refreshes it after 4096
+events or 300 seconds, and a smaller batch marks it pending for the background
+checkpoint thread, which drains it within 60 seconds. It is not a
+cross-cluster consensus value, and replicas built from different imports need
+not agree.
+
+Orphan chunks are collected at server startup, at most every 3600 seconds,
+and immediately after compaction. A periodic pass deletes only when the last
+compaction is at least 3600 seconds old; compaction itself has already dropped
+every event that could reference an orphan, so it collects without delay.
+Collection deletes chunk rows only. `VACUUM` is not run automatically; freed
+pages are reused by later writes.
 
 ## Drain, compaction and epoch
 
@@ -436,24 +512,28 @@ is [`docs/threat-model.md`](docs/threat-model.md).
 - **No non-UTF-8 names.** A file name must be valid UTF-8, at most 255 bytes
   and free of `/` and NUL; otherwise the operation returns `EINVAL` or
   `ENAMETOOLONG`. Paths are capped at 4096 bytes.
-- **No ACLs or xattrs.** `getxattr` returns `ENODATA`, `setxattr` and
-  `removexattr` return `ENOTSUP`, and POSIX ACLs are not stored. `fcntl`
-  record locks return `ENOSYS`; `flock` is local to one mount.
+- **No ACLs or xattrs.** `getxattr` returns `ENODATA`, `listxattr` returns an
+  empty list, `setxattr` and `removexattr` return `ENOTSUP`, and POSIX ACLs
+  are not stored. `fcntl` record locks return `ENOSYS`; `flock` is local to one
+  mount.
 - **4 MiB payload and 4 GiB file ceilings.** One wire write aggregate and one
   event payload are capped at 4 MiB; the server refuses a file larger than
   4 GiB. Larger files must be split by the application.
 - **Reads can be stale and JOIN is readable.** The convergence window is about
   0.1 s on a LAN and about 1 s on a public network. A joining client allows
   reads while it replays.
-- **A rejection does not roll back local state.** The outbox row becomes a
-  `failed` tombstone with the server's errno; the server never applies it, and
-  ordinary reconnects do not resend or repair it. A rejected namespace
-  operation can leave the replica diverged until an epoch change or a new
-  import. Writes to an existing path converge by last-writer-wins.
+- **A rejection repairs only the affected path.** The outbox row becomes a
+  `failed` tombstone with the server's errno, and later operations on the same
+  inode are tombstoned too. The server's state replaces the affected path
+  locally when it fits the 512-byte detail budget; otherwise the client
+  records a resync marker, reconnects and replays the server log. Other paths
+  and pending operations are untouched. Writes to an existing path converge by
+  last-writer-wins.
 - **No HA, no multi-tenant routing, no P2P.** One process serves one
-  namespace. All traffic goes through the server. There is no independent
-  fsck, broadcast log or content verification pass; a full replay is the
-  recovery path.
+  namespace, and one SQLite file is the only authoritative state; there is no
+  failover, leader election or multi-server replication. All traffic goes
+  through the server. There is no independent fsck, broadcast log or content
+  verification pass; a full replay is the recovery path.
 - **Linux only.** The host needs `/dev/fuse` and a setuid `fusermount3`. The
   musl binary is static, but FUSE is not; a container also needs
   `/etc/resolv.conf` for DNS.
@@ -482,7 +562,7 @@ CI asserts a size below 15 MiB and no `NEEDED` entries. See
 
 ```bash
 ./install.sh                      # latest release into ~/.local/bin
-./install.sh --version 0.1.0 --prefix /usr/local
+./install.sh --version 1.0.0 --prefix /usr/local
 ```
 
 The script downloads the tarball, verifies its sha256, installs the binary and
@@ -495,6 +575,7 @@ man page, and reports missing `/dev/fuse` or `fusermount3`.
 - [`examples/two-clients.sh`](examples/two-clients.sh) — two mounts, eventual
   convergence and last-writer-wins.
 - [`examples/offline-remount.sh`](examples/offline-remount.sh) — transport loss
+  triggers in-process reconnects; once the budget is exhausted the client
   unmounts with status 10 and the durable outbox is resent on the next start.
 
 Each script uses a private runtime and state directory and cleans up after

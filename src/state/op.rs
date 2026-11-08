@@ -474,7 +474,10 @@ fn plan_setattr(
         match object.kind {
             Kind::File => {}
             Kind::Dir => {
-                return Err(Reject::new(Errno::EISDIR, "setattr size targets a directory"));
+                return Err(Reject::new(
+                    Errno::EISDIR,
+                    "setattr size targets a directory",
+                ));
             }
             Kind::Symlink => {
                 return Err(Reject::new(Errno::EINVAL, "setattr size targets a symlink"));

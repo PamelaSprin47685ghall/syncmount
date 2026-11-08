@@ -2188,7 +2188,10 @@ mod tests {
                     |row| row.get(0),
                 )
                 .unwrap();
-            assert_eq!(count, 1, "the dropped file's chunk exists before compaction");
+            assert_eq!(
+                count, 1,
+                "the dropped file's chunk exists before compaction"
+            );
         }
 
         let report = store.compact().await.unwrap();
@@ -2211,9 +2214,11 @@ mod tests {
         // The compacted log still describes the live file, and its bytes are
         // available to a replaying client.
         let rows = store.events(report.epoch, 0, 1_000).await.unwrap();
-        assert!(rows.iter().any(|row| {
-            row.kind == EventKind::Write && row.path.as_deref() == Some("/keep")
-        }));
+        assert!(
+            rows.iter().any(|row| {
+                row.kind == EventKind::Write && row.path.as_deref() == Some("/keep")
+            })
+        );
         assert_eq!(
             store.chunk_data(keep_hash).await.unwrap(),
             Some(b"keep".to_vec())

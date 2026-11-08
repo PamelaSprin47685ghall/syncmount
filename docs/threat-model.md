@@ -1,10 +1,10 @@
 # Threat model
 
-Status: normative security boundary for syncmount v2 (protocol 3.0). This
-document states what the design protects, against whom, and what it explicitly
-does not protect. It describes the design, not a particular build. The
-semantic limits are in [`known-limitations.md`](known-limitations.md); the
-operational surface is in [`../README.md`](../README.md) and
+Status: normative security boundary for syncmount 1.0.0 (protocol 3.0,
+payload v3). This document states what the design protects, against whom, and
+what it explicitly does not protect. It describes the design, not a particular
+build. The semantic limits are in [`known-limitations.md`](known-limitations.md);
+the operational surface is in [`../README.md`](../README.md) and
 `man/syncmount.1`.
 
 ## 1. System and trust boundaries
@@ -37,8 +37,8 @@ client B (PSK, client.db plaintext) ── HTTP/1.1 ──┘
   deliver the master password out of band. Anyone with the password is a full
   member and can open every database.
 
-The server is **not** an untrusted sequencer in v2. It is a trusted reader and
-writer that happens to sit across a network link. This is the central
+The server is **not** an untrusted sequencer in 1.0.0. It is a trusted reader
+and writer that happens to sit across a network link. This is the central
 difference from an end-to-end encrypted design: the PSK protects the link, not
 the data from the server.
 
@@ -69,16 +69,18 @@ the data from the server.
 
 - The master password is stretched with Argon2id (`m = 64 MiB`, `t = 3`,
   `p = 4`) using the fixed 16-byte PSK salt. The 32-byte master key is
-  expanded with HKDF-SHA256, using the namespace id as the salt, into the
-  encryption, control and handshake keys.
+  expanded with HKDF-SHA256 using that same fixed `PSK_SALT`, not the
+  namespace id, into the encryption, control and handshake keys.
 - The namespace id is `BLAKE3("sm/v2/namespace" || master key)[..16]`. It is
-  derived from the password, not from the URL. Every client and the server
-  must use the same password; a different password derives a different id and
-  a different key.
-- Every steady-state frame is sealed with ChaCha8-Poly1305 (default) or
-  ChaCha20-Poly1305 (selectable). Each frame uses an independent nonce from
-  the nonce minter. The AEAD covers the frame body and binds the header fields
-  except `seq`, which the server must assign.
+  derived from the password, not from the URL, and it guards a database
+  against being opened under a different password. It is not an HKDF salt.
+  Every client and the server must use the same password; a different
+  password derives a different id and a different key.
+- Every steady-state frame is sealed with ChaCha8-Poly1305. A build with the
+  `reduced-round` feature disabled uses ChaCha20-Poly1305; the choice is fixed
+  at build time, not negotiated per session. Each frame uses an independent
+  nonce from the nonce minter. The AEAD covers the frame body and binds the
+  header fields except `seq`, which the server must assign.
 - Paths, file data, chunk bytes and operation arguments are inside the sealed
   body. The server can read them because it holds the PSK; a network attacker
   without the PSK cannot.
@@ -121,7 +123,7 @@ The server can rewrite `seq`, delay, drop, duplicate or reorder events. A
 client detects its own sequence gaps and an epoch change, but it cannot prove
 a cross-client reorder: the server can put B's operation before A's as long as
 each client's stream stays monotonic. Preventing that requires
-client-to-client consensus or a global hash chain, which v2 does not have.
+client-to-client consensus or a global hash chain, which 1.0.0 does not have.
 
 The server can also forge an event because it holds the PSK. Clients have no
 independent signature to check. A compromised server is therefore a full
@@ -153,6 +155,11 @@ file, no symlink.
 - The server accepts unauthenticated connections; garbage is dropped at AEAD
   or at the handshake proof. Rate limiting, connection quotas and a reverse
   proxy are operational controls, not protocol guarantees.
+- `server.db` is a single SQLite file and the only authoritative copy. There
+  is no replication, hot standby or failover. Loss or corruption of that file
+  stops every writer; clients keep readable replicas but cannot commit until
+  the operator restores the file from a backup. Disk redundancy, backups and
+  restore drills are operational controls, not protocol guarantees.
 
 ### 4.6 Local protection
 
@@ -239,7 +246,7 @@ assume the old data was exposed.
 ```
 master password
   └─ Argon2id(fixed PSK salt, m=64 MiB, t=3, p=4) → 32-byte master key
-       └─ HKDF-SHA256(salt = namespace id) → enc / ctrl / handshake keys
+       └─ HKDF-SHA256(salt = fixed PSK_SALT) → enc / ctrl / handshake keys
 namespace id = BLAKE3("sm/v2/namespace" || master key)[..16]
 
 per connection
@@ -262,7 +269,7 @@ per connection
   rebuilding. There is no revocation list and no per-client credential to
   revoke.
 - **No forward secrecy.** A leaked password decrypts past and future traffic.
-  ChaCha20-Poly1305 does not change that.
+  Neither ChaCha8-Poly1305 nor ChaCha20-Poly1305 changes that.
 - **Compromise response.** A leaked password: rebuild under a new password and
   assume all old data and recordings are exposed. A stolen database: treat all
   plaintext in it as exposed. A compromised server: treat the whole tree as

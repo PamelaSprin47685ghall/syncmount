@@ -312,65 +312,81 @@ impl EventPayload {
         let payload = match version {
             PAYLOAD_VERSION => decode_body(body, "payload")?,
             PAYLOAD_VERSION_V2 => match kind {
-                EventKind::Rename => decode_timestamped_v2(
-                    body,
-                    EventKind::Rename,
-                    "v2 rename",
-                    |ino| EventPayload::Rename { ino, mtime_ns: None },
-                )?,
-                EventKind::Unlink => decode_timestamped_v2(
-                    body,
-                    EventKind::Unlink,
-                    "v2 unlink",
-                    |ino| EventPayload::Unlink { ino, mtime_ns: None },
-                )?,
-                EventKind::Rmdir => decode_timestamped_v2(
-                    body,
-                    EventKind::Rmdir,
-                    "v2 rmdir",
-                    |ino| EventPayload::Rmdir { ino, mtime_ns: None },
-                )?,
-                EventKind::Link => decode_timestamped_v2(
-                    body,
-                    EventKind::Link,
-                    "v2 link",
-                    |ino| EventPayload::Link { ino, mtime_ns: None },
-                )?,
+                EventKind::Rename => {
+                    decode_timestamped_v2(body, EventKind::Rename, "v2 rename", |ino| {
+                        EventPayload::Rename {
+                            ino,
+                            mtime_ns: None,
+                        }
+                    })?
+                }
+                EventKind::Unlink => {
+                    decode_timestamped_v2(body, EventKind::Unlink, "v2 unlink", |ino| {
+                        EventPayload::Unlink {
+                            ino,
+                            mtime_ns: None,
+                        }
+                    })?
+                }
+                EventKind::Rmdir => {
+                    decode_timestamped_v2(body, EventKind::Rmdir, "v2 rmdir", |ino| {
+                        EventPayload::Rmdir {
+                            ino,
+                            mtime_ns: None,
+                        }
+                    })?
+                }
+                EventKind::Link => {
+                    decode_timestamped_v2(body, EventKind::Link, "v2 link", |ino| {
+                        EventPayload::Link {
+                            ino,
+                            mtime_ns: None,
+                        }
+                    })?
+                }
                 _ => decode_body(body, "payload")?,
             },
             PAYLOAD_VERSION_V1 if kind == EventKind::Setattr => decode_setattr_v1(body)?,
             PAYLOAD_VERSION_V1 => match kind {
-                EventKind::Rename => decode_timestamped_v2(
-                    body,
-                    EventKind::Rename,
-                    "v1 rename",
-                    |ino| EventPayload::Rename { ino, mtime_ns: None },
-                )?,
-                EventKind::Unlink => decode_timestamped_v2(
-                    body,
-                    EventKind::Unlink,
-                    "v1 unlink",
-                    |ino| EventPayload::Unlink { ino, mtime_ns: None },
-                )?,
-                EventKind::Rmdir => decode_timestamped_v2(
-                    body,
-                    EventKind::Rmdir,
-                    "v1 rmdir",
-                    |ino| EventPayload::Rmdir { ino, mtime_ns: None },
-                )?,
-                EventKind::Link => decode_timestamped_v2(
-                    body,
-                    EventKind::Link,
-                    "v1 link",
-                    |ino| EventPayload::Link { ino, mtime_ns: None },
-                )?,
+                EventKind::Rename => {
+                    decode_timestamped_v2(body, EventKind::Rename, "v1 rename", |ino| {
+                        EventPayload::Rename {
+                            ino,
+                            mtime_ns: None,
+                        }
+                    })?
+                }
+                EventKind::Unlink => {
+                    decode_timestamped_v2(body, EventKind::Unlink, "v1 unlink", |ino| {
+                        EventPayload::Unlink {
+                            ino,
+                            mtime_ns: None,
+                        }
+                    })?
+                }
+                EventKind::Rmdir => {
+                    decode_timestamped_v2(body, EventKind::Rmdir, "v1 rmdir", |ino| {
+                        EventPayload::Rmdir {
+                            ino,
+                            mtime_ns: None,
+                        }
+                    })?
+                }
+                EventKind::Link => {
+                    decode_timestamped_v2(body, EventKind::Link, "v1 link", |ino| {
+                        EventPayload::Link {
+                            ino,
+                            mtime_ns: None,
+                        }
+                    })?
+                }
                 _ => decode_body(body, "payload")?,
             },
             found => {
                 return Err(StoreError::PayloadVersion {
                     found,
                     supported: PAYLOAD_VERSION,
-                })
+                });
             }
         };
         let actual = payload.kind();

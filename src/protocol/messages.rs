@@ -1429,9 +1429,7 @@ impl Auth {
                 major: u16::from_le_bytes([body[48], body[49]]),
                 minor: u16::from_le_bytes([body[50], body[51]]),
             },
-            caps: Caps::from_bits(u32::from_le_bytes([
-                body[52], body[53], body[54], body[55],
-            ])),
+            caps: Caps::from_bits(u32::from_le_bytes([body[52], body[53], body[54], body[55]])),
         })
     }
 }
@@ -1779,7 +1777,6 @@ impl<'a> Ordered<'a> {
             _ => None,
         }
     }
-
 }
 
 impl fmt::Debug for Ordered<'_> {
@@ -2497,7 +2494,9 @@ mod tests {
         let plain = welcome.encode().unwrap();
         let proof = [0x5e; Welcome::SERVER_PROOF_LEN];
         let accept = [0x5c; ACCEPT_SEALED_LEN];
-        let body = welcome.encode_with_proof_and_accept(&proof, &accept).unwrap();
+        let body = welcome
+            .encode_with_proof_and_accept(&proof, &accept)
+            .unwrap();
 
         assert_eq!(
             Welcome::server_proof(&body, &limits()).unwrap(),
@@ -2509,9 +2508,11 @@ mod tests {
         );
         assert_eq!(
             Welcome::proof_input(&body, &limits()).unwrap(),
-            *blake3::hash(
-                &rebuilt(&plain, &[(fid::F_SEALED_ACCEPT, accept.to_vec())], &[])
-            )
+            *blake3::hash(&rebuilt(
+                &plain,
+                &[(fid::F_SEALED_ACCEPT, accept.to_vec())],
+                &[]
+            ))
             .as_bytes()
         );
         assert_eq!(Welcome::decode(&body, &limits()).unwrap(), welcome);
@@ -2576,17 +2577,11 @@ mod tests {
         assert_eq!(Auth::decode(&bytes).unwrap(), auth);
         assert_eq!(
             Auth::decode(&bytes[..55]).unwrap_err(),
-            MessageError::BadBodyLen {
-                len: 55,
-                need: 56
-            }
+            MessageError::BadBodyLen { len: 55, need: 56 }
         );
         assert_eq!(
             Auth::decode(&[0u8; 57]).unwrap_err(),
-            MessageError::BadBodyLen {
-                len: 57,
-                need: 56
-            }
+            MessageError::BadBodyLen { len: 57, need: 56 }
         );
     }
 
@@ -3004,9 +2999,7 @@ mod tests {
         let limits = Limits::default();
         assert!(body.len() <= usize::from(limits.wcp_max));
         assert!(
-            crate::protocol::HEADER_LEN
-                + crate::protocol::CTRL_PREFIX_LEN
-                + body.len()
+            crate::protocol::HEADER_LEN + crate::protocol::CTRL_PREFIX_LEN + body.len()
                 <= limits.ingress_frame as usize
         );
     }
@@ -3095,10 +3088,7 @@ mod tests {
         let canonical = write.canonical_bytes_excluding(&[fid::F_PATH]).unwrap();
         let canonical_map = FieldMap::parse(&canonical, &limits).unwrap();
         assert!(canonical_map.get(fid::F_PATH).is_none());
-        assert_eq!(
-            canonical_map.get(fid::F_OP_ID),
-            Some([2u8; 16].as_slice())
-        );
+        assert_eq!(canonical_map.get(fid::F_OP_ID), Some([2u8; 16].as_slice()));
 
         let pwrite_body = ordered_pwrite_body();
         let pwrite = Ordered::decode(&pwrite_body, &limits).unwrap();

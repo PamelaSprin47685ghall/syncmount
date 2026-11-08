@@ -1,0 +1,24 @@
+# syncmount 1.0.0 sequencer template.
+# Instance: private or public. /etc/syncmount/%i.env provides:
+#   LISTEN=127.0.0.1:8081   (private) or 127.0.0.1:8082 (public)
+#   DB=/var/lib/syncmount/private/server.db (or .../public/server.db)
+# The production unit runs under an administrator account; this example uses
+# a dedicated account.
+[Unit]
+Description=syncmount sequencer (%i)
+StartLimitIntervalSec=0
+After=network.target
+
+[Service]
+Type=simple
+User=syncmount
+Group=syncmount
+UMask=0077
+EnvironmentFile=/etc/syncmount/%i.env
+ExecStart=/usr/local/bin/syncmount --log-format json --log-level info server http://sync.example.com/%i --listen ${LISTEN} --db ${DB} --key-file /etc/syncmount/master.pass
+Restart=on-failure
+RestartPreventExitStatus=1 2 3
+RestartSec=2s
+
+[Install]
+WantedBy=multi-user.target

@@ -550,14 +550,7 @@ impl HandshakeKeys {
         tag.copy_from_slice(&sealed[tag_at..]);
         let mut plaintext = Zeroizing::new(sealed[1 + NONCE_LEN..tag_at].to_vec());
         let aad = detached_aad(domain, context);
-        decrypt_in_place(
-            alg,
-            &self.key,
-            &nonce,
-            &aad,
-            plaintext.as_mut_slice(),
-            &tag,
-        )?;
+        decrypt_in_place(alg, &self.key, &nonce, &aad, plaintext.as_mut_slice(), &tag)?;
         Ok(plaintext)
     }
 

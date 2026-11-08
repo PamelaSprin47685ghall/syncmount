@@ -498,7 +498,8 @@ impl WriteBuffer {
                         state.bytes = state.bytes.saturating_sub(removed.bytes());
                     }
                 }
-                self.commits.fetch_add(batch.len() as u64, Ordering::Relaxed);
+                self.commits
+                    .fetch_add(batch.len() as u64, Ordering::Relaxed);
             }
             Err(error) if is_discardable(&error) => {
                 let mut state = self.write_state();
@@ -965,10 +966,7 @@ mod tests {
         .unwrap();
 
         let rows = db.outbox_page(10).unwrap();
-        let kinds: Vec<&str> = rows
-            .iter()
-            .map(|row| row.decoded.kind().as_str())
-            .collect();
+        let kinds: Vec<&str> = rows.iter().map(|row| row.decoded.kind().as_str()).collect();
         assert_eq!(kinds, vec!["create_file", "write", "setattr"]);
         match &rows.last().expect("setattr row").decoded {
             EventPayload::Setattr { size, mode, .. } => {

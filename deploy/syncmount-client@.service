@@ -1,0 +1,32 @@
+# syncmount 1.0.0 client template.
+# Instance: private or public. Replace example.com with the real URL host.
+# The production fleet uses dedicated IPv4/IPv6 hostnames; see operations.md.
+[Unit]
+Description=syncmount client (%i)
+StartLimitIntervalSec=0
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=user
+Group=user
+UMask=0077
+Environment=HOME=/home/user
+Environment=XDG_STATE_HOME=/home/user/.local/state/syncmount-%i
+Environment=SYNCMOUNT_RUN_DIR=/run/syncmount-%i
+RuntimeDirectory=syncmount-%i
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=yes
+ExecStartPre=-/usr/bin/fusermount3 -uz /home/user/%i
+ExecStart=/usr/local/bin/syncmount --log-format json --log-level info client http://sync.example.com/%i /home/user/%i --key-file /home/user/.config/syncmount/master.pass --db /home/user/.local/state/syncmount-%i/client.db
+Restart=always
+RestartPreventExitStatus=2 4
+RestartSec=2s
+TimeoutStopSec=30s
+PrivateDevices=no
+NoNewPrivileges=no
+ProtectHome=no
+
+[Install]
+WantedBy=multi-user.target
