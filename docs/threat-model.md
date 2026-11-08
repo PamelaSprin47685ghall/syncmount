@@ -144,7 +144,8 @@ file, no symlink.
 ### 4.5 Availability
 
 - The server has a per-session outbound budget of 32 MiB and 512 data frames.
-  A consumer that cannot drain it is kicked with `QueueOverflow`.
+  A sequenced frame that does not fit ends the session with `QueueOverflow`
+  instead of being dropped; the client reconnects and replays.
 - A watermark that regresses or exceeds `current_seq` is kicked as
   `Regression` or `Overclaim`.
 - A graceful shutdown drains for at most 30 seconds, compacts the event log,

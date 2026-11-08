@@ -208,16 +208,23 @@ pub struct EventsStream {
 }
 
 impl EventsStream {
-    /// One non-blocking poll, used after the session is already closed so
-    /// buffered chunks still reach the caller before `None`.
-    async fn drain_once(&mut self) -> Result<Option<Bytes>, TransportError> {
-        match tokio::time::timeout(std::time::Duration::ZERO, self.body.next_bytes()).await {
+    /// One poll after either half closed.
+    ///
+    /// The final frames (`KICK`, `SYNC_END`) travel on the events body after
+    /// the RPC half ends. A zero-timeout poll would discard a chunk that is
+    /// still in flight, so the drain gives the body a bounded grace and keeps
+    /// returning buffered chunks until the body ends.
+    async fn drain_closed(&mut self, failed: bool) -> Result<Option<Bytes>, TransportError> {
+        const GRACE: std::time::Duration = std::time::Duration::from_secs(1);
+        match tokio::time::timeout(GRACE, self.body.next_bytes()).await {
             Ok(Ok(Some(chunk))) => Ok(Some(chunk)),
+            Ok(Ok(None)) if failed => Err(TransportError::Disconnected),
             Ok(Ok(None)) => Ok(None),
             Ok(Err(error)) => {
                 self.state.mark(CloseReason::Failed);
                 Err(TransportError::Hyper(error))
             }
+            Err(_elapsed) if failed => Err(TransportError::Disconnected),
             Err(_elapsed) => Ok(None),
         }
     }
@@ -232,9 +239,9 @@ impl Transport for EventsStream {
         Box::pin(async move {
             loop {
                 match self.state.reason() {
-                    Some(CloseReason::Failed) => return Err(TransportError::Disconnected),
+                    Some(CloseReason::Failed) => return self.drain_closed(true).await,
                     Some(CloseReason::Local) => return Ok(None),
-                    Some(CloseReason::Remote) => return self.drain_once().await,
+                    Some(CloseReason::Remote) => return self.drain_closed(false).await,
                     None => {}
                 }
                 tokio::select! {

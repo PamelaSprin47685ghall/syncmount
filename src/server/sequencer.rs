@@ -1371,11 +1371,26 @@ impl SequencerCore {
         self.send_error_detail(session_id, TrnReason::Protocol, &detail);
     }
 
-    fn send_to_author(&self, session_id: SessionId, frame: Bytes) {
-        let Some(session) = self.online.get(&session_id) else {
+    fn send_to_author(&mut self, session_id: SessionId, frame: Bytes) {
+        let Some(session) = self.online.get_mut(&session_id) else {
             return;
         };
-        let _ = session.outbox.try_push_data(frame);
+        match session.outbox.try_push_data(frame) {
+            PushOutcome::Queued => {}
+            PushOutcome::Overflow => {
+                // The author's echo carries a sequence number. Dropping it
+                // would hide that sequence until the next reconnect.
+                session.state = SessionState::Kicking;
+                self.pending_kicks
+                    .push((session_id, KickReason::QueueOverflow));
+                self.metrics.dropped_frames.fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(
+                    session = ?session_id,
+                    "downlink full on an echo; kicking the session"
+                );
+            }
+            PushOutcome::Closed => self.pending_detaches.push(session_id),
+        }
     }
 
     fn release_relay(&mut self, session_id: SessionId, now: Instant) {
@@ -1594,13 +1609,21 @@ impl SequencerCore {
             for frame in &frames {
                 match session.outbox.try_push_data(Bytes::from(frame.clone())) {
                     PushOutcome::Queued => {}
-                    PushOutcome::Overflow if session.outbox.queued.since_drain() > DRAIN_GRACE => {
-                        kicked.push((*session_id, KickReason::QueueOverflow));
-                        delivered = false;
-                        break;
-                    }
                     PushOutcome::Overflow => {
+                        // A partially delivered event has no ORDERED, and a
+                        // following ORDERED would leave a sequence hole that
+                        // the client cannot repair. Stop the session instead:
+                        // the queued prefix is contiguous, and the client
+                        // replays the missing event on reconnect.
+                        session.state = SessionState::Kicking;
+                        kicked.push((*session_id, KickReason::QueueOverflow));
                         self.metrics.dropped_frames.fetch_add(1, Ordering::Relaxed);
+                        tracing::warn!(
+                            session = ?session_id,
+                            queued_bytes = session.outbox.queued.bytes(),
+                            seq = seq.get(),
+                            "downlink full; kicking the session instead of leaving a sequence hole"
+                        );
                         delivered = false;
                         break;
                     }
@@ -1616,15 +1639,15 @@ impl SequencerCore {
             }
             match session.outbox.try_push_data(ordered.clone()) {
                 PushOutcome::Queued => session.last_good_seq = seq,
-                PushOutcome::Overflow if session.outbox.queued.since_drain() > DRAIN_GRACE => {
-                    kicked.push((*session_id, KickReason::QueueOverflow));
-                }
                 PushOutcome::Overflow => {
+                    session.state = SessionState::Kicking;
+                    kicked.push((*session_id, KickReason::QueueOverflow));
                     self.metrics.dropped_frames.fetch_add(1, Ordering::Relaxed);
-                    tracing::debug!(
+                    tracing::warn!(
                         session = ?session_id,
                         queued_bytes = session.outbox.queued.bytes(),
-                        "downlink queue full but draining; frame dropped, client will replay"
+                        seq = seq.get(),
+                        "downlink full; kicking the session instead of leaving a sequence hole"
                     );
                 }
                 PushOutcome::Closed => self.pending_detaches.push(*session_id),
@@ -1646,16 +1669,30 @@ impl SequencerCore {
                         session.last_good_seq = seq;
                     }
                 }
-                PushOutcome::Overflow if session.outbox.queued.since_drain() > DRAIN_GRACE => {
-                    kicked.push((*session_id, KickReason::QueueOverflow));
-                }
                 PushOutcome::Overflow => {
                     self.metrics.dropped_frames.fetch_add(1, Ordering::Relaxed);
-                    tracing::debug!(
-                        session = ?session_id,
-                        queued_bytes = session.outbox.queued.bytes(),
-                        "downlink queue full but draining; frame dropped, client will replay"
-                    );
+                    // A sequenced frame must never be skipped: the next
+                    // ORDERED would expose a gap. Relay traffic has its own
+                    // flow control, so only a stalled relay queue ends the
+                    // session.
+                    if seq.is_some()
+                        || session.outbox.queued.since_drain() > DRAIN_GRACE
+                    {
+                        session.state = SessionState::Kicking;
+                        kicked.push((*session_id, KickReason::QueueOverflow));
+                        tracing::warn!(
+                            session = ?session_id,
+                            queued_bytes = session.outbox.queued.bytes(),
+                            seq = seq.map(Seq::get),
+                            "downlink full; kicking the session instead of leaving a sequence hole"
+                        );
+                    } else {
+                        tracing::debug!(
+                            session = ?session_id,
+                            queued_bytes = session.outbox.queued.bytes(),
+                            "relay frame dropped"
+                        );
+                    }
                 }
                 PushOutcome::Closed => self.pending_detaches.push(*session_id),
             }
@@ -1688,10 +1725,12 @@ impl SequencerCore {
         self.awaiting_events.remove(&session.nonce);
         self.pending_events.remove(&session.nonce);
         self.release_relay(session.session_id, Instant::now());
+        // `Kicking` is set on a live session before its queued kick runs, so
+        // it still owns the locks that `LEAVE` must release.
         let inject_leave = inject_leave
             && matches!(
                 session.state,
-                SessionState::Online | SessionState::Replaying
+                SessionState::Online | SessionState::Replaying | SessionState::Kicking
             );
         if inject_leave {
             self.inject_leave(session.session_id, session.last_good_seq, now_us);
@@ -1706,7 +1745,10 @@ impl SequencerCore {
         self.awaiting_events.remove(&session.nonce);
         self.pending_events.remove(&session.nonce);
         if let Some(frame) = self.encode_kick(reason, session.last_good_seq) {
-            let _ = session.outbox.try_push_ctrl(frame);
+            let pushed = session.outbox.try_push_ctrl(frame);
+            tracing::debug!(?session_id, ?reason, ?pushed, "kick queued");
+        } else {
+            tracing::warn!(?session_id, ?reason, "cannot encode the kick frame");
         }
         let dropped = self.relay.drop_by_session(session_id, Instant::now());
         for relay in dropped {
@@ -1715,10 +1757,12 @@ impl SequencerCore {
             }
         }
         let last_good = session.last_good_seq;
+        // `Kicking` is set on a live session before its queued kick runs, so
+        // it still owns the locks that `LEAVE` must release.
         let inject = kick::injects_leave(reason)
             && matches!(
                 session.state,
-                SessionState::Online | SessionState::Replaying
+                SessionState::Online | SessionState::Replaying | SessionState::Kicking
             );
         drop(session);
         if inject {

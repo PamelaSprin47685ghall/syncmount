@@ -83,6 +83,14 @@ impl SessionExit {
             reason: "disconnected",
         }
     }
+
+    /// A transient end the driver may retry from `applied_seq`.
+    const fn resync() -> Self {
+        Self {
+            code: EXIT_DISCONNECTED,
+            reason: "resync",
+        }
+    }
 }
 
 /// One session's fixed inputs.
@@ -311,8 +319,11 @@ pub async fn run(
                         break;
                     }
                     Some(Signal::Disconnected) | None => {
-                        tracing::warn!(event = "disconnect", "session ended");
-                        exit = SessionExit::disconnected();
+                        // A transport close is transient: the durable
+                        // applied_seq is the replay cursor, so the driver
+                        // reconnects instead of unmounting.
+                        tracing::warn!(event = "disconnect", "session ended; reconnecting");
+                        exit = SessionExit::resync();
                         break;
                     }
                 }
@@ -324,7 +335,13 @@ pub async fn run(
         }
     }
 
-    gate.set(State::Unmounting);
+    // A resync exit keeps the mount alive: writes wait as EROFS while the
+    // driver reconnects. A terminal exit unmounts.
+    if exit.reason == "resync" {
+        gate.set(State::Joining);
+    } else {
+        gate.set(State::Unmounting);
+    }
     downlink_task.abort();
     uplink_task.abort();
     let _ = downlink_task.await;
@@ -696,7 +713,20 @@ async fn downlink(
                 MsgType::KICK => {
                     if let Ok(opened) = opener.open(&frame.header, &frame.prefix, &frame.body) {
                         if let Ok(kick) = Kick::decode(opened.as_slice(), &limits) {
-                            let _ = signal.send(Signal::Kicked(kick.reason)).await;
+                            // The server ends a session whose downlink queue
+                            // overflowed instead of leaving a sequence hole.
+                            // Reconnecting replays the missing events from
+                            // the durable applied_seq.
+                            if kick.reason == crate::protocol::KickReason::QueueOverflow {
+                                tracing::warn!(
+                                    event = "kick",
+                                    reason = ?kick.reason,
+                                    "server ended the downlink; reconnecting to replay"
+                                );
+                                let _ = signal.send(Signal::Resync).await;
+                            } else {
+                                let _ = signal.send(Signal::Kicked(kick.reason)).await;
+                            }
                             return;
                         }
                     }
@@ -747,6 +777,11 @@ async fn downlink(
                     // Advisory locks are session-scoped and die with the
                     // connection; nothing durable to do here.
                 }
+                MsgType::RELAY => {
+                    // Stream-open marker for a write's content stream. The
+                    // bytes follow in STREAM_DATA and the ORDERED names the
+                    // data session; there is no payload here.
+                }
                 MsgType::WELCOME | MsgType::HELLO => {}
                 other => {
                     tracing::warn!(event = "unexpected_frame", msg_type = ?other, "ignoring");
@@ -764,7 +799,8 @@ async fn downlink(
                     return;
                 }
                 Err(error) => {
-                    let _ = signal.send(Signal::Fatal(error.to_string())).await;
+                    tracing::warn!(event = "disconnect", error = %error, "events stream failed");
+                    let _ = signal.send(Signal::Disconnected).await;
                     return;
                 }
             }
@@ -791,7 +827,8 @@ async fn downlink(
                     return;
                 }
                 Ok(Err(error)) => {
-                    let _ = signal.send(Signal::Fatal(error.to_string())).await;
+                    tracing::warn!(event = "disconnect", error = %error, "events stream failed");
+                    let _ = signal.send(Signal::Disconnected).await;
                     return;
                 }
                 Err(_elapsed) => {
@@ -823,7 +860,8 @@ async fn downlink(
                             return;
                         }
                         Err(error) => {
-                            let _ = signal.send(Signal::Fatal(error.to_string())).await;
+                            tracing::warn!(event = "disconnect", error = %error, "events stream failed");
+                            let _ = signal.send(Signal::Disconnected).await;
                             return;
                         }
                     }
@@ -932,14 +970,36 @@ async fn flush_replay(
     let report = match store.apply_remote_batch(pending) {
         Ok(report) => report,
         Err(error) => {
-            tracing::error!(
-                event = "apply",
-                events = pending.len(),
-                error = %error,
-                "cannot apply an event batch"
-            );
             Counters::bump(&counters.materialize_errors);
-            let _ = signal.send(Signal::Fatal(format!("apply: {error}"))).await;
+            if matches!(&error, DbError::Corrupt("event sequence gap")) {
+                // A gap means the peer's stream lost an event (or a frame
+                // arrived out of order). The batch rolled back, so the durable
+                // applied_seq is still the last contiguous event. Reconnect:
+                // HELLO advertises it and the server replays the hole.
+                let applied = store.applied_seq().unwrap_or(0);
+                let missing = pending
+                    .iter()
+                    .map(|event| event.seq)
+                    .find(|seq| *seq > applied + 1);
+                tracing::warn!(
+                    event = "apply",
+                    events = pending.len(),
+                    applied,
+                    expected = applied + 1,
+                    got = missing,
+                    error = %error,
+                    "event sequence gap; reconnecting to replay from applied_seq"
+                );
+                let _ = signal.send(Signal::Resync).await;
+            } else {
+                tracing::error!(
+                    event = "apply",
+                    events = pending.len(),
+                    error = %error,
+                    "cannot apply an event batch"
+                );
+                let _ = signal.send(Signal::Fatal(format!("apply: {error}"))).await;
+            }
             return Err(());
         }
     };
@@ -1859,6 +1919,45 @@ mod tests {
         assert_eq!(kind_for(OpClass::UNLINK), EventKind::Unlink);
         assert_eq!(kind_for(OpClass::RMDIR), EventKind::Rmdir);
         assert_eq!(kind_for(OpClass::LINK), EventKind::Link);
+    }
+
+    #[tokio::test]
+    async fn a_sequence_gap_requests_a_resync_instead_of_a_fatal_exit() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = ClientDb::open(dir.path().join("client.db"), [7u8; 16]).unwrap();
+        let mut pending = vec![RemoteEvent {
+            seq: 2,
+            epoch: 1,
+            op_id: None,
+            result: "ok".to_owned(),
+            payload: EventPayload::Leave,
+            path: None,
+            path2: None,
+            data: None,
+        }];
+        let mut pending_bytes = 0usize;
+        let watermark = AtomicI64::new(0);
+        let counters = Counters::default();
+        let (signal, mut signals) = mpsc::channel(8);
+
+        let result = flush_replay(
+            &db,
+            &mut pending,
+            &mut pending_bytes,
+            &watermark,
+            &counters,
+            &signal,
+        )
+        .await;
+
+        assert!(result.is_err());
+        match signals.recv().await {
+            Some(Signal::Resync) => {}
+            other => panic!("expected Resync, got {other:?}"),
+        }
+        // The failed batch rolled back; the durable watermark is unchanged so
+        // the reconnect replays from the missing sequence.
+        assert_eq!(db.applied_seq().unwrap(), 0);
     }
 
     #[test]

@@ -316,11 +316,13 @@ and `synchronous=FULL`, so a committed transaction survives a crash even
 before the checkpoint. Closing a file (`flush`/`release`) commits that file
 but does not checkpoint the WAL.
 
-A transport failure, kick or protocol violation unmounts the client and exits
-10. There is no in-process reconnect and no offline mode.
-The outbox survives, so the next start resends pending and previously sent
-operations. An epoch change clears the replica tables and replays the
-compacted stream from zero; pending outbox rows survive that reset too.
+A transport disconnect or a `QueueOverflow` kick reconnects in-process from
+`applied_seq` with a bounded backoff; after the budget is exhausted the
+process exits with status 10. Any other kick, or a protocol violation,
+unmounts the client and exits 10. There is no offline mode. The outbox
+survives a restart, so pending and previously sent operations are resent. An
+epoch change clears the replica tables and replays the compacted stream from
+zero; pending outbox rows survive that reset too.
 
 A client whose replica is behind replays the server's event log from
 `applied_seq + 1`. Writes return `EROFS` during `JOINING`, but reads are
@@ -328,8 +330,10 @@ allowed, so a reader can see a mixed tree while replay is filling it. The
 write gate opens at `STEADY`.
 
 The server has a per-session outbound budget of 32 MiB and 512 data frames. A
-consumer that cannot drain it is kicked with `QueueOverflow`; an idle peer that
-cannot apply the broadcast stream fast enough can also be kicked. A watermark
+sequenced frame that does not fit ends the session with `QueueOverflow` instead
+of being dropped, so a client's `ORDERED` stream never contains a hole; the
+client reconnects and replays from `applied_seq`. Unsequenced relay frames are
+dropped unless the queue has stopped draining. A watermark
 that regresses or exceeds the server's `current_seq` is kicked as `Regression`
 or `Overclaim`. Lag diagnostics are not a kick: a slow but progressing client
 may stay slow. See [`docs/known-limitations.md`](docs/known-limitations.md).

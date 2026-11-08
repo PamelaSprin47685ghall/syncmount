@@ -39,6 +39,10 @@ struct Harness {
 
 impl Harness {
     async fn start() -> Self {
+        Self::start_with_config(ServeConfig::for_tests()).await
+    }
+
+    async fn start_with_config(config: ServeConfig) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("server.db");
         let path_for_thread = path.clone();
@@ -49,7 +53,7 @@ impl Harness {
                 .unwrap();
         let master = master();
         let ring = Arc::new(master.derive_psk_keyring(&PskSalt::DEFAULT).unwrap());
-        let config = Arc::new(ServeConfig::for_tests());
+        let config = Arc::new(config);
         let metrics = Arc::new(crate::server::Metrics::new(crate::server::Epoch::new(
             meta.epoch as u64,
         )));
@@ -969,6 +973,46 @@ async fn group_commit_broadcasts_a_batch_in_sequence_order() {
     }
     drop(read);
     drop(db);
+
+    let _ = harness.stop().await;
+}
+
+#[tokio::test]
+async fn a_full_outbox_kicks_instead_of_skipping_an_ordered_frame() {
+    // A zero-frame budget overflows on the first data frame. The server must
+    // end the session instead of dropping the frame: a later ORDERED would
+    // expose a sequence hole that the client cannot repair.
+    let mut config = ServeConfig::for_tests();
+    config.outbox.cap_frames = 0;
+    config.outbox.cap_bytes = 1;
+    let harness = Harness::start_with_config(config).await;
+    let (session, _, mut data, mut ctrl) = harness.attach(1, Seq::UNSEQUENCED).await;
+
+    harness
+        .sequencer
+        .ordered(session, request(create_op([7; 16], "/full")))
+        .await
+        .unwrap();
+
+    assert!(
+        data.try_recv().is_err(),
+        "a frame that cannot be queued must not reach the stream"
+    );
+    let kick = recv_seq(&mut ctrl).await;
+    assert_eq!(kick.header.msg_type, MsgType::KICK);
+
+    // The kicked session still owned advisory locks, so the server must
+    // release them through a committed LEAVE. The create committed as seq 1;
+    // a LEAVE makes it seq 2.
+    let mut seq = harness.sequencer.snapshot().await.unwrap().current_seq;
+    for _ in 0..100 {
+        if seq == Seq(2) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        seq = harness.sequencer.snapshot().await.unwrap().current_seq;
+    }
+    assert_eq!(seq, Seq(2), "the kicked session's LEAVE must be committed");
 
     let _ = harness.stop().await;
 }

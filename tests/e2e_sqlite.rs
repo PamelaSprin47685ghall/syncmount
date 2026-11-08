@@ -1012,6 +1012,79 @@ fn two_clients_converge_on_write_rename_unlink() {
     );
 }
 
+/// Eleven clients write 4 KiB files at the same time. Every client must
+/// converge without a sequence gap: the server may kick a slow downlink, but
+/// it must never skip a sequenced frame.
+#[test]
+fn eleven_clients_write_4k_concurrently_without_a_gap() {
+    if let Err(reason) = fuse_available() {
+        eprintln!("SKIP eleven_clients_write_4k_concurrently_without_a_gap: {reason}");
+        return;
+    }
+    let env = Env::new();
+    let server = env.server("eleven.db");
+    let mut clients: Vec<Client> = (0..11)
+        .map(|index| {
+            env.client(
+                &format!("c{index}"),
+                &format!("c{index}.db"),
+                &env.key,
+                &server,
+            )
+        })
+        .collect();
+    for client in &mut clients {
+        client.wait_mounted();
+    }
+    for client in &mut clients {
+        wait_synced(client, &server);
+    }
+
+    let payload = vec![0x5au8; 4096];
+    let mounts: Vec<PathBuf> = clients.iter().map(|client| client.mountpoint.clone()).collect();
+    std::thread::scope(|scope| {
+        for (index, mount) in mounts.iter().enumerate() {
+            let mount = mount.clone();
+            let payload = payload.clone();
+            scope.spawn(move || {
+                for file in 0..40 {
+                    write_retry(&mount, &format!("c{index}-{file}.bin"), &payload);
+                }
+            });
+        }
+    });
+
+    for client in &mut clients {
+        wait_synced(client, &server);
+        assert!(
+            !client.proc.log_contains("event sequence gap"),
+            "{} saw a sequence gap\n{}",
+            client.name,
+            client.proc.tail()
+        );
+        assert!(
+            !client.proc.log_contains("cannot apply an event batch"),
+            "{} failed an event batch\n{}",
+            client.name,
+            client.proc.tail()
+        );
+        assert!(
+            !client.proc.log_contains("reconnect budget exhausted"),
+            "{} exhausted its reconnect budget\n{}",
+            client.name,
+            client.proc.tail()
+        );
+    }
+    for index in 0..11 {
+        let reader = &clients[(index + 1) % 11];
+        wait_file(
+            &reader.mountpoint,
+            &format!("c{index}-39.bin"),
+            &payload,
+        );
+    }
+}
+
 /// A stopped client restarts from its persisted `applied_seq`; the server
 /// replays only what it missed and the write gate reopens.
 #[test]

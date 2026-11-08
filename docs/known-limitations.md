@@ -157,13 +157,17 @@ diagnostics.
 
 The server kicks a session when:
 
-- its outbound queue exceeds 32 MiB or 512 data frames and does not drain
-  (`QueueOverflow`);
+- its outbound queue cannot take a sequenced frame (32 MiB or 512 data
+  frames) (`QueueOverflow`); dropping the frame would leave a sequence hole,
+  so the session ends instead;
 - its reported watermark goes backwards (`Regression`);
 - its reported watermark exceeds `current_seq` (`Overclaim`);
 - the server compacts or shuts down (`EpochMismatch` or `ServerShutdown`).
 
-A kick unmounts the client with status 10; the next start replays and resends.
+A `QueueOverflow` kick does not unmount: the client reconnects from its
+durable `applied_seq` with a bounded backoff, and a session that applies
+events resets that budget. Only a client that makes no progress across
+several attempts exits with status 10. Any other kick unmounts and exits 10.
 Lag diagnostics are not a kick: a slow but progressing client may stay slow
 for as long as it keeps making progress.
 
@@ -171,8 +175,10 @@ Watermarks prove liveness and replay position, not content correctness. There
 is no independent fsck and no content-level verification pass. A client can be
 healthy while its local tree is wrong; a full replay is the recovery path.
 
-The server can delay, drop, duplicate or reorder frames. Clients detect their
-own sequence gaps and epoch changes, but cannot prove a cross-client reorder:
+The server can delay, drop, duplicate or reorder frames. A client detects its
+own sequence gap, reconnects from `applied_seq` and replays the hole; an epoch
+change clears the replica and replays from zero. Neither proves a cross-client
+reorder:
 the server can put B's operation before A's as long as each client's own
 stream stays monotonic.
 

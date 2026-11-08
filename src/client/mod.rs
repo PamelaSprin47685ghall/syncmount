@@ -11,9 +11,10 @@
 //! BOOT -> LOCKED -> MOUNTING -> JOINING -> STEADY -> UNMOUNTING -> EXITED
 //! ```
 //!
-//! The lifecycle is deliberately short: a disconnect ends the process with
-//! [`lifecycle::EXIT_DISCONNECTED`], and the next start resends the durable
-//! outbox. There is no in-process reconnect.
+//! The lifecycle is deliberately short, but a transient transport end does
+//! not unmount: the driver reconnects from the durable `applied_seq` with a
+//! bounded backoff. After the budget is exhausted the process exits with
+//! [`lifecycle::EXIT_DISCONNECTED`]; the next start resends the outbox.
 
 pub mod config;
 pub mod db;
@@ -34,10 +35,17 @@ use std::path::PathBuf;
 #[cfg(feature = "fuse")]
 use std::process::Command;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::protocol::crypto::PskKeyRing;
 use crate::store::runtime_dir::RuntimeDir;
+
+/// Consecutive short sessions allowed before the mount gives up.
+const RECONNECT_ATTEMPTS: u32 = 6;
+/// First reconnect delay; doubles per attempt up to 32x.
+const RECONNECT_BASE: Duration = Duration::from_millis(100);
+/// A session that lived this long resets the reconnect budget.
+const HEALTHY_SESSION: Duration = Duration::from_secs(10);
 
 pub use config::{Config, Tuning};
 pub use db::{ClientDb, DbError};
@@ -145,7 +153,10 @@ impl Client {
         let (shutdown_tx, shutdown_rx) = tokio::sync::mpsc::channel(1);
         spawn_signal_task(shutdown_tx);
         let mut shutdown_rx = shutdown_rx;
+        let mut attempts = 0u32;
         let exit = loop {
+            let started = Instant::now();
+            let applied_before = store.applied_seq().unwrap_or(0);
             let exit = session::run(
                 Arc::clone(&store),
                 SessionOptions {
@@ -159,11 +170,43 @@ impl Client {
                 &mut shutdown_rx,
             )
             .await;
-            // A rejection asked for the server's authoritative tree. The next
-            // handshake resets the replica and replays from sequence zero;
-            // the mount stays up and the hot path never waited.
-            if exit.reason == "resync" {
-                tracing::warn!(event = "resync", "reconnecting to replay the server log");
+            // A rejection, a transport end, or a failed redial keeps the
+            // mount up: the next handshake advertises the durable applied_seq
+            // and the server replays the missing events. The first dial is
+            // not a retry: a misconfigured endpoint still fails fast.
+            let retryable = exit.reason == "resync"
+                || (attempts > 0
+                    && matches!(exit.reason, "dial" | "dial timeout" | "handshake"));
+            if retryable {
+                // A slow client may be kicked repeatedly while it is still
+                // applying events. Progress (or a long healthy session) is
+                // what resets the budget, not a clean exit.
+                let applied_after = store.applied_seq().unwrap_or(0);
+                if exit.reason == "resync"
+                    && (applied_after > applied_before
+                        || started.elapsed() >= HEALTHY_SESSION)
+                {
+                    attempts = 0;
+                }
+                attempts = attempts.saturating_add(1);
+                if attempts > RECONNECT_ATTEMPTS {
+                    tracing::error!(event = "reconnect", attempts, "reconnect budget exhausted");
+                    break session::SessionExit {
+                        code: lifecycle::EXIT_DISCONNECTED,
+                        reason: "reconnect budget",
+                    };
+                }
+                let backoff = RECONNECT_BASE.saturating_mul(1u32 << (attempts - 1).min(5));
+                tracing::warn!(
+                    event = "reconnect",
+                    attempt = attempts,
+                    ?backoff,
+                    "reconnecting to replay the server log"
+                );
+                // The mount stays up while the session is down; writes wait
+                // as EROFS instead of seeing ENOTCONN.
+                self.gate.set(State::Joining);
+                tokio::time::sleep(backoff).await;
                 continue;
             }
             break exit;

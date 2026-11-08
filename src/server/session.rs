@@ -746,7 +746,8 @@ async fn run_writer(
         }
     }
     if let Some(kick) = deferred_kick {
-        let _ = out.send(kick).await;
+        let sent = out.send(kick).await;
+        tracing::debug!(sent = sent.is_ok(), "deferred kick sent");
     }
     let _ = closed.send(());
 }
