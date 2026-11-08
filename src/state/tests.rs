@@ -84,6 +84,8 @@ fn set_attr(p: &str, attrs: Attrs) -> Op {
     Op::SetAttr {
         path: path(p),
         attrs,
+        size: None,
+        chunks: Vec::new(),
     }
 }
 

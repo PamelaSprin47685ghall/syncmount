@@ -30,8 +30,9 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::collections::VecDeque;
+use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
-use std::io::ErrorKind;
+use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -45,9 +46,13 @@ use rustix::process::{kill_process, Pid, Signal};
 use serde_json::Value;
 use tempfile::TempDir;
 
+use syncmount::client::ClientDb;
 use syncmount::client::config::mount_id_for;
+use syncmount::client::ops::AttrChange;
 use syncmount::store::Errno;
-use syncmount::store::sqlite::{EventPayload, ObjectKind, file_root};
+use syncmount::store::sqlite::{
+    EventKind, EventPayload, ObjectKind, ROOT_INO, chunk_hash, file_root,
+};
 
 /// The master password every fixture writes to its 0600 key file.
 const PSK: &[u8] = b"e2e-sqlite-master-psk";
@@ -581,6 +586,18 @@ fn db_count(path: &Path, sql: &str) -> Option<i64> {
     conn.query_row(sql, [], |row| row.get(0)).ok()
 }
 
+fn db_value_i64(path: &Path, sql: &str) -> Option<i64> {
+    let conn = open_ro(path)?;
+    conn.query_row(sql, [], |row| row.get(0)).ok()
+}
+
+/// Linux process state from `/proc/<pid>/stat` (`R`, `S`, `T`, ...).
+fn process_state(pid: u32) -> Option<char> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let end = stat.rfind(')')?;
+    stat[end + 1..].trim_start().chars().next()
+}
+
 fn ino_at(path: &Path, name: &str) -> Option<[u8; 16]> {
     let conn = open_ro(path)?;
     let bytes: Vec<u8> = conn
@@ -647,6 +664,33 @@ fn insert_outbox(
         [next],
     )
     .expect("bump local_seq");
+}
+
+/// Encode one unsigned integer the way bincode's standard config does.
+fn push_bincode_u32(out: &mut Vec<u8>, value: u32) {
+    if value <= 250 {
+        out.push(value as u8);
+    } else if value <= u32::from(u16::MAX) {
+        out.push(0xfb);
+        out.extend_from_slice(&(value as u16).to_le_bytes());
+    } else {
+        out.push(0xfc);
+        out.extend_from_slice(&value.to_le_bytes());
+    }
+}
+
+/// The version-1 `setattr` payload for a mode-only change.
+///
+/// Version 1 had no `size`: `version 1 || tag 5 || ino || mode || uid || gid
+/// || mtime_ns`, with `None` encoded as one zero byte. The bytes are the
+/// format a database written before the upgrade holds.
+fn v1_setattr_payload(ino: [u8; 16], mode: u32) -> Vec<u8> {
+    let mut out = vec![1, 5];
+    out.extend_from_slice(&ino);
+    out.push(1);
+    push_bincode_u32(&mut out, mode);
+    out.extend_from_slice(&[0, 0, 0]);
+    out
 }
 
 /// Rewrite a client database to look "never synced" while keeping its tree.
@@ -1211,8 +1255,6 @@ fn rejected_op_is_point_to_point_and_outbox_marks_failed() {
         Ok(db_i64(&server.db, "seq").unwrap_or(0) > applied_before_stop)
     });
     wait_synced(&mut a, &server);
-    let server_seq_before = db_i64(&server.db, "seq").expect("server seq");
-    let a_applied_before = db_i64(&a.db, "applied_seq").expect("A applied");
 
     // A local create for a name the server already has. The client-side tree
     // is untouched; only the durable outbox carries the intent.
@@ -1273,9 +1315,18 @@ fn rejected_op_is_point_to_point_and_outbox_marks_failed() {
         "a rejected op must leave the send queue"
     );
 
-    // Point-to-point: no sequence, no broadcast, the other client unchanged.
-    assert_eq!(db_i64(&server.db, "seq"), Some(server_seq_before));
-    assert_eq!(db_i64(&a.db, "applied_seq"), Some(a_applied_before));
+    // Point-to-point: the rejected op produces no event. The resync
+    // reconnect itself records LEAVE events, so the raw sequence moves; the
+    // rejected `op_id` must never appear in the log.
+    let server_conn = open_ro(&server.db).expect("server db");
+    let rejected_events: i64 = server_conn
+        .query_row(
+            "SELECT COUNT(*) FROM events WHERE op_id = ?1",
+            [op_id.as_slice()],
+            |row| row.get(0),
+        )
+        .expect("count rejected events");
+    assert_eq!(rejected_events, 0, "the rejected op must not be sequenced");
     wait_file(&a.mountpoint, "clash.txt", b"original\n");
     assert!(
         !a.mountpoint.join("whatever").exists(),
@@ -1295,6 +1346,293 @@ fn rejected_op_is_point_to_point_and_outbox_marks_failed() {
         "failed rows are not counted as outstanding"
     );
     let _ = b_mount;
+}
+
+/// A size-changing `setattr` is one wire operation and one server event.
+///
+/// The fixture applies the local effect and the outbox row in one client
+/// transaction, then restarts the client. The server must record one
+/// `setattr` event carrying both `size` and `mode`, and both clients must
+/// converge on the truncated content and the new mode.
+#[test]
+fn setattr_size_and_mode_reach_the_server_as_one_event() {
+    if let Err(reason) = fuse_available() {
+        eprintln!("SKIP setattr_size_and_mode_reach_the_server_as_one_event: {reason}");
+        return;
+    }
+    let env = Env::new();
+    let mut server = env.server("setattr-atomic.db");
+    let mut a = env.client("a", "a.db", &env.key, &server);
+    let mut b = env.client("b", "b.db", &env.key, &server);
+    a.wait_mounted();
+    b.wait_mounted();
+    wait_synced(&mut a, &server);
+    wait_synced(&mut b, &server);
+
+    write_retry(&a.mountpoint, "atomic.txt", b"abcdef");
+    wait_file(&b.mountpoint, "atomic.txt", b"abcdef");
+    wait_synced(&mut a, &server);
+    wait_synced(&mut b, &server);
+
+    let b_db = b.db.clone();
+    let status = b.stop_graceful();
+    assert_eq!(status.code(), Some(0), "{}", b.proc.tail());
+    drop(b);
+
+    let cluster: [u8; 16] = db_blob(&b_db, "cluster_id")
+        .expect("client cluster id")
+        .try_into()
+        .expect("cluster id is 16 bytes");
+    {
+        let db = ClientDb::open(&b_db, cluster).expect("open B database");
+        let ino = db
+            .lookup(ROOT_INO, OsStr::new("atomic.txt"))
+            .expect("atomic.txt")
+            .ino;
+        db.setattr(
+            ino,
+            AttrChange {
+                size: Some(4),
+                mode: Some(0o600),
+                ..AttrChange::default()
+            },
+        )
+        .expect("size+mode setattr");
+    }
+
+    let mut b2 = env.client("b2", "b.db", &env.key, &server);
+    b2.wait_mounted();
+    wait_synced(&mut b2, &server);
+
+    wait_until("A sees the server size and mode", READY, || {
+        let meta = fs::metadata(a.mountpoint.join("atomic.txt"))
+            .map_err(|error| format!("stat: {error}"))?;
+        let mode = meta.permissions().mode() & 0o777;
+        if meta.len() != 4 || mode != 0o600 {
+            return Err(format!("size={} mode={mode:o}", meta.len()));
+        }
+        Ok(true)
+    });
+    wait_file(&a.mountpoint, "atomic.txt", b"abcd");
+    wait_file(&b2.mountpoint, "atomic.txt", b"abcd");
+
+    let conn = open_ro(&server.db).expect("server db");
+    let (kind, payload): (String, Vec<u8>) = conn
+        .query_row(
+            "SELECT kind, payload FROM events
+              WHERE path = '/atomic.txt' AND kind = 'setattr'
+              ORDER BY seq DESC LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("setattr event");
+    assert_eq!(kind, "setattr");
+    match EventPayload::decode(EventKind::Setattr, &payload).expect("setattr payload") {
+        EventPayload::Setattr { size, mode, .. } => {
+            assert_eq!(size, Some(4), "the event carries the new size");
+            assert_eq!(mode, Some(0o600), "the event carries the new mode");
+        }
+        other => panic!("expected a setattr payload, got {other:?}"),
+    }
+    assert_eq!(
+        db_count(
+            &server.db,
+            "SELECT COUNT(*) FROM events WHERE path = '/atomic.txt' AND kind = 'truncate'"
+        ),
+        Some(0),
+        "a size-changing setattr must not also write a truncate event"
+    );
+    let (size, mode): (i64, i64) = conn
+        .query_row(
+            "SELECT o.size, o.mode FROM objects o
+               JOIN names n ON n.ino = o.ino
+              WHERE n.path = '/atomic.txt'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("server object");
+    assert_eq!(size, 4);
+    assert_eq!(mode, 0o600);
+    drop(conn);
+
+    let status = b2.stop_graceful();
+    assert_eq!(status.code(), Some(0), "{}", b2.proc.tail());
+    drop(b2);
+    let status = a.stop_graceful();
+    assert_eq!(status.code(), Some(0), "{}", a.proc.tail());
+    drop(a);
+    let status = server.stop_graceful();
+    assert_eq!(status.code(), Some(0), "server must stop cleanly");
+}
+
+/// A server database written before the payload gained `size`, and a client
+/// database whose outbox still holds a version-1 `setattr`, both survive the
+/// upgrade without a clean database or a re-import.
+#[test]
+fn version_1_setattr_rows_replay_after_upgrade() {
+    if let Err(reason) = fuse_available() {
+        eprintln!("SKIP version_1_setattr_rows_replay_after_upgrade: {reason}");
+        return;
+    }
+    let env = Env::new();
+    let mut server = env.server("old-setattr.db");
+    let mut a = env.client("a", "a.db", &env.key, &server);
+    let mut b = env.client("b", "b.db", &env.key, &server);
+    a.wait_mounted();
+    b.wait_mounted();
+    wait_synced(&mut a, &server);
+    wait_synced(&mut b, &server);
+
+    write_retry(&a.mountpoint, "old.txt", b"abcdef");
+    wait_file(&b.mountpoint, "old.txt", b"abcdef");
+    fs::set_permissions(
+        a.mountpoint.join("old.txt"),
+        fs::Permissions::from_mode(0o600),
+    )
+    .expect("chmod old.txt");
+    wait_until("server records the mode change", READY, || {
+        let count = db_count(
+            &server.db,
+            "SELECT COUNT(*) FROM events WHERE kind = 'setattr' AND path = '/old.txt'",
+        )
+        .ok_or_else(|| "server db is not readable".to_owned())?;
+        if count == 0 {
+            return Err("no setattr event yet".to_owned());
+        }
+        Ok(true)
+    });
+    wait_until("B sees the mode", READY, || {
+        let meta =
+            fs::metadata(b.mountpoint.join("old.txt")).map_err(|error| format!("stat: {error}"))?;
+        let mode = meta.permissions().mode() & 0o777;
+        if mode != 0o600 {
+            return Err(format!("mode={mode:o}"));
+        }
+        Ok(true)
+    });
+    wait_synced(&mut a, &server);
+    wait_synced(&mut b, &server);
+
+    let a_db = a.db.clone();
+    let status = b.stop_graceful();
+    assert_eq!(status.code(), Some(0), "{}", b.proc.tail());
+    drop(b);
+    let status = a.stop_graceful();
+    assert_eq!(status.code(), Some(0), "{}", a.proc.tail());
+    drop(a);
+
+    // A crash skips compaction, so the version-2 `setattr` row survives.
+    server.kill();
+
+    // Rewrite that row to the version-1 layout: same fields, no size tag.
+    {
+        let conn = Connection::open(&server.db).expect("server db");
+        let (seq, op_id, payload): (i64, Vec<u8>, Vec<u8>) = conn
+            .query_row(
+                "SELECT seq, op_id, payload FROM events
+                  WHERE kind = 'setattr' AND path = '/old.txt'
+                  ORDER BY seq DESC LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("setattr event");
+        assert_eq!(payload[0], 2, "the row was written by the current codec");
+        let mut legacy = payload;
+        assert_eq!(
+            legacy.pop(),
+            Some(0),
+            "the recorded setattr is attribute-only"
+        );
+        legacy[0] = 1;
+        match EventPayload::decode(EventKind::Setattr, &legacy).expect("version-1 payload") {
+            EventPayload::Setattr { size, mode, .. } => {
+                assert_eq!(size, None, "version 1 carries no size");
+                assert_eq!(
+                    mode.map(|mode| mode & 0o7777),
+                    Some(0o600),
+                    "the kernel's chmod carries the file-type bits"
+                );
+            }
+            other => panic!("expected a setattr payload, got {other:?}"),
+        }
+        conn.execute(
+            "UPDATE events SET payload = ?1 WHERE seq = ?2",
+            params![legacy, seq],
+        )
+        .expect("rewrite event payload");
+        conn.execute(
+            "UPDATE op_ids SET payload_hash = ?1 WHERE op_id = ?2",
+            params![chunk_hash(&legacy).as_slice(), op_id],
+        )
+        .expect("rewrite payload hash");
+    }
+
+    // The server must start on the old database and replay the old bytes to a
+    // fresh client, which decodes them as an attribute-only change.
+    let mut server = env.server("old-setattr.db");
+    let mut c = env.client("c", "c.db", &env.key, &server);
+    c.wait_mounted();
+    wait_synced(&mut c, &server);
+    wait_file(&c.mountpoint, "old.txt", b"abcdef");
+    wait_until("C sees the replayed mode", READY, || {
+        let meta =
+            fs::metadata(c.mountpoint.join("old.txt")).map_err(|error| format!("stat: {error}"))?;
+        let mode = meta.permissions().mode() & 0o777;
+        if mode != 0o600 {
+            return Err(format!("mode={mode:o}"));
+        }
+        Ok(true)
+    });
+
+    // The stopped author's database gains a pending version-1 outbox row, the
+    // shape a pre-upgrade client leaves behind. Its tree already holds the
+    // optimistic effect.
+    let ino = ino_at(&a_db, "/old.txt").expect("author inode");
+    let payload = v1_setattr_payload(ino, 0o640);
+    let op_id = random_op_id();
+    insert_outbox(
+        &a_db,
+        op_id,
+        "setattr",
+        "/old.txt",
+        None,
+        ino,
+        &payload,
+    );
+    {
+        let conn = Connection::open(&a_db).expect("author db");
+        conn.execute(
+            "UPDATE objects SET mode = ?1 WHERE ino = ?2",
+            params![0o640i64, ino.as_slice()],
+        )
+        .expect("author mode");
+    }
+
+    let mut a2 = env.client("a2", "a.db", &env.key, &server);
+    a2.wait_mounted();
+    wait_synced(&mut a2, &server);
+    wait_until("C sees the upgraded client's mode", READY, || {
+        let meta =
+            fs::metadata(c.mountpoint.join("old.txt")).map_err(|error| format!("stat: {error}"))?;
+        let mode = meta.permissions().mode() & 0o777;
+        if mode != 0o640 {
+            return Err(format!("mode={mode:o}"));
+        }
+        Ok(true)
+    });
+    assert!(
+        outbox_row(&a_db, &op_id).is_none(),
+        "the version-1 outbox row was sent and acknowledged"
+    );
+
+    let status = a2.stop_graceful();
+    assert_eq!(status.code(), Some(0), "{}", a2.proc.tail());
+    drop(a2);
+    let status = c.stop_graceful();
+    assert_eq!(status.code(), Some(0), "{}", c.proc.tail());
+    drop(c);
+    let status = server.stop_graceful();
+    assert_eq!(status.code(), Some(0), "server must stop cleanly");
 }
 
 fn wait_replay_ok(client: &mut Client, server: &Server) {
@@ -1408,4 +1746,249 @@ fn fuse_hardlink_converges() {
     wait_file(&b.mountpoint, "hard.txt", b"hardlink content\n");
     wait_synced(&mut a, &server);
     wait_synced(&mut b, &server);
+}
+
+/// A one-byte `pwrite` at offset zero must patch a 150 KiB file, not replace
+/// it with the one-chunk stream. The server size is the observable: the old
+/// class choice truncated the file to 64 KiB while every client still held
+/// the full length.
+#[test]
+fn partial_write_at_offset_zero_keeps_the_whole_file() {
+    if let Err(reason) = fuse_available() {
+        eprintln!("SKIP partial_write_at_offset_zero_keeps_the_whole_file: {reason}");
+        return;
+    }
+    let env = Env::new();
+    let server = env.server("pwrite-zero.db");
+    let mut a = env.client("a", "a.db", &env.key, &server);
+    let mut b = env.client("b", "b.db", &env.key, &server);
+    a.wait_mounted();
+    b.wait_mounted();
+    wait_synced(&mut a, &server);
+    wait_synced(&mut b, &server);
+
+    let big: Vec<u8> = (0..150_000u32).map(|i| (i % 251) as u8).collect();
+    write_retry(&a.mountpoint, "big.bin", &big);
+    wait_file(&b.mountpoint, "big.bin", &big);
+
+    let mut file = OpenOptions::new()
+        .write(true)
+        .open(a.mountpoint.join("big.bin"))
+        .unwrap();
+    file.seek(SeekFrom::Start(0)).unwrap();
+    file.write_all(&[0xEE]).unwrap();
+    file.sync_all().unwrap();
+    drop(file);
+
+    let mut expected = big;
+    expected[0] = 0xEE;
+    wait_file(&b.mountpoint, "big.bin", &expected);
+    wait_synced(&mut a, &server);
+    wait_synced(&mut b, &server);
+    wait_until("server keeps 150 KiB", READY, || {
+        let size = db_value_i64(
+            &server.db,
+            "SELECT o.size FROM objects o JOIN names n ON n.ino = o.ino
+              WHERE n.path = '/big.bin'",
+        );
+        if size == Some(150_000) {
+            Ok(true)
+        } else {
+            Err(format!("server size is {size:?}"))
+        }
+    });
+
+    // A restart replays the event from the server and must read the same
+    // bytes, not a 64 KiB truncation.
+    let status = a.stop_graceful();
+    assert_eq!(status.code(), Some(0), "{}", a.proc.tail());
+    drop(a);
+    let mut a2 = env.client("a2", "a.db", &env.key, &server);
+    a2.wait_mounted();
+    wait_synced(&mut a2, &server);
+    wait_file(&a2.mountpoint, "big.bin", &expected);
+}
+
+/// Two writes in one flush window, at offsets 0 and 200000, must reach the
+/// server as a contiguous stream with the holes zero-filled. A live peer and
+/// a replayed peer must both hold the same 200001-byte file.
+#[test]
+fn sparse_writeback_keeps_holes_and_replays_identically() {
+    if let Err(reason) = fuse_available() {
+        eprintln!("SKIP sparse_writeback_keeps_holes_and_replays_identically: {reason}");
+        return;
+    }
+    let env = Env::new();
+    let server = env.server("sparse.db");
+    let mut a = env.client("a", "a.db", &env.key, &server);
+    let mut b = env.client("b", "b.db", &env.key, &server);
+    a.wait_mounted();
+    b.wait_mounted();
+    wait_synced(&mut a, &server);
+    wait_synced(&mut b, &server);
+
+    write_retry(&a.mountpoint, "sparse.bin", b"");
+    let mut file = OpenOptions::new()
+        .write(true)
+        .open(a.mountpoint.join("sparse.bin"))
+        .unwrap();
+    file.seek(SeekFrom::Start(0)).unwrap();
+    file.write_all(b"A").unwrap();
+    file.seek(SeekFrom::Start(200_000)).unwrap();
+    file.write_all(b"B").unwrap();
+    file.sync_all().unwrap();
+    drop(file);
+
+    let mut expected = vec![0u8; 200_001];
+    expected[0] = b'A';
+    expected[200_000] = b'B';
+    wait_file(&b.mountpoint, "sparse.bin", &expected);
+    wait_synced(&mut a, &server);
+    wait_synced(&mut b, &server);
+    wait_until("server size is 200001", READY, || {
+        let size = db_value_i64(
+            &server.db,
+            "SELECT o.size FROM objects o JOIN names n ON n.ino = o.ino
+              WHERE n.path = '/sparse.bin'",
+        );
+        if size == Some(200_001) {
+            Ok(true)
+        } else {
+            Err(format!("server size is {size:?}"))
+        }
+    });
+
+    // B is the live peer; a restart replays the same sequence from the
+    // server's event and must produce the same bytes.
+    let status = b.stop_graceful();
+    assert_eq!(status.code(), Some(0), "{}", b.proc.tail());
+    drop(b);
+    let mut b2 = env.client("b2", "b.db", &env.key, &server);
+    b2.wait_mounted();
+    wait_synced(&mut b2, &server);
+    wait_file(&b2.mountpoint, "sparse.bin", &expected);
+    assert_eq!(
+        sha_file(&a.mountpoint, "sparse.bin"),
+        sha_file(&b2.mountpoint, "sparse.bin")
+    );
+}
+
+/// B replaces `/x`, then A renames `/x` to `/y`. The server resolves the
+/// source to B's inode, while A's optimistic rename may have moved its own
+/// inode. The author's echo must repair A; all three replicas then name the
+/// same inode at `/y`.
+#[test]
+fn a_rename_echo_repairs_the_author_tree() {
+    if let Err(reason) = fuse_available() {
+        eprintln!("SKIP a_rename_echo_repairs_the_author_tree: {reason}");
+        return;
+    }
+    let env = Env::new();
+    let server = env.server("rename-echo.db");
+    let mut a = env.client("a", "a.db", &env.key, &server);
+    let mut b = env.client("b", "b.db", &env.key, &server);
+    a.wait_mounted();
+    b.wait_mounted();
+    wait_synced(&mut a, &server);
+    wait_synced(&mut b, &server);
+
+    write_retry(&a.mountpoint, "x", b"a");
+    wait_file(&b.mountpoint, "x", b"a");
+    wait_synced(&mut a, &server);
+    wait_synced(&mut b, &server);
+    let a_ino = ino_at(&a.db, "/x").expect("A /x inode");
+    assert_eq!(ino_at(&server.db, "/x"), Some(a_ino));
+
+    // B replaces the name with its own inode. Wait for the server to record
+    // it; A's downlink may or may not have applied it yet.
+    unlink_retry(&b.mountpoint, "x");
+    write_retry(&b.mountpoint, "x", b"b");
+    wait_until("B's replacement is on the server", READY, || {
+        match ino_at(&server.db, "/x") {
+            Some(ino) if ino != a_ino => Ok(true),
+            other => Err(format!("server /x inode is {other:?}")),
+        }
+    });
+
+    rename_retry(&a.mountpoint, "x", "y");
+    wait_absent(&a.mountpoint, "x");
+    wait_file(&a.mountpoint, "y", b"b");
+    wait_file(&b.mountpoint, "y", b"b");
+    wait_synced(&mut a, &server);
+    wait_synced(&mut b, &server);
+
+    let server_ino = ino_at(&server.db, "/y").expect("server /y inode");
+    assert_eq!(ino_at(&a.db, "/y"), Some(server_ino), "A /y inode");
+    assert_eq!(ino_at(&b.db, "/y"), Some(server_ino), "B /y inode");
+}
+
+/// The local hot path must never wait for a server round trip. With the
+/// server stopped, every namespace and data operation still completes on
+/// local disk time and the outbox holds the intent until the server returns.
+#[test]
+fn hot_paths_do_not_wait_for_the_server() {
+    if let Err(reason) = fuse_available() {
+        eprintln!("SKIP hot_paths_do_not_wait_for_the_server: {reason}");
+        return;
+    }
+    let env = Env::new();
+    let server = env.server("no-rtt.db");
+    let mut a = env.client("a", "a.db", &env.key, &server);
+    let mut b = env.client("b", "b.db", &env.key, &server);
+    a.wait_mounted();
+    b.wait_mounted();
+    wait_synced(&mut a, &server);
+    wait_synced(&mut b, &server);
+
+    let pid = server.proc.child.id();
+    server.proc.signal(Signal::STOP);
+    wait_until("server stopped", READY, || match process_state(pid) {
+        Some('T') => Ok(true),
+        other => Err(format!("process state is {other:?}")),
+    });
+
+    let started = Instant::now();
+    write_retry(&a.mountpoint, "blocked.txt", b"payload\n");
+    mkdir_retry(&a.mountpoint, "blocked-dir");
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(a.mountpoint.join("blocked.txt"))
+        .unwrap();
+    file.write_all(b"more").unwrap();
+    file.seek(SeekFrom::Start(0)).unwrap();
+    let mut buffer = [0u8; 4];
+    file.read_exact(&mut buffer).unwrap();
+    file.set_len(3).unwrap();
+    file.sync_all().unwrap();
+    drop(file);
+    fs::set_permissions(
+        a.mountpoint.join("blocked.txt"),
+        fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
+    fs::rename(
+        a.mountpoint.join("blocked.txt"),
+        a.mountpoint.join("renamed.txt"),
+    )
+    .unwrap();
+    fs::hard_link(
+        a.mountpoint.join("renamed.txt"),
+        a.mountpoint.join("linked.txt"),
+    )
+    .unwrap();
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "the hot path waited for the stopped server: {elapsed:?}"
+    );
+    assert!(
+        db_count(&a.db, "SELECT COUNT(*) FROM outbox").unwrap_or(0) > 0,
+        "the outbox must hold the local intent while the server is away"
+    );
+
+    server.proc.signal(Signal::CONT);
+    wait_synced(&mut a, &server);
+    wait_file(&b.mountpoint, "renamed.txt", b"mor");
+    wait_file(&b.mountpoint, "linked.txt", b"mor");
 }

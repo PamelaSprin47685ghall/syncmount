@@ -191,19 +191,15 @@ impl fmt::Debug for Flags {
     }
 }
 
-/// One of the 16 defined message types (44 §3.1).
+/// One of the 14 defined message types (44 §3.1).
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct MsgType(u8);
 
 impl MsgType {
-    /// Client hello; plain WCP with a control prefix.
+    /// Client hello; plain WCP with a control prefix and a sealed `AUTH`.
     pub const HELLO: Self = Self(0x01);
-    /// Server welcome; plain WCP.
+    /// Server welcome; plain WCP with a sealed `ACCEPT`.
     pub const WELCOME: Self = Self(0x02);
-    /// Client handshake authentication; sealed under the handshake key.
-    pub const AUTH: Self = Self(0x03);
-    /// Server handshake acceptance; sealed under the handshake key.
-    pub const ACCEPT: Self = Self(0x04);
     /// Sequenced operation; sealed WCP.
     pub const ORDERED: Self = Self(0x10);
     /// Operation response; sealed WCP.
@@ -230,11 +226,9 @@ impl MsgType {
     pub const LEAVE: Self = Self(0x1B);
 
     /// Every defined type, in wire order. Used by table-driven tests.
-    pub const ALL: [Self; 16] = [
+    pub const ALL: [Self; 14] = [
         Self::HELLO,
         Self::WELCOME,
-        Self::AUTH,
-        Self::ACCEPT,
         Self::ORDERED,
         Self::RESPONSE,
         Self::RELAY,
@@ -259,8 +253,6 @@ impl MsgType {
         match raw {
             0x01 => Ok(Self::HELLO),
             0x02 => Ok(Self::WELCOME),
-            0x03 => Ok(Self::AUTH),
-            0x04 => Ok(Self::ACCEPT),
             0x10 => Ok(Self::ORDERED),
             0x11 => Ok(Self::RESPONSE),
             0x12 => Ok(Self::RELAY),
@@ -282,8 +274,6 @@ impl MsgType {
         matches!(
             raw,
             0x01 | 0x02
-                | 0x03
-                | 0x04
                 | 0x10
                 | 0x11
                 | 0x12
@@ -324,8 +314,6 @@ impl MsgType {
         match self.0 {
             0x01 => "HELLO",
             0x02 => "WELCOME",
-            0x03 => "AUTH",
-            0x04 => "ACCEPT",
             0x10 => "ORDERED",
             0x11 => "RESPONSE",
             0x12 => "RELAY",
@@ -1330,6 +1318,14 @@ mod tests {
             Err(ProtocolError::UnknownType(0))
         ));
         assert!(matches!(
+            MsgType::from_u8(0x03),
+            Err(ProtocolError::UnknownType(0x03))
+        ));
+        assert!(matches!(
+            MsgType::from_u8(0x04),
+            Err(ProtocolError::UnknownType(0x04))
+        ));
+        assert!(matches!(
             MsgType::from_u8(0x1c),
             Err(ProtocolError::UnknownType(0x1c))
         ));
@@ -1346,8 +1342,6 @@ mod tests {
             );
         }
         for msg_type in [
-            MsgType::AUTH,
-            MsgType::ACCEPT,
             MsgType::ORDERED,
             MsgType::RESPONSE,
             MsgType::RELAY,
@@ -1375,11 +1369,17 @@ mod tests {
             flags.validate(msg_type).expect("sealed flags are valid");
             assert!(Flags::EMPTY.validate(msg_type).is_err());
         }
-        assert_eq!(MsgType::ALL.len(), 16);
-        assert_eq!(MsgType::AUTH.get(), 0x03);
-        assert_eq!(MsgType::ACCEPT.get(), 0x04);
-        assert_eq!(MsgType::AUTH.name(), "AUTH");
-        assert_eq!(MsgType::ACCEPT.name(), "ACCEPT");
+        assert_eq!(MsgType::ALL.len(), 14);
+        assert!(!MsgType::is_known_raw(0x03));
+        assert!(!MsgType::is_known_raw(0x04));
+        assert!(matches!(
+            MsgType::from_u8(0x03),
+            Err(ProtocolError::UnknownType(0x03))
+        ));
+        assert!(matches!(
+            MsgType::from_u8(0x04),
+            Err(ProtocolError::UnknownType(0x04))
+        ));
     }
 
     #[test]

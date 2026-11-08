@@ -491,6 +491,8 @@ fn u_state_setattr_is_partial_and_masks_mode() {
                 mode: Some(0o107600),
                 ..Attrs::default()
             },
+            size: None,
+            chunks: Vec::new(),
         },
     );
     assert_eq!(changes.len(), 1);
@@ -506,6 +508,8 @@ fn u_state_setattr_is_partial_and_masks_mode() {
         &Op::SetAttr {
             path: b"/f".to_vec(),
             attrs: Attrs::default(),
+            size: None,
+            chunks: Vec::new(),
         },
     );
     assert!(noop.is_empty());
@@ -517,10 +521,58 @@ fn u_state_setattr_is_partial_and_masks_mode() {
                 uid: Some(1),
                 ..Attrs::default()
             },
+            size: None,
+            chunks: Vec::new(),
         },
         Errno::ENOENT,
     );
     assert_eq!(state.check_invariants(), Ok(()));
+}
+
+#[test]
+fn u_state_setattr_size_and_mode_are_one_change_set() {
+    let mut state = State::new();
+    create_file(&mut state, "/f", 7);
+    write_file(&mut state, "/f", vec![full(1), full(2)]);
+
+    let op = Op::SetAttr {
+        path: b"/f".to_vec(),
+        attrs: Attrs {
+            mode: Some(0o600),
+            mtime_ns: Some(55),
+            ..Attrs::default()
+        },
+        size: Some(CHUNK_BYTES),
+        chunks: vec![full(1)],
+    };
+    let changes = plan_ok(&state, &op);
+    assert!(
+        matches!(changes.first(), Some(Change::UpdateChunks { .. })),
+        "the size change is part of the same change list"
+    );
+    assert!(
+        matches!(changes.get(1), Some(Change::SetAttrs { .. })),
+        "the metadata change is part of the same change list"
+    );
+    state.commit(changes);
+    let Some(object) = state.object(7) else {
+        panic!("file is missing");
+    };
+    assert_eq!(object.size, CHUNK_BYTES);
+    assert_eq!(object.mode, 0o600);
+    assert_eq!(object.mtime_ns, 55);
+    assert_eq!(state.check_invariants(), Ok(()));
+
+    apply_err(
+        &mut state,
+        &Op::SetAttr {
+            path: b"/f".to_vec(),
+            attrs: Attrs::default(),
+            size: Some(1),
+            chunks: vec![full(1)],
+        },
+        Errno::EINVAL,
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1308,6 +1360,8 @@ fn random_op(rng: &mut Rng, step: u64) -> Op {
                 gid: Some(4),
                 mtime_ns: Some(mtime),
             },
+            size: None,
+            chunks: Vec::new(),
         },
         6 => Op::Rename {
             from: rng.pick(&paths).into_bytes(),

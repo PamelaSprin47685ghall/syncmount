@@ -8,7 +8,7 @@
 pub const SOFTWARE_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// HELLO/WELCOME `major.minor`.
-pub const PROTOCOL_VERSION: &str = "2.0";
+pub const PROTOCOL_VERSION: &str = "3.0";
 
 /// Frame header `ver` byte.
 pub const FRAME_VERSION: u8 = 1;

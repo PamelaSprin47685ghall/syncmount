@@ -9,7 +9,7 @@ Owner: W21 (D1). This document is the build contract for the release binary.
 | Rust | `1.85.0` (pinned by `rust-toolchain.toml`) |
 | Edition | 2024 |
 | Components | `rustfmt`, `clippy` |
-| Targets | `x86_64-unknown-linux-gnu` (development), `x86_64-unknown-linux-musl` (release) |
+| Targets | `x86_64-unknown-linux-gnu` (development), `x86_64-unknown-linux-musl` and `aarch64-unknown-linux-musl` (release) |
 | Linker | host `cc`; the musl target ships its own libc/crt |
 | Extra tools | `fusermount3` and `/dev/fuse` for FUSE tests only |
 
@@ -62,6 +62,26 @@ stat -c%s "$bin"                   # must be < 15 * 1024 * 1024
 `profile.dist` inherits `release` and sets `lto = "fat"`,
 `codegen-units = 1`, `strip = "symbols"`. `panic` stays `unwind` because the
 unmount path must run after a worker panic.
+
+### aarch64 musl cross build
+
+The aarch64 target uses a musl cross toolchain; the host `cc` cannot link it.
+One working setup (musl-cross) is:
+
+```bash
+export PATH="$HOME/.local/share/musl-cross/aarch64-linux-musl-cross/bin:$PATH"
+export CC_aarch64_unknown_linux_musl=aarch64-linux-musl-gcc
+export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-musl-gcc
+cargo +1.85.0 build --locked --profile dist --target aarch64-unknown-linux-musl
+bin=target/aarch64-unknown-linux-musl/dist/syncmount
+file "$bin"                        # ELF 64-bit LSB executable, ARM aarch64, statically linked
+readelf -l "$bin" | grep INTERP    # must print nothing
+readelf -d "$bin" | grep NEEDED    # must print nothing
+```
+
+The resulting binary is `ET_EXEC` (not static-PIE); it has no build-id, so
+release records must identify it by sha256. The FUSE runtime dependency is
+unchanged.
 
 A release build does not link `libfuse`; fuser talks to `/dev/fuse` directly.
 The host still needs the `fusermount3` helper at runtime.

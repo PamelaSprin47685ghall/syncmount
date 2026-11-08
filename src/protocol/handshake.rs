@@ -1,42 +1,41 @@
 //! PSK handshake state machines.
 //!
 //! The handshake is sans-io: callers inject nonces, time and the transport.
-//! Both sides derive the same handshake key from the two nonces and use it
-//! for the `WELCOME` proof, `AUTH` and `ACCEPT`. The steady-state key is only
-//! used after `ACCEPT` verifies.
+//! One client flight and one server flight finish authentication:
 //!
 //! ```text
-//! client  HELLO(plain) ───────────────▶ server
-//!         ◀──────────── WELCOME(plain body + F_SERVER_PROOF)
-//!         AUTH(sealed) ───────────────▶ server
-//!         ◀──────────── ACCEPT(sealed)
+//! client  HELLO(plain header + sealed AUTH) ─────▶ server
+//!         ◀───── WELCOME(plain header + server_nonce
+//!                        + F_SERVER_PROOF + sealed ACCEPT)
 //!         STEADY (enc)
 //! ```
 //!
-//! A wrong PSK fails at the `WELCOME` proof, so the client never sends
-//! `AUTH`. A failed `AUTH` closes the connection silently: the server does
-//! not turn "wrong password" and "tampered transcript" into a distinguishable
-//! oracle.
+//! `AUTH` is sealed under a key derived from the PSK and `client_nonce`, so
+//! the client can produce it before it sees the server nonce. `ACCEPT` and
+//! the `WELCOME` proof are sealed under a key derived from both nonces.
+//!
+//! A wrong PSK fails at `HELLO.AUTH` on the server and at the `WELCOME` proof
+//! on the client. The server closes silently in both cases: it never turns
+//! "wrong password" and "tampered transcript" into a distinguishable oracle.
 
 use std::collections::VecDeque;
 use std::fmt;
 
 use crate::protocol::crypto::{
-    CryptoError, HandshakeKeys, PskKeyRing, SessionKey, WELCOME_PROOF_LEN,
+    ACCEPT_DOMAIN, AUTH_DOMAIN, CryptoError, NONCE_LEN, NonceMinter, PskKeyRing, SessionKey,
+    WELCOME_PROOF_LEN,
 };
 use crate::protocol::frame::{
-    ClientId, FrameHeader, Limits as FrameLimits, Prefix, Seq, SessionId,
+    CTRL_PREFIX_LEN, ClientId, CtrlPrefix, Limits as FrameLimits, Seq, SessionId,
 };
 use crate::protocol::messages::{
-    Accept, Auth, Hello, MessageError, ResyncMode, Welcome, WelcomeLimits,
+    ACCEPT_SEALED_LEN, AUTH_SEALED_LEN, Accept, Auth, Hello, MessageError, ResyncMode, Welcome,
+    WelcomeLimits,
 };
 use crate::protocol::version::{Caps, Negotiated, ProtoVersion, VersionError, negotiate};
 
 /// Client-side budget for the whole handshake, in milliseconds.
 pub const CLIENT_HANDSHAKE_TIMEOUT_MS: u64 = 10_000;
-
-/// Server-side budget for `AUTH` after `WELCOME`, in milliseconds.
-pub const AUTH_TIMEOUT_MS: u64 = 5_000;
 
 /// Largest number of remembered client nonces in one replay window.
 pub const MAX_RECENT_NONCES: usize = 4_096;
@@ -49,9 +48,7 @@ pub const NONCE_REPLAY_WINDOW_MS: u64 = 60_000;
 pub enum ClientPhase {
     /// `HELLO` has been built and sent; `WELCOME` is outstanding.
     HelloSent,
-    /// `WELCOME` verified; `AUTH` has been built and sent.
-    AuthSent,
-    /// `ACCEPT` verified; the steady-state key is live.
+    /// `WELCOME` verified; the steady-state key is live.
     Steady,
     /// The handshake failed and must not continue.
     Failed,
@@ -70,7 +67,6 @@ pub struct ClientHandshake {
     phase: ClientPhase,
     deadline_ms: u64,
     negotiated: Option<Negotiated>,
-    handshake: Option<HandshakeKeys>,
     session_id: Option<SessionId>,
     epoch: Option<u64>,
     server_nonce: Option<[u8; 32]>,
@@ -95,16 +91,50 @@ impl ClientHandshake {
             phase: ClientPhase::HelloSent,
             deadline_ms: now_ms.saturating_add(CLIENT_HANDSHAKE_TIMEOUT_MS),
             negotiated: None,
-            handshake: None,
             session_id: None,
             epoch: None,
             server_nonce: None,
         }
     }
 
-    /// The `HELLO` body to send.
-    pub const fn hello(&self) -> Hello {
-        Hello::new(self.proto, self.caps, self.client_id, self.client_nonce)
+    /// Build the `HELLO` body, including a freshly sealed `AUTH`.
+    ///
+    /// `nonces` must belong to this connection: the `AUTH` envelope nonce is
+    /// drawn from it and must never repeat under the same handshake key.
+    /// `ctrl` is the plaintext control prefix of the same `HELLO` frame; its
+    /// bytes are authenticated with the `AUTH`, so a relay cannot change the
+    /// replay point without failing the handshake.
+    ///
+    /// # Errors
+    ///
+    /// [`HandshakeError::WrongPhase`], or a crypto error from key derivation
+    /// or sealing.
+    pub fn hello(
+        &self,
+        nonces: &NonceMinter,
+        ctrl: &CtrlPrefix,
+    ) -> Result<Hello, HandshakeError> {
+        self.expect_phase(ClientPhase::HelloSent)?;
+        let keys = self.ring.auth_keys(&self.client_nonce)?;
+        let auth = Auth {
+            client_nonce: self.client_nonce,
+            client_id: self.client_id,
+            proto: self.proto,
+            caps: self.caps,
+        };
+        let nonce = nonces.next()?;
+        let context = auth_context(&self.client_nonce, ctrl);
+        let sealed = keys.seal_detached(AUTH_DOMAIN, &context, &auth.encode(), &nonce)?;
+        let auth: [u8; AUTH_SEALED_LEN] = sealed
+            .try_into()
+            .map_err(|_| HandshakeError::Crypto(CryptoError::Aead))?;
+        Ok(Hello::new(
+            self.proto,
+            self.caps,
+            self.client_id,
+            self.client_nonce,
+            auth,
+        ))
     }
 
     /// Current phase.
@@ -132,10 +162,14 @@ impl ClientHandshake {
         &self.client_nonce
     }
 
+    /// The server nonce from the verified `WELCOME`.
+    pub const fn server_nonce(&self) -> Option<[u8; 32]> {
+        self.server_nonce
+    }
+
     /// Fail the handshake. Subsequent calls return [`HandshakeError::WrongPhase`].
     pub fn fail(&mut self) {
         self.phase = ClientPhase::Failed;
-        self.handshake = None;
     }
 
     /// Check the whole-handshake deadline.
@@ -150,42 +184,82 @@ impl ClientHandshake {
         Ok(())
     }
 
-    /// Verify `WELCOME` and build `AUTH`.
+    /// Verify `WELCOME`, including the server proof and the sealed `ACCEPT`,
+    /// and return the steady-state key.
     ///
-    /// `body` is the raw plaintext `WELCOME` body, including
-    /// `F_SERVER_PROOF`. The proof covers the canonical body without that
-    /// field; a wrong PSK and a tampered body both fail as
-    /// [`HandshakeError::AuthFailed`].
+    /// `body` is the raw plaintext `WELCOME` body. The proof covers the
+    /// canonical body without `F_SERVER_PROOF`; the sealed `ACCEPT` is part of
+    /// that covered body, so neither attachment can be swapped.
     ///
     /// # Errors
     ///
     /// [`HandshakeError::WrongPhase`], [`HandshakeError::Timeout`],
     /// [`HandshakeError::Version`], [`HandshakeError::ClientIdMismatch`],
-    /// [`HandshakeError::MissingSession`], [`HandshakeError::MissingServerProof`]
-    /// or [`HandshakeError::AuthFailed`].
+    /// [`HandshakeError::MissingServerProof`],
+    /// [`HandshakeError::MissingAccept`], [`HandshakeError::EpochMismatch`],
+    /// [`HandshakeError::SessionMismatch`] or [`HandshakeError::AuthFailed`].
     pub fn on_welcome(
         &mut self,
         welcome: &Welcome,
         body: &[u8],
         now_ms: u64,
-    ) -> Result<Auth, HandshakeError> {
+    ) -> Result<SessionKey, HandshakeError> {
         self.expect_phase(ClientPhase::HelloSent)?;
-        self.check_deadline(now_ms)?;
-
+        if let Err(error) = self.check_deadline(now_ms) {
+            self.fail();
+            return Err(error);
+        }
         if welcome.client_id != self.client_id {
             self.fail();
             return Err(HandshakeError::ClientIdMismatch);
         }
-        let negotiated = negotiate(self.proto, welcome.proto, self.caps, welcome.caps)?;
-        let session_id = welcome.session_id;
+        let negotiated = match negotiate(self.proto, welcome.proto, self.caps, welcome.caps) {
+            Ok(negotiated) => negotiated,
+            Err(error) => {
+                self.fail();
+                return Err(error.into());
+            }
+        };
         let limits = FrameLimits::default();
-        let proof =
-            Welcome::server_proof(body, &limits)?.ok_or(HandshakeError::MissingServerProof)?;
-        let body_hash = Welcome::proof_input(body, &limits)?;
-
-        let keys = self
+        let proof = match Welcome::server_proof(body, &limits) {
+            Ok(Some(proof)) => proof,
+            Ok(None) => {
+                self.fail();
+                return Err(HandshakeError::MissingServerProof);
+            }
+            Err(error) => {
+                self.fail();
+                return Err(error.into());
+            }
+        };
+        let sealed_accept = match Welcome::sealed_accept(body, &limits) {
+            Ok(Some(accept)) => accept,
+            Ok(None) => {
+                self.fail();
+                return Err(HandshakeError::MissingAccept);
+            }
+            Err(error) => {
+                self.fail();
+                return Err(error.into());
+            }
+        };
+        let body_hash = match Welcome::proof_input(body, &limits) {
+            Ok(hash) => hash,
+            Err(error) => {
+                self.fail();
+                return Err(error.into());
+            }
+        };
+        let keys = match self
             .ring
-            .handshake_keys(&self.client_nonce, &welcome.server_nonce)?;
+            .handshake_keys(&self.client_nonce, &welcome.server_nonce)
+        {
+            Ok(keys) => keys,
+            Err(error) => {
+                self.fail();
+                return Err(error.into());
+            }
+        };
         if keys
             .open_welcome_proof(&self.client_nonce, &body_hash, &proof)
             .is_err()
@@ -193,77 +267,36 @@ impl ClientHandshake {
             self.fail();
             return Err(HandshakeError::AuthFailed);
         }
-
-        self.negotiated = Some(negotiated);
-        self.session_id = Some(session_id);
-        self.epoch = Some(welcome.epoch);
-        self.server_nonce = Some(welcome.server_nonce);
-        self.handshake = Some(keys);
-        self.phase = ClientPhase::AuthSent;
-
-        Ok(Auth {
-            client_nonce: self.client_nonce,
-            server_nonce: welcome.server_nonce,
-            session_id,
-            epoch: welcome.epoch,
-            client_id: self.client_id,
-            proto: negotiated.proto,
-            caps: negotiated.caps,
-        })
-    }
-
-    /// The handshake keys used to seal `AUTH`, once `WELCOME` verified.
-    pub fn handshake_keys(&self) -> Option<&HandshakeKeys> {
-        self.handshake.as_ref()
-    }
-
-    /// Verify an already-opened `ACCEPT`.
-    ///
-    /// # Errors
-    ///
-    /// [`HandshakeError::WrongPhase`], [`HandshakeError::Timeout`],
-    /// [`HandshakeError::EpochMismatch`] or [`HandshakeError::SessionMismatch`].
-    pub fn on_accept(
-        &mut self,
-        accept: &Accept,
-        now_ms: u64,
-    ) -> Result<SessionKey, HandshakeError> {
-        self.expect_phase(ClientPhase::AuthSent)?;
-        self.check_deadline(now_ms)?;
-        if Some(accept.epoch) != self.epoch {
+        let context = accept_context(&self.client_nonce, &welcome.server_nonce);
+        let opened = match keys.open_detached(ACCEPT_DOMAIN, &context, &sealed_accept) {
+            Ok(opened) => opened,
+            Err(_) => {
+                self.fail();
+                return Err(HandshakeError::AuthFailed);
+            }
+        };
+        let accept = match Accept::decode(&opened) {
+            Ok(accept) => accept,
+            Err(error) => {
+                self.fail();
+                return Err(error.into());
+            }
+        };
+        if accept.epoch != welcome.epoch {
             self.fail();
             return Err(HandshakeError::EpochMismatch);
         }
-        if Some(accept.session_id) != self.session_id {
+        if accept.session_id != welcome.session_id {
             self.fail();
             return Err(HandshakeError::SessionMismatch);
         }
-        self.phase = ClientPhase::Steady;
-        self.handshake = None;
-        Ok(self.ring.session_key())
-    }
 
-    /// Open and verify a sealed `ACCEPT` frame body.
-    ///
-    /// # Errors
-    ///
-    /// [`HandshakeError::WrongPhase`], [`HandshakeError::Timeout`],
-    /// [`HandshakeError::AuthFailed`] for a bad tag, or any error from
-    /// [`ClientHandshake::on_accept`].
-    pub fn open_accept(
-        &mut self,
-        header: &FrameHeader,
-        body: &[u8],
-        now_ms: u64,
-    ) -> Result<SessionKey, HandshakeError> {
-        self.expect_phase(ClientPhase::AuthSent)?;
-        self.check_deadline(now_ms)?;
-        let keys = self.handshake.as_ref().ok_or(HandshakeError::AuthFailed)?;
-        let opened = keys
-            .open(header, &Prefix::None, body)
-            .map_err(|_| HandshakeError::AuthFailed)?;
-        let accept = Accept::decode(opened.as_slice())?;
-        self.on_accept(&accept, now_ms)
+        self.negotiated = Some(negotiated);
+        self.session_id = Some(welcome.session_id);
+        self.epoch = Some(welcome.epoch);
+        self.server_nonce = Some(welcome.server_nonce);
+        self.phase = ClientPhase::Steady;
+        Ok(self.ring.session_key())
     }
 
     /// Start a new attempt with a fresh nonce.
@@ -280,16 +313,10 @@ impl ClientHandshake {
         self.phase = ClientPhase::HelloSent;
         self.deadline_ms = now_ms.saturating_add(CLIENT_HANDSHAKE_TIMEOUT_MS);
         self.negotiated = None;
-        self.handshake = None;
         self.session_id = None;
         self.epoch = None;
         self.server_nonce = None;
         Ok(())
-    }
-
-    /// The server nonce from the verified `WELCOME`.
-    pub const fn server_nonce(&self) -> Option<[u8; 32]> {
-        self.server_nonce
     }
 
     fn expect_phase(&self, expected: ClientPhase) -> Result<(), HandshakeError> {
@@ -314,7 +341,7 @@ impl fmt::Debug for ClientHandshake {
     }
 }
 
-/// Inputs the transport supplies for one `WELCOME`.
+/// Inputs the transport supplies for one `HELLO`/`WELCOME` exchange.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct HelloInput {
     /// Join session identifier.
@@ -322,30 +349,30 @@ pub struct HelloInput {
     /// Fresh 32-byte server nonce.
     pub server_nonce: [u8; 32],
     /// Fresh 12-byte nonce for the `WELCOME` proof.
-    pub proof_nonce: [u8; 12],
+    pub proof_nonce: [u8; NONCE_LEN],
+    /// Fresh 12-byte nonce for the sealed `ACCEPT`.
+    ///
+    /// Must differ from [`HelloInput::proof_nonce`]: both are sealed under the
+    /// same two-nonce handshake key.
+    pub accept_nonce: [u8; NONCE_LEN],
     /// Server clock.
     pub server_time: u64,
     /// Resync mode the server requests.
     pub resync: ResyncMode,
+    /// Plaintext control prefix from the `HELLO` frame.
+    ///
+    /// The prefix is part of the AUTH transcript, so a modified
+    /// `applied_seq`/`epoch_seen` fails authentication instead of silently
+    /// changing the replay point.
+    pub ctrl: CtrlPrefix,
 }
 
-/// A `WELCOME` body ready to send.
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub struct WelcomeReply {
-    /// Parsed message.
-    pub welcome: Welcome,
-    /// Encoded body including `F_SERVER_PROOF`.
-    pub body: Vec<u8>,
-}
-
-/// A verified `AUTH`, plus the key still needed to seal `ACCEPT`.
+/// A verified `HELLO`, plus the encoded `WELCOME` ready to send.
 pub struct Accepted {
-    /// `ACCEPT` body to seal under [`Accepted::keys`].
-    pub accept: Accept,
-    /// Handshake key for `ACCEPT`; drop it after sealing.
-    pub keys: HandshakeKeys,
-    /// Client identity claimed in `HELLO` and confirmed by `AUTH`.
-    pub client_id: ClientId,
+    /// Parsed `WELCOME` message.
+    pub welcome: Welcome,
+    /// Encoded body including `F_SERVER_PROOF` and `F_SEALED_ACCEPT`.
+    pub body: Vec<u8>,
     /// Join session identifier.
     pub session_id: SessionId,
 }
@@ -353,37 +380,24 @@ pub struct Accepted {
 impl fmt::Debug for Accepted {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Accepted")
-            .field("accept", &self.accept)
-            .field("client_id", &self.client_id)
+            .field("welcome", &self.welcome)
             .field("session_id", &self.session_id)
             .finish_non_exhaustive()
     }
 }
 
-struct Pending {
-    client_nonce: [u8; 32],
-    server_nonce: [u8; 32],
-    session_id: SessionId,
-    epoch: u64,
-    client_id: ClientId,
-    proto: ProtoVersion,
-    caps: Caps,
-    deadline_ms: u64,
-    keys: HandshakeKeys,
-}
-
 /// A server-side PSK handshake for one connection.
 ///
-/// One `HELLO` per connection. `client_id` is only claimed here; the caller
-/// must not insert the identity into any session or broadcast table until
-/// `AUTH` verifies.
+/// The server verifies `HELLO.AUTH` before it builds `WELCOME`; there is no
+/// second client flight and no pending handshake state. `client_id` is only
+/// claimed here; the caller must not insert the identity into any session or
+/// broadcast table until [`ServerHandshake::on_hello`] returns `Ok`.
 pub struct ServerHandshake {
     ring: PskKeyRing,
     epoch: u64,
     current_seq: Seq,
     limits: WelcomeLimits,
     caps: Caps,
-    pending: Option<Pending>,
 }
 
 impl ServerHandshake {
@@ -401,7 +415,6 @@ impl ServerHandshake {
             current_seq,
             limits,
             caps,
-            pending: None,
         }
     }
 
@@ -415,36 +428,44 @@ impl ServerHandshake {
         self.current_seq
     }
 
-    /// Whether an `AUTH` is outstanding.
-    pub const fn has_pending(&self) -> bool {
-        self.pending.is_some()
-    }
-
-    /// Build `WELCOME` for `hello` and remember the pending handshake.
+    /// Verify `HELLO.AUTH` and build `WELCOME`.
     ///
-    /// The caller must run [`NonceReplayGuard::check_and_record`] first. The
-    /// returned body is plain WCP with `F_SERVER_PROOF`; the proof is sealed
-    /// under the per-connection handshake key.
+    /// The caller must run [`NonceReplayGuard::check_and_record`] first. A
+    /// wrong PSK, a tampered `AUTH` and a transcript mismatch all return
+    /// [`HandshakeError::AuthFailed`]; the caller must close silently.
     ///
     /// # Errors
     ///
-    /// [`HandshakeError::Busy`] if a handshake is already pending,
     /// [`HandshakeError::Version`] for a major mismatch or missing capability,
-    /// or a crypto/message error.
+    /// [`HandshakeError::AuthFailed`] when `AUTH` does not verify, or a
+    /// crypto/message error.
     pub fn on_hello(
         &mut self,
         hello: &Hello,
         input: HelloInput,
-        now_ms: u64,
-    ) -> Result<WelcomeReply, HandshakeError> {
-        if self.pending.is_some() {
-            return Err(HandshakeError::Busy);
+    ) -> Result<Accepted, HandshakeError> {
+        if input.proof_nonce == input.accept_nonce {
+            return Err(HandshakeError::Crypto(CryptoError::Aead));
         }
         let negotiated = negotiate(ProtoVersion::CURRENT, hello.proto, self.caps, hello.caps)?;
+
+        let auth_keys = self.ring.auth_keys(&hello.client_nonce)?;
+        let context = auth_context(&hello.client_nonce, &input.ctrl);
+        let opened = auth_keys
+            .open_detached(AUTH_DOMAIN, &context, &hello.auth)
+            .map_err(|_| HandshakeError::AuthFailed)?;
+        let auth = Auth::decode(&opened)?;
+        if auth.client_nonce != hello.client_nonce
+            || auth.client_id != hello.client_id
+            || auth.proto != hello.proto
+            || auth.caps != hello.caps
+        {
+            return Err(HandshakeError::AuthFailed);
+        }
+
         let keys = self
             .ring
             .handshake_keys(&hello.client_nonce, &input.server_nonce)?;
-
         let welcome = Welcome {
             proto: negotiated.proto,
             caps: negotiated.caps,
@@ -457,114 +478,44 @@ impl ServerHandshake {
             server_nonce: input.server_nonce,
             session_id: input.session_id,
         };
-        let plain = welcome.encode()?;
-        let body_hash = Welcome::proof_input(&plain, &FrameLimits::default())?;
-        let proof = keys.seal_welcome_proof(&hello.client_nonce, &body_hash, &input.proof_nonce)?;
-        debug_assert_eq!(proof.len(), WELCOME_PROOF_LEN);
-        let body = welcome.encode_with_proof(&proof)?;
-
-        self.pending = Some(Pending {
-            client_nonce: hello.client_nonce,
-            server_nonce: input.server_nonce,
-            session_id: input.session_id,
+        let accept = Accept {
             epoch: self.epoch,
-            client_id: hello.client_id,
-            proto: negotiated.proto,
-            caps: negotiated.caps,
-            deadline_ms: now_ms.saturating_add(AUTH_TIMEOUT_MS),
-            keys,
-        });
+            session_id: input.session_id,
+            current_seq: self.current_seq,
+        };
+        let context = accept_context(&hello.client_nonce, &input.server_nonce);
+        let sealed_accept = keys.seal_detached(
+            ACCEPT_DOMAIN,
+            &context,
+            &accept.encode(),
+            &input.accept_nonce,
+        )?;
+        let sealed_accept: [u8; ACCEPT_SEALED_LEN] = sealed_accept
+            .try_into()
+            .map_err(|_| HandshakeError::Crypto(CryptoError::Aead))?;
 
-        Ok(WelcomeReply { welcome, body })
-    }
+        // The proof covers the sealed ACCEPT, so hash a body that already
+        // carries it. `proof_input` excludes only F_SERVER_PROOF, and the
+        // placeholder proof value never enters the hash.
+        let placeholder = welcome.encode_with_proof_and_accept(
+            &[0u8; WELCOME_PROOF_LEN],
+            &sealed_accept,
+        )?;
+        let body_hash = Welcome::proof_input(&placeholder, &FrameLimits::default())?;
+        let proof = keys.seal_welcome_proof(
+            &hello.client_nonce,
+            &body_hash,
+            &input.proof_nonce,
+        )?;
+        debug_assert_eq!(proof.len(), WELCOME_PROOF_LEN);
 
-    /// Verify an already-opened `AUTH` and consume the pending handshake.
-    ///
-    /// # Errors
-    ///
-    /// [`HandshakeError::UnknownHandshake`] when no `AUTH` is outstanding or
-    /// the nonce does not match, [`HandshakeError::Timeout`] after the
-    /// deadline, or [`HandshakeError::AuthFailed`] when any transcript field
-    /// differs. A replayed `AUTH` hits `UnknownHandshake` because the pending
-    /// entry is removed on first success.
-    pub fn on_auth(&mut self, auth: &Auth, now_ms: u64) -> Result<Accepted, HandshakeError> {
-        let pending = self
-            .pending
-            .as_ref()
-            .ok_or(HandshakeError::UnknownHandshake)?;
-        if now_ms >= pending.deadline_ms {
-            self.pending = None;
-            return Err(HandshakeError::Timeout);
-        }
-        if auth.client_nonce != pending.client_nonce
-            || auth.server_nonce != pending.server_nonce
-            || auth.session_id != pending.session_id
-            || auth.epoch != pending.epoch
-            || auth.client_id != pending.client_id
-            || auth.proto != pending.proto
-            || auth.caps != pending.caps
-        {
-            self.pending = None;
-            return Err(HandshakeError::AuthFailed);
-        }
+        let body = welcome.encode_with_proof_and_accept(&proof, &sealed_accept)?;
 
-        let pending = self
-            .pending
-            .take()
-            .ok_or(HandshakeError::UnknownHandshake)?;
         Ok(Accepted {
-            accept: Accept {
-                epoch: pending.epoch,
-                session_id: pending.session_id,
-                current_seq: self.current_seq,
-            },
-            keys: pending.keys,
-            client_id: pending.client_id,
-            session_id: pending.session_id,
+            welcome,
+            body,
+            session_id: input.session_id,
         })
-    }
-
-    /// Open and verify a sealed `AUTH` frame body.
-    ///
-    /// # Errors
-    ///
-    /// [`HandshakeError::UnknownHandshake`], [`HandshakeError::Timeout`],
-    /// [`HandshakeError::AuthFailed`] for a bad tag or malformed plaintext, or
-    /// any error from [`ServerHandshake::on_auth`].
-    pub fn open_auth(
-        &mut self,
-        header: &FrameHeader,
-        body: &[u8],
-        now_ms: u64,
-    ) -> Result<Accepted, HandshakeError> {
-        let pending = self
-            .pending
-            .as_ref()
-            .ok_or(HandshakeError::UnknownHandshake)?;
-        if now_ms >= pending.deadline_ms {
-            self.pending = None;
-            return Err(HandshakeError::Timeout);
-        }
-        let opened = pending
-            .keys
-            .open(header, &Prefix::None, body)
-            .map_err(|_| HandshakeError::AuthFailed)?;
-        let auth = Auth::decode(opened.as_slice())?;
-        self.on_auth(&auth, now_ms)
-    }
-
-    /// Drop an expired pending handshake.
-    ///
-    /// Returns `true` when an entry was removed.
-    pub fn expire(&mut self, now_ms: u64) -> bool {
-        let expired = self
-            .pending
-            .as_ref()
-            .is_some_and(|pending| now_ms >= pending.deadline_ms);
-        if expired {
-            self.pending = None;
-        }
-        expired
     }
 }
 
@@ -573,16 +524,31 @@ impl fmt::Debug for ServerHandshake {
         f.debug_struct("ServerHandshake")
             .field("epoch", &self.epoch)
             .field("current_seq", &self.current_seq)
-            .field("has_pending", &self.pending.is_some())
             .finish_non_exhaustive()
     }
 }
 
+fn accept_context(client_nonce: &[u8; 32], server_nonce: &[u8; 32]) -> [u8; 64] {
+    let mut context = [0u8; 64];
+    context[..32].copy_from_slice(client_nonce);
+    context[32..].copy_from_slice(server_nonce);
+    context
+}
+
+fn auth_context(client_nonce: &[u8; 32], ctrl: &CtrlPrefix) -> [u8; 32 + CTRL_PREFIX_LEN] {
+    let mut context = [0u8; 32 + CTRL_PREFIX_LEN];
+    context[..32].copy_from_slice(client_nonce);
+    context[32..].copy_from_slice(&ctrl.encode());
+    context
+}
+
 /// A bounded recent-nonce set.
 ///
-/// Callers must invoke this before accepting a `HELLO`; the same
-/// `client_nonce` inside the window is a replay. The set is bounded so an
-/// unauthenticated peer cannot grow it without limit.
+/// Callers hold the guard across [`NonceReplayGuard::contains`] and the AUTH
+/// verification, then call [`NonceReplayGuard::record`] only after the AUTH
+/// succeeds. A failed AUTH therefore consumes no capacity, and the same
+/// `client_nonce` inside the window is a replay. The set is bounded so a
+/// peer cannot grow it without limit.
 pub struct NonceReplayGuard {
     entries: VecDeque<([u8; 32], u64)>,
     capacity: usize,
@@ -610,15 +576,30 @@ impl NonceReplayGuard {
     ///
     /// [`HandshakeError::ReplayNonce`] when the nonce is still in the window.
     pub fn check_and_record(&mut self, nonce: [u8; 32], now_ms: u64) -> Result<(), HandshakeError> {
-        self.prune(now_ms);
-        if self.entries.iter().any(|(seen, _)| *seen == nonce) {
+        if self.contains(nonce, now_ms) {
             return Err(HandshakeError::ReplayNonce);
         }
+        self.record(nonce, now_ms);
+        Ok(())
+    }
+
+    /// Whether `nonce` is still inside the window, without recording it.
+    pub fn contains(&mut self, nonce: [u8; 32], now_ms: u64) -> bool {
+        self.prune(now_ms);
+        self.entries.iter().any(|(seen, _)| *seen == nonce)
+    }
+
+    /// Record an already-verified `nonce`.
+    ///
+    /// Callers that authenticate first must hold the guard across the check,
+    /// the verification and this call, so two connections cannot both pass
+    /// the check with the same nonce.
+    pub fn record(&mut self, nonce: [u8; 32], now_ms: u64) {
+        self.prune(now_ms);
         while self.entries.len() >= self.capacity && !self.entries.is_empty() {
             self.entries.pop_front();
         }
         self.entries.push_back((nonce, now_ms));
-        Ok(())
     }
 
     /// Number of remembered nonces.
@@ -677,21 +658,17 @@ pub enum HandshakeError {
     Crypto(CryptoError),
     /// `WELCOME.client_id` is not the identity this client sent.
     ClientIdMismatch,
-    /// `WELCOME` does not name a session.
-    MissingSession,
     /// `WELCOME` has no `F_SERVER_PROOF`.
     MissingServerProof,
+    /// `WELCOME` has no sealed `ACCEPT`.
+    MissingAccept,
     /// The proof, tag or transcript does not verify. Deliberately does not
     /// distinguish a wrong PSK from tampering.
     AuthFailed,
-    /// `ACCEPT.epoch` does not match the `WELCOME` epoch.
+    /// The sealed `ACCEPT` epoch does not match the `WELCOME` epoch.
     EpochMismatch,
-    /// `ACCEPT.session_id` does not match the `WELCOME` session.
+    /// The sealed `ACCEPT` session does not match the `WELCOME` session.
     SessionMismatch,
-    /// No `AUTH` is outstanding for this connection.
-    UnknownHandshake,
-    /// A `HELLO` already has a pending `AUTH`.
-    Busy,
     /// A client nonce was seen inside the replay window, or a retry reused it.
     ReplayNonce,
 }
@@ -707,13 +684,11 @@ impl fmt::Display for HandshakeError {
             Self::Message(e) => write!(f, "{e}"),
             Self::Crypto(e) => write!(f, "{e}"),
             Self::ClientIdMismatch => f.write_str("welcome names a different client id"),
-            Self::MissingSession => f.write_str("welcome does not name a session"),
             Self::MissingServerProof => f.write_str("welcome has no server proof"),
+            Self::MissingAccept => f.write_str("welcome has no sealed accept"),
             Self::AuthFailed => f.write_str("master password rejected or transcript tampered"),
             Self::EpochMismatch => f.write_str("accept epoch does not match welcome"),
             Self::SessionMismatch => f.write_str("accept session does not match welcome"),
-            Self::UnknownHandshake => f.write_str("no handshake is pending"),
-            Self::Busy => f.write_str("a handshake is already pending"),
             Self::ReplayNonce => f.write_str("client nonce replayed"),
         }
     }
@@ -753,8 +728,7 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
-    use crate::protocol::crypto::{NonceMinter, PskSalt};
-    use crate::protocol::frame::{Flags, MsgType};
+    use crate::protocol::crypto::PskSalt;
 
     const NOW: u64 = 1_000;
 
@@ -771,242 +745,346 @@ mod tests {
         }
     }
 
-    fn hello() -> Hello {
-        Hello::new(
-            ProtoVersion::CURRENT,
-            Caps::REQUIRED,
-            ClientId::from_bytes([0x11; 16]),
-            [0x22; 32],
-        )
-    }
-
     fn input() -> HelloInput {
         HelloInput {
             session_id: SessionId(0x3333),
             server_nonce: [0x44; 32],
             proof_nonce: [0x55; 12],
+            accept_nonce: [0x56; 12],
             server_time: 1_700_000_000,
             resync: ResyncMode::None,
+            ctrl: ctrl(),
         }
     }
 
-    fn client(ring: PskKeyRing) -> ClientHandshake {
+    fn ctrl() -> CtrlPrefix {
+        CtrlPrefix::new(Seq::UNSEQUENCED, 0)
+    }
+
+    fn input_with_ctrl(ctrl: CtrlPrefix) -> HelloInput {
+        HelloInput { ctrl, ..input() }
+    }
+
+    fn client_with(ring: PskKeyRing, nonce: [u8; 32], proto: ProtoVersion) -> ClientHandshake {
         ClientHandshake::new(
             ring,
             ClientId::from_bytes([0x11; 16]),
-            [0x22; 32],
-            ProtoVersion::CURRENT,
+            nonce,
+            proto,
             Caps::REQUIRED,
             NOW,
         )
+    }
+
+    fn client(ring: PskKeyRing) -> ClientHandshake {
+        client_with(ring, [0x22; 32], ProtoVersion::CURRENT)
     }
 
     fn server(ring: PskKeyRing) -> ServerHandshake {
         ServerHandshake::new(ring, NOW, Seq(7), limits(), Caps::REQUIRED)
     }
 
-    fn sealed_auth(client: &ClientHandshake, nonces: &NonceMinter) -> (FrameHeader, Vec<u8>) {
-        let auth = client.handshake_keys().expect("handshake keys");
-        let mut header = FrameHeader::new(MsgType::AUTH, Flags::ENC, 0, Seq::UNSEQUENCED);
-        let body = auth
-            .sealer(nonces)
-            .seal(&mut header, &Prefix::None, &client_auth(client).encode())
-            .unwrap();
-        (header, body.into_vec())
+    fn seal_hello(client: &ClientHandshake, nonces: &NonceMinter) -> Hello {
+        client.hello(nonces, &ctrl()).unwrap()
     }
 
-    fn client_auth(client: &ClientHandshake) -> Auth {
-        Auth {
-            client_nonce: *client.client_nonce(),
-            server_nonce: client.server_nonce().unwrap(),
-            session_id: client.session_id().unwrap(),
-            epoch: client.epoch().unwrap(),
-            client_id: ClientId::from_bytes([0x11; 16]),
-            proto: client.negotiated().unwrap().proto,
-            caps: client.negotiated().unwrap().caps,
-        }
+    fn pair(
+        ring_byte: u8,
+        client_nonce: [u8; 32],
+        nonces: &NonceMinter,
+    ) -> (ClientHandshake, Accepted) {
+        let client = client_with(ring(ring_byte), client_nonce, ProtoVersion::CURRENT);
+        let hello = seal_hello(&client, nonces);
+        let mut server = server(ring(ring_byte));
+        let reply = server.on_hello(&hello, input()).unwrap();
+        (client, reply)
     }
 
     #[test]
-    fn full_handshake_reaches_steady_with_the_enc_key() {
+    fn full_handshake_is_one_round_trip() {
         let nonces = NonceMinter::with_instance(1);
         let expected = ring(0x01);
         let mut client = client(ring(0x01));
         let mut server = server(ring(0x01));
 
-        let reply = server.on_hello(&client.hello(), input(), NOW).unwrap();
+        // Flight 1: one client message. HELLO carries the sealed AUTH.
+        let hello = seal_hello(&client, &nonces);
+        assert_eq!(hello.client_nonce, [0x22; 32]);
+        assert_eq!(hello.auth.len(), AUTH_SEALED_LEN);
+        assert_eq!(client.phase(), ClientPhase::HelloSent);
+
+        // Flight 2: one server message. WELCOME carries the proof and the
+        // sealed ACCEPT; there is no AUTH/ACCEPT frame and no third flight.
+        let reply = server.on_hello(&hello, input()).unwrap();
         assert_eq!(reply.welcome.epoch, NOW);
         assert_eq!(reply.welcome.current_seq, Seq(7));
         assert_eq!(reply.welcome.server_nonce, [0x44; 32]);
-        assert_eq!(
-            reply.body.len(),
-            reply.welcome.encode().unwrap().len() + 3 + WELCOME_PROOF_LEN
+        assert_eq!(reply.welcome.proto, ProtoVersion::CURRENT);
+        assert_eq!(reply.welcome.session_id, SessionId(0x3333));
+        assert!(
+            Welcome::sealed_accept(&reply.body, &FrameLimits::default())
+                .unwrap()
+                .is_some()
         );
 
-        let auth = client.on_welcome(&reply.welcome, &reply.body, NOW).unwrap();
-        assert_eq!(auth.client_nonce, [0x22; 32]);
-        assert_eq!(auth.server_nonce, [0x44; 32]);
-        assert_eq!(auth.proto, ProtoVersion::CURRENT);
-        assert_eq!(client.phase(), ClientPhase::AuthSent);
-
-        let mut header = FrameHeader::new(MsgType::AUTH, Flags::ENC, 0, Seq::UNSEQUENCED);
-        let sealed = client
-            .handshake_keys()
-            .unwrap()
-            .sealer(&nonces)
-            .seal(&mut header, &Prefix::None, &auth.encode())
-            .unwrap();
-        let accepted = server.open_auth(&header, sealed.as_bytes(), NOW).unwrap();
-        assert_eq!(accepted.client_id, ClientId::from_bytes([0x11; 16]));
-        assert_eq!(accepted.session_id, SessionId(0x3333));
-
-        let mut accept_header = FrameHeader::new(MsgType::ACCEPT, Flags::ENC, 0, Seq::UNSEQUENCED);
-        let accept_body = accepted
-            .keys
-            .sealer(&nonces)
-            .seal(&mut accept_header, &Prefix::None, &accepted.accept.encode())
-            .unwrap();
-        let session_key = client
-            .open_accept(&accept_header, accept_body.as_bytes(), NOW)
-            .unwrap();
+        let session_key = client.on_welcome(&reply.welcome, &reply.body, NOW).unwrap();
         assert_eq!(client.phase(), ClientPhase::Steady);
         assert_eq!(session_key.key(), expected.enc_key());
         assert_eq!(session_key.kid(), expected.kid());
-        assert!(client.handshake_keys().is_none());
-    }
-
-    #[test]
-    fn wrong_psk_fails_at_the_welcome_proof_and_sends_no_auth() {
-        let mut client = client(ring(0x02));
-        let mut server = server(ring(0x01));
-        let reply = server.on_hello(&client.hello(), input(), NOW).unwrap();
-
-        let error = client
-            .on_welcome(&reply.welcome, &reply.body, NOW)
-            .unwrap_err();
-        assert!(matches!(error, HandshakeError::AuthFailed));
-        assert_eq!(client.phase(), ClientPhase::Failed);
-        assert!(client.handshake_keys().is_none());
-
-        // The server never claimed the identity; the pending entry expires.
-        assert!(server.has_pending());
-        assert!(server.expire(NOW + AUTH_TIMEOUT_MS));
-        assert!(!server.has_pending());
-    }
-
-    #[test]
-    fn welcome_proof_is_bound_to_both_nonces_and_the_body() {
-        let nonces = NonceMinter::with_instance(2);
-        let psk_ring = ring(0x01);
-
-        // A different server nonce yields a different handshake key.
-        let first = psk_ring.handshake_keys(&[0x22; 32], &[0x44; 32]).unwrap();
-        let second = psk_ring.handshake_keys(&[0x22; 32], &[0x45; 32]).unwrap();
-        assert_ne!(first.kid(), second.kid());
-
-        // A different client nonce does not verify the proof.
-        let mut client = client(ring(0x01));
-        let mut server = server(ring(0x01));
-        let reply = server.on_hello(&client.hello(), input(), NOW).unwrap();
-        let mut other = ClientHandshake::new(
-            ring(0x01),
-            ClientId::from_bytes([0x11; 16]),
-            [0x23; 32],
+        assert_eq!(client.session_id(), Some(SessionId(0x3333)));
+        assert_eq!(client.epoch(), Some(NOW));
+        assert_eq!(client.server_nonce(), Some([0x44; 32]));
+        assert_eq!(
+            client.negotiated().unwrap().proto,
             ProtoVersion::CURRENT,
-            Caps::REQUIRED,
-            NOW,
+            "the handshake keeps proto v3"
         );
-        let error = other
+        assert_eq!(ProtoVersion::CURRENT, ProtoVersion::V3_0);
+    }
+
+    #[test]
+    fn wrong_psk_is_rejected_at_hello_auth() {
+        let nonces = NonceMinter::with_instance(2);
+        let client = client(ring(0x02));
+        let mut server = server(ring(0x01));
+        let hello = seal_hello(&client, &nonces);
+        let error = server.on_hello(&hello, input()).unwrap_err();
+        assert!(matches!(error, HandshakeError::AuthFailed));
+    }
+
+    #[test]
+    fn wrong_psk_client_rejects_the_welcome_proof() {
+        let nonces = NonceMinter::with_instance(3);
+        let mut wrong = client(ring(0x02));
+        let good_client = client(ring(0x01));
+        let mut server = server(ring(0x01));
+        let hello = seal_hello(&good_client, &nonces);
+        let reply = server.on_hello(&hello, input()).unwrap();
+
+        let error = wrong
             .on_welcome(&reply.welcome, &reply.body, NOW)
             .unwrap_err();
         assert!(matches!(error, HandshakeError::AuthFailed));
+        assert_eq!(wrong.phase(), ClientPhase::Failed);
+    }
 
-        // A tampered body fails even when the proof bytes are unchanged.
-        let mut tampered = reply.welcome;
-        tampered.epoch = tampered.epoch.wrapping_add(1);
-        let proof = Welcome::server_proof(&reply.body, &FrameLimits::default())
-            .unwrap()
-            .unwrap();
-        let body = tampered.encode_with_proof(&proof).unwrap();
-        let error = client.on_welcome(&tampered, &body, NOW).unwrap_err();
-        assert!(matches!(error, HandshakeError::AuthFailed));
+    #[test]
+    fn wrong_psk_and_tampered_auth_are_indistinguishable() {
+        let nonces = NonceMinter::with_instance(4);
+        let wrong = client(ring(0x02));
+        let good = client(ring(0x01));
+        let mut server = server(ring(0x01));
+
+        let wrong_hello = seal_hello(&wrong, &nonces);
+        let wrong_error = server.on_hello(&wrong_hello, input()).unwrap_err();
+
+        let good_hello = seal_hello(&good, &nonces);
+        let mut tampered_hello = good_hello;
+        let last = tampered_hello.auth.len() - 1;
+        tampered_hello.auth[last] ^= 1;
+        let tampered_error = server.on_hello(&tampered_hello, input()).unwrap_err();
+
+        assert!(matches!(wrong_error, HandshakeError::AuthFailed));
+        assert!(matches!(tampered_error, HandshakeError::AuthFailed));
+        assert_eq!(wrong_error.to_string(), tampered_error.to_string());
+    }
+
+    #[test]
+    fn hello_auth_is_bound_to_the_nonce_and_the_plaintext_transcript() {
+        let nonces = NonceMinter::with_instance(5);
+        let client = client(ring(0x01));
+        let hello = seal_hello(&client, &nonces);
+        let mut server = server(ring(0x01));
+
+        let mut changed_nonce = hello;
+        changed_nonce.client_nonce = [0x23; 32];
+        assert!(matches!(
+            server.on_hello(&changed_nonce, input()).unwrap_err(),
+            HandshakeError::AuthFailed
+        ));
+
+        let mut renamed = hello;
+        renamed.client_id = ClientId::from_bytes([0x99; 16]);
+        assert!(matches!(
+            server.on_hello(&renamed, input()).unwrap_err(),
+            HandshakeError::AuthFailed
+        ));
+
+        let mut newer_minor = hello;
+        newer_minor.proto = ProtoVersion { major: 3, minor: 1 };
+        assert!(matches!(
+            server.on_hello(&newer_minor, input()).unwrap_err(),
+            HandshakeError::AuthFailed
+        ));
+
+        let mut extra_caps = hello;
+        extra_caps.caps = Caps::from_bits(Caps::REQUIRED.bits() | 0x100);
+        assert!(matches!(
+            server.on_hello(&extra_caps, input()).unwrap_err(),
+            HandshakeError::AuthFailed
+        ));
+
+        let moved_prefix = input_with_ctrl(CtrlPrefix::new(Seq(1), 0));
+        assert!(matches!(
+            server.on_hello(&hello, moved_prefix).unwrap_err(),
+            HandshakeError::AuthFailed
+        ));
+    }
+
+    #[test]
+    fn welcome_proof_and_accept_are_bound_to_the_body() {
+        let limits = FrameLimits::default();
 
         // A tampered proof fails.
-        let mut client = self::client(ring(0x01));
-        let mut server = self::server(ring(0x01));
-        let reply = server.on_hello(&client.hello(), input(), NOW).unwrap();
-        let mut proof = Welcome::server_proof(&reply.body, &FrameLimits::default())
-            .unwrap()
+        let nonces = NonceMinter::with_instance(6);
+        let (mut client, reply) = pair(0x01, [0x22; 32], &nonces);
+        let mut proof = Welcome::server_proof(&reply.body, &limits).unwrap().unwrap();
+        let accept = Welcome::sealed_accept(&reply.body, &limits).unwrap().unwrap();
+        proof[0] ^= 1;
+        let body = reply
+            .welcome
+            .encode_with_proof_and_accept(&proof, &accept)
             .unwrap();
-        proof[0] = 7;
+        assert!(matches!(
+            client.on_welcome(&reply.welcome, &body, NOW).unwrap_err(),
+            HandshakeError::AuthFailed
+        ));
+
+        // A tampered plaintext field fails even with the original proof.
+        let nonces = NonceMinter::with_instance(7);
+        let (mut client, reply) = pair(0x01, [0x23; 32], &nonces);
+        let proof = Welcome::server_proof(&reply.body, &limits).unwrap().unwrap();
+        let accept = Welcome::sealed_accept(&reply.body, &limits).unwrap().unwrap();
+        let mut tampered = reply.welcome;
+        tampered.epoch = tampered.epoch.wrapping_add(1);
+        let body = tampered
+            .encode_with_proof_and_accept(&proof, &accept)
+            .unwrap();
+        assert!(matches!(
+            client.on_welcome(&tampered, &body, NOW).unwrap_err(),
+            HandshakeError::AuthFailed
+        ));
+
+        // A tampered ACCEPT with a valid proof fails the AEAD tag.
+        let nonces = NonceMinter::with_instance(8);
+        let (mut client, reply) = pair(0x01, [0x24; 32], &nonces);
+        let mut accept = Welcome::sealed_accept(&reply.body, &limits).unwrap().unwrap();
+        let last = accept.len() - 1;
+        accept[last] ^= 1;
+        let placeholder = reply
+            .welcome
+            .encode_with_proof_and_accept(&[0u8; WELCOME_PROOF_LEN], &accept)
+            .unwrap();
+        let hash = Welcome::proof_input(&placeholder, &limits).unwrap();
+        let keys = ring(0x01)
+            .handshake_keys(&[0x24; 32], &input().server_nonce)
+            .unwrap();
+        let proof = keys
+            .seal_welcome_proof(&[0x24; 32], &hash, &[0x77; 12])
+            .unwrap();
+        let body = reply
+            .welcome
+            .encode_with_proof_and_accept(&proof, &accept)
+            .unwrap();
+        assert!(matches!(
+            client.on_welcome(&reply.welcome, &body, NOW).unwrap_err(),
+            HandshakeError::AuthFailed
+        ));
+    }
+
+    #[test]
+    fn welcome_without_a_proof_or_accept_is_rejected() {
+        let limits = FrameLimits::default();
+
+        let nonces = NonceMinter::with_instance(9);
+        let (mut client, reply) = pair(0x01, [0x22; 32], &nonces);
+        let body = reply.welcome.encode().unwrap();
+        assert!(matches!(
+            client.on_welcome(&reply.welcome, &body, NOW).unwrap_err(),
+            HandshakeError::MissingServerProof
+        ));
+
+        let nonces = NonceMinter::with_instance(10);
+        let (mut client, reply) = pair(0x01, [0x23; 32], &nonces);
+        let plain = reply.welcome.encode().unwrap();
+        let hash = Welcome::proof_input(&plain, &limits).unwrap();
+        let keys = ring(0x01)
+            .handshake_keys(&[0x23; 32], &input().server_nonce)
+            .unwrap();
+        let proof = keys
+            .seal_welcome_proof(&[0x23; 32], &hash, &[0x78; 12])
+            .unwrap();
         let body = reply.welcome.encode_with_proof(&proof).unwrap();
-        let error = client.on_welcome(&reply.welcome, &body, NOW).unwrap_err();
-        assert!(matches!(error, HandshakeError::AuthFailed));
-        let _ = nonces;
+        assert!(matches!(
+            client.on_welcome(&reply.welcome, &body, NOW).unwrap_err(),
+            HandshakeError::MissingAccept
+        ));
     }
 
     #[test]
-    fn auth_replay_is_rejected_after_first_success() {
-        let nonces = NonceMinter::with_instance(3);
+    fn accept_must_match_welcome_epoch() {
+        let limits = FrameLimits::default();
+        let nonces = NonceMinter::with_instance(11);
+        let (mut client, reply) = pair(0x01, [0x22; 32], &nonces);
+        let keys = ring(0x01)
+            .handshake_keys(&[0x22; 32], &input().server_nonce)
+            .unwrap();
+        let bad_accept = Accept {
+            epoch: reply.welcome.epoch + 1,
+            session_id: reply.welcome.session_id,
+            current_seq: reply.welcome.current_seq,
+        };
+        let context = accept_context(&[0x22; 32], &input().server_nonce);
+        let sealed = keys
+            .seal_detached(
+                ACCEPT_DOMAIN,
+                &context,
+                &bad_accept.encode(),
+                &[0x79; 12],
+            )
+            .unwrap();
+        let sealed: [u8; ACCEPT_SEALED_LEN] = sealed.try_into().unwrap();
+        let placeholder = reply
+            .welcome
+            .encode_with_proof_and_accept(&[0u8; WELCOME_PROOF_LEN], &sealed)
+            .unwrap();
+        let hash = Welcome::proof_input(&placeholder, &limits).unwrap();
+        let proof = keys
+            .seal_welcome_proof(&[0x22; 32], &hash, &[0x7a; 12])
+            .unwrap();
+        let body = reply
+            .welcome
+            .encode_with_proof_and_accept(&proof, &sealed)
+            .unwrap();
+        assert!(matches!(
+            client.on_welcome(&reply.welcome, &body, NOW).unwrap_err(),
+            HandshakeError::EpochMismatch
+        ));
+        assert_eq!(client.phase(), ClientPhase::Failed);
+    }
+
+    #[test]
+    fn client_timeout_is_enforced() {
         let mut client = client(ring(0x01));
-        let mut server = server(ring(0x01));
-        let reply = server.on_hello(&client.hello(), input(), NOW).unwrap();
-        let _ = client.on_welcome(&reply.welcome, &reply.body, NOW).unwrap();
-        let (header, body) = sealed_auth(&client, &nonces);
-
-        assert!(server.open_auth(&header, &body, NOW).is_ok());
-        let replay = server.open_auth(&header, &body, NOW).unwrap_err();
-        assert!(matches!(replay, HandshakeError::UnknownHandshake));
-    }
-
-    #[test]
-    fn auth_tag_tamper_fails_and_pending_expires() {
-        let nonces = NonceMinter::with_instance(4);
-        let mut client = client(ring(0x01));
-        let mut server = server(ring(0x01));
-        let reply = server.on_hello(&client.hello(), input(), NOW).unwrap();
-        let _ = client.on_welcome(&reply.welcome, &reply.body, NOW).unwrap();
-        let (header, mut body) = sealed_auth(&client, &nonces);
-        let last = body.len() - 1;
-        body[last] ^= 1;
-
-        let error = server.open_auth(&header, &body, NOW).unwrap_err();
-        assert!(matches!(error, HandshakeError::AuthFailed));
-        assert!(server.has_pending());
-        assert!(server.expire(NOW + AUTH_TIMEOUT_MS));
-    }
-
-    #[test]
-    fn auth_field_mismatch_is_auth_failed() {
-        let nonces = NonceMinter::with_instance(5);
-        let mut client = client(ring(0x01));
-        let mut server = server(ring(0x01));
-        let reply = server.on_hello(&client.hello(), input(), NOW).unwrap();
-        let _ = client.on_welcome(&reply.welcome, &reply.body, NOW).unwrap();
-
-        let mut auth = client_auth(&client);
-        auth.server_nonce = [0x99; 32];
-        let error = server.on_auth(&auth, NOW).unwrap_err();
-        assert!(matches!(error, HandshakeError::AuthFailed));
-        assert!(!server.has_pending());
-
-        let _ = nonces;
-    }
-
-    #[test]
-    fn client_and_server_timeouts_are_enforced() {
-        let client = client(ring(0x01));
         assert!(client.check_deadline(NOW).is_ok());
         assert!(matches!(
             client.check_deadline(NOW + CLIENT_HANDSHAKE_TIMEOUT_MS),
             Err(HandshakeError::Timeout)
         ));
 
+        let nonces = NonceMinter::with_instance(12);
+        let hello = seal_hello(&client, &nonces);
         let mut server = server(ring(0x01));
-        let hello = hello();
-        let _ = server.on_hello(&hello, input(), NOW).unwrap();
-        assert!(!server.expire(NOW + AUTH_TIMEOUT_MS - 1));
-        assert!(server.expire(NOW + AUTH_TIMEOUT_MS));
+        let reply = server.on_hello(&hello, input()).unwrap();
+        let error = client
+            .on_welcome(
+                &reply.welcome,
+                &reply.body,
+                NOW + CLIENT_HANDSHAKE_TIMEOUT_MS,
+            )
+            .unwrap_err();
+        assert!(matches!(error, HandshakeError::Timeout));
+        assert_eq!(client.phase(), ClientPhase::Failed);
     }
 
     #[test]
@@ -1041,52 +1119,101 @@ mod tests {
     }
 
     #[test]
+    fn replayed_hello_nonce_is_rejected_before_auth() {
+        let nonces = NonceMinter::with_instance(15);
+        let client = client(ring(0x01));
+        let hello = seal_hello(&client, &nonces);
+        let mut guard = NonceReplayGuard::new();
+        assert!(guard.check_and_record(hello.client_nonce, NOW).is_ok());
+        assert!(matches!(
+            guard.check_and_record(hello.client_nonce, NOW + 1),
+            Err(HandshakeError::ReplayNonce)
+        ));
+
+        let fresh = client_with(ring(0x01), [0x23; 32], ProtoVersion::CURRENT);
+        let fresh_hello = seal_hello(&fresh, &nonces);
+        assert!(guard
+            .check_and_record(fresh_hello.client_nonce, NOW + 2)
+            .is_ok());
+    }
+
+    #[test]
+    fn reused_proof_and_accept_nonce_is_rejected() {
+        let nonces = NonceMinter::with_instance(16);
+        let client = client(ring(0x01));
+        let hello = seal_hello(&client, &nonces);
+        let mut server = server(ring(0x01));
+        let mut input = input();
+        input.accept_nonce = input.proof_nonce;
+        assert!(matches!(
+            server.on_hello(&hello, input).unwrap_err(),
+            HandshakeError::Crypto(CryptoError::Aead)
+        ));
+    }
+
+    #[test]
     fn version_mismatch_is_rejected_before_keys() {
+        let nonces = NonceMinter::with_instance(13);
+        let client = client_with(ring(0x01), [0x22; 32], ProtoVersion::V2_0);
+        let hello = seal_hello(&client, &nonces);
         let mut server = server(ring(0x01));
-        let hello = Hello::new(
-            ProtoVersion::V1_0,
-            Caps::REQUIRED,
-            ClientId::from_bytes([0x11; 16]),
-            [0x22; 32],
-        );
-        let error = server.on_hello(&hello, input(), NOW).unwrap_err();
-        assert!(matches!(error, HandshakeError::Version(_)));
-        assert!(!server.has_pending());
+        let error = server.on_hello(&hello, input()).unwrap_err();
+        assert!(matches!(
+            error,
+            HandshakeError::Version(VersionError::MajorMismatch {
+                local: 3,
+                remote: 2
+            })
+        ));
     }
 
     #[test]
-    fn a_second_hello_on_the_same_connection_is_busy() {
-        let mut server = server(ring(0x01));
-        let hello = hello();
-        let _ = server.on_hello(&hello, input(), NOW).unwrap();
-        let error = server.on_hello(&hello, input(), NOW).unwrap_err();
-        assert!(matches!(error, HandshakeError::Busy));
+    fn old_v2_welcome_is_rejected_as_a_version_mismatch() {
+        let nonces = NonceMinter::with_instance(17);
+        let mut client = client(ring(0x01));
+        let _hello = seal_hello(&client, &nonces);
+
+        // The body a 2.0 server would send: the same plain fields, but no
+        // server proof and no sealed ACCEPT. Negotiation runs first, so the
+        // client reports the version break, not a missing attachment.
+        let welcome = Welcome {
+            proto: ProtoVersion::V2_0,
+            caps: Caps::REQUIRED,
+            epoch: NOW,
+            current_seq: Seq(7),
+            client_id: ClientId::from_bytes([0x11; 16]),
+            resync: ResyncMode::None,
+            limits: limits(),
+            server_time: NOW,
+            server_nonce: [0x44; 32],
+            session_id: SessionId(0x3333),
+        };
+        let body = welcome.encode().unwrap();
+        let error = client.on_welcome(&welcome, &body, NOW).unwrap_err();
+        assert!(matches!(
+            error,
+            HandshakeError::Version(VersionError::MajorMismatch {
+                local: 3,
+                remote: 2
+            })
+        ));
+        assert_eq!(client.phase(), ClientPhase::Failed);
     }
 
     #[test]
-    fn accept_must_match_welcome_epoch_and_session() {
-        let nonces = NonceMinter::with_instance(6);
+    fn phase_order_is_enforced() {
+        let nonces = NonceMinter::with_instance(14);
         let mut client = client(ring(0x01));
         let mut server = server(ring(0x01));
-        let reply = server.on_hello(&client.hello(), input(), NOW).unwrap();
+        let hello = seal_hello(&client, &nonces);
+        let reply = server.on_hello(&hello, input()).unwrap();
         let _ = client.on_welcome(&reply.welcome, &reply.body, NOW).unwrap();
-
-        let wrong_epoch = Accept {
-            epoch: NOW + 1,
-            session_id: SessionId(0x3333),
-            current_seq: Seq(7),
-        };
-        let mut header = FrameHeader::new(MsgType::ACCEPT, Flags::ENC, 0, Seq::UNSEQUENCED);
-        let body = {
-            let keys = client.handshake_keys().unwrap();
-            keys.sealer(&nonces)
-                .seal(&mut header, &Prefix::None, &wrong_epoch.encode())
-                .unwrap()
-        };
-        let error = client
-            .open_accept(&header, body.as_bytes(), NOW)
-            .unwrap_err();
-        assert!(matches!(error, HandshakeError::EpochMismatch));
-        assert_eq!(client.phase(), ClientPhase::Failed);
+        assert!(matches!(
+            client.on_welcome(&reply.welcome, &reply.body, NOW).unwrap_err(),
+            HandshakeError::WrongPhase {
+                expected: ClientPhase::HelloSent,
+                actual: ClientPhase::Steady
+            }
+        ));
     }
 }

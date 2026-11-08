@@ -57,28 +57,30 @@ syncmount \- server-authoritative, eventually consistent FUSE filesystem
 mounts one namespace as a local directory.
 The server owns the authoritative tree, assigns a total order, appends an
 event log and streams that log to every client.
-A client keeps a full SQLite replica, applies every local mutation to that
-replica before returning, and sends the matching operation through a durable
-outbox.
+A client keeps a full SQLite replica. A write buffers in memory and returns;
+a background commit every 100 ms, or flush, close, fsync, truncate, unlink or
+rename, writes it to the replica and the durable outbox. Namespace operations
+commit before returning.
 The mountpoint is a view over the replica database; it is not a backing
 directory.
 .PP
 The server and every client derive the same pre-shared key from one master
 password with Argon2id and HKDF-SHA256.
-The handshake is
+The handshake is one round trip:
 .B HELLO
-(plain),
+(plain body carrying a sealed \fBAUTH\fP)
+and
 .B WELCOME
-(plain body plus server proof),
+(plain body carrying a server proof and a sealed \fBACCEPT\fP).
+There are no separate
 .B AUTH
-(sealed) and
+or
 .B ACCEPT
-(sealed); steady-state frames are sealed under a per-session key.
-A wrong password fails at the
-.B WELCOME
-proof before
+frames; steady-state frames are sealed under a per-session key.
+A wrong password fails at the sealed
 .B AUTH
-is sent.
+in
+.B HELLO .
 .PP
 This is not end-to-end encryption.
 The server holds the master password, decrypts every operation, applies it to
@@ -472,7 +474,11 @@ Reserved for a corrupt audit journal.
 The v2 client keeps no audit journal and does not return this status.
 .TP
 .B 4
-Authentication failure: the server rejected the master password, or the
+Authentication failure: the server rejected the sealed
+.B AUTH
+in
+.B HELLO ,
+or the
 .B WELCOME
 proof did not verify.
 .TP
@@ -575,10 +581,17 @@ syncmount debug-conntrace --limit 20
 syncmount debug-seq-gaps --json
 .fi
 .SH LIMITATIONS
-Every mutation is local-first: it commits to the client SQLite database and
-the durable outbox before the FUSE callback returns.
-A crash, disconnect or kick keeps the outbox, and the next session resends
-it.
+Every mutation is local-first. A write is volatile until it is committed to
+the client SQLite database and the durable outbox by the background writer or
+by flush, close, fsync, truncate, unlink or rename; a crash loses only the
+uncommitted buffer. Namespace operations commit before the FUSE callback
+returns. Each namespace operation is one SQLite transaction; rename and unlink
+first commit the related inode's buffered content in a separate transaction,
+then change the names in one transaction. A size-changing setattr is one
+SETATTR operation with one outbox row; the client commits the new size, chunk
+list and metadata together, and the server applies them in one transaction. A
+crash leaves an operation fully visible or completely absent. A crash,
+disconnect or kick keeps the outbox, and the next session resends it.
 There is no in-process reconnect and no offline mode.
 .PP
 The outbox has a soft resident-memory budget of 1 GiB and one million

@@ -92,6 +92,21 @@ pub const HS_INFO: &[u8] = b"sm/v2/hs";
 /// HKDF info for the per-connection handshake key.
 pub const HS_SESSION_INFO: &[u8] = b"sm/v2/hs/session";
 
+/// HKDF info for the client-nonce handshake key that seals `AUTH`.
+///
+/// `AUTH` travels inside the first `HELLO`, before the client knows the
+/// server nonce, so its key can only be bound to the client nonce.
+pub const HS_AUTH_INFO: &[u8] = b"sm/v2/hs/auth";
+
+/// AAD domain for the sealed `AUTH` carried in `HELLO`.
+pub const AUTH_DOMAIN: &[u8] = b"sm/v2/auth\0";
+
+/// AAD domain for the sealed `ACCEPT` carried in `WELCOME`.
+pub const ACCEPT_DOMAIN: &[u8] = b"sm/v2/accept\0";
+
+/// Overhead of a detached seal: `alg u8 | nonce 12 | tag 16`.
+pub const DETACHED_OVERHEAD: usize = 1 + NONCE_LEN + TAG_LEN;
+
 /// BLAKE3 domain for the key identifier (44 §4.1).
 pub const KID_DOMAIN: &[u8] = b"sm/v2/kid";
 
@@ -253,7 +268,7 @@ impl fmt::Debug for PskSalt {
 /// `enc` seals steady-state frames, `ctrl` is reserved, and `hs` is the input
 /// keying material for per-connection handshake keys. The PSK itself never
 /// enters an AEAD.
-#[derive(Zeroize, ZeroizeOnDrop)]
+#[derive(Clone, Zeroize, ZeroizeOnDrop)]
 pub struct PskKeyRing {
     kid: u8,
     enc: [u8; 32],
@@ -346,6 +361,29 @@ impl PskKeyRing {
         salt.zeroize();
         Ok(HandshakeKeys { key, kid })
     }
+
+    /// Derive the key that seals `AUTH` inside `HELLO`.
+    ///
+    /// `salt = client_nonce`, `ikm = hs`, and the info string is
+    /// [`HS_AUTH_INFO`]. The client derives this key before it knows the
+    /// server nonce; the server derives the same key from the nonce it reads
+    /// in `HELLO`.
+    ///
+    /// # Errors
+    ///
+    /// [`CryptoError::Kdf`] only if HKDF rejects a 32-byte output.
+    pub fn auth_keys(&self, client_nonce: &[u8; 32]) -> Result<HandshakeKeys, CryptoError> {
+        let hk = Hkdf::<Sha256>::new(Some(client_nonce), &self.hs);
+        let mut key = [0u8; 32];
+        hk.expand(HS_AUTH_INFO, &mut key)
+            .map_err(|_| CryptoError::Kdf)?;
+
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(&key);
+        hasher.update(KID_DOMAIN);
+        let kid = hasher.finalize().as_bytes()[0];
+        Ok(HandshakeKeys { key, kid })
+    }
 }
 
 impl fmt::Debug for PskKeyRing {
@@ -391,10 +429,11 @@ impl fmt::Debug for SessionKey {
     }
 }
 
-/// A per-connection handshake key derived from both nonces.
+/// A per-connection handshake key.
 ///
-/// `AUTH` and `ACCEPT` are sealed with this key. The `WELCOME` server proof
-/// uses it too, through [`HandshakeKeys::seal_welcome_proof`].
+/// [`PskKeyRing::auth_keys`] derives the key that seals `AUTH` from the
+/// client nonce alone. [`PskKeyRing::handshake_keys`] derives the key that
+/// seals the `WELCOME` proof and the `ACCEPT` from both nonces.
 #[derive(Zeroize, ZeroizeOnDrop)]
 pub struct HandshakeKeys {
     key: [u8; 32],
@@ -407,7 +446,9 @@ impl HandshakeKeys {
         Self { key, kid }
     }
 
-    /// The envelope identifier placed in sealed `AUTH`/`ACCEPT` frames.
+    /// The envelope identifier used by [`HandshakeKeys::sealer`] and
+    /// [`HandshakeKeys::opener`]. Detached handshake sub-bodies do not carry
+    /// it: their format is `alg | nonce | ciphertext | tag`.
     pub const fn kid(&self) -> u8 {
         self.kid
     }
@@ -449,6 +490,75 @@ impl HandshakeKeys {
         body: &[u8],
     ) -> Result<Opened, CryptoError> {
         self.opener().open(header, prefix, body)
+    }
+
+    /// Seal a detached sub-body with an explicit nonce and AAD context.
+    ///
+    /// The output is `alg u8 | nonce 12 | ciphertext n | tag 16`, the same
+    /// layout as the `WELCOME` proof. `domain` separates handshake messages;
+    /// `context` binds the nonces that the caller already committed to.
+    ///
+    /// # Errors
+    ///
+    /// [`CryptoError::BadAlg`] if this build lacks the default algorithm.
+    pub fn seal_detached(
+        &self,
+        domain: &[u8],
+        context: &[u8],
+        plaintext: &[u8],
+        nonce: &[u8; NONCE_LEN],
+    ) -> Result<Vec<u8>, CryptoError> {
+        let aad = detached_aad(domain, context);
+        let mut out = Vec::with_capacity(DETACHED_OVERHEAD + plaintext.len());
+        out.push(DEFAULT_ALG);
+        out.extend_from_slice(nonce);
+        out.extend_from_slice(plaintext);
+        let tag = encrypt_in_place(
+            DEFAULT_ALG,
+            &self.key,
+            nonce,
+            &aad,
+            &mut out[1 + NONCE_LEN..],
+        )?;
+        out.extend_from_slice(&tag);
+        Ok(out)
+    }
+
+    /// Open a detached sub-body produced by [`HandshakeKeys::seal_detached`].
+    ///
+    /// # Errors
+    ///
+    /// [`CryptoError::Aead`] for a short or tampered envelope, or
+    /// [`CryptoError::BadAlg`] for an algorithm this build lacks.
+    pub fn open_detached(
+        &self,
+        domain: &[u8],
+        context: &[u8],
+        sealed: &[u8],
+    ) -> Result<Zeroizing<Vec<u8>>, CryptoError> {
+        if sealed.len() < DETACHED_OVERHEAD {
+            return Err(CryptoError::Aead);
+        }
+        let alg = sealed[0];
+        if !is_supported_alg(alg) {
+            return Err(CryptoError::BadAlg(alg));
+        }
+        let mut nonce = [0u8; NONCE_LEN];
+        nonce.copy_from_slice(&sealed[1..1 + NONCE_LEN]);
+        let tag_at = sealed.len() - TAG_LEN;
+        let mut tag = [0u8; TAG_LEN];
+        tag.copy_from_slice(&sealed[tag_at..]);
+        let mut plaintext = Zeroizing::new(sealed[1 + NONCE_LEN..tag_at].to_vec());
+        let aad = detached_aad(domain, context);
+        decrypt_in_place(
+            alg,
+            &self.key,
+            &nonce,
+            &aad,
+            plaintext.as_mut_slice(),
+            &tag,
+        )?;
+        Ok(plaintext)
     }
 
     /// Seal the `WELCOME` server proof.
@@ -522,6 +632,13 @@ impl HandshakeKeys {
             Err(CryptoError::Aead)
         }
     }
+}
+
+fn detached_aad(domain: &[u8], context: &[u8]) -> Vec<u8> {
+    let mut aad = Vec::with_capacity(domain.len() + context.len());
+    aad.extend_from_slice(domain);
+    aad.extend_from_slice(context);
+    aad
 }
 
 impl fmt::Debug for HandshakeKeys {
@@ -1749,7 +1866,7 @@ mod tests {
         let ring = PskKeyRing::derive(&[0x24; 32], &PskSalt::DEFAULT).unwrap();
         let keys = ring.handshake_keys(&[0x01; 32], &[0x02; 32]).unwrap();
         let nonces = NonceMinter::with_instance(0x1122_3344_5566_7788);
-        let mut header = FrameHeader::new(MsgType::AUTH, Flags::ENC, 0, Seq::UNSEQUENCED);
+        let mut header = FrameHeader::new(MsgType::ORDERED, Flags::ENC, 0, Seq::UNSEQUENCED);
         let plaintext = [0x77u8; 112];
         let sealed = keys
             .seal(&mut header, &Prefix::None, &plaintext, &nonces)

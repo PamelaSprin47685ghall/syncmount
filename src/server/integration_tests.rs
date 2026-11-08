@@ -10,7 +10,7 @@ use tokio::sync::mpsc;
 
 use crate::crypto::secret::MasterKey;
 use crate::protocol::crypto::{NonceMinter, PskKeyRing, PskSalt, Sealer};
-use crate::protocol::handshake::ClientHandshake;
+use crate::protocol::handshake::{ClientHandshake, ClientPhase};
 use crate::protocol::messages::{DataRef, Message, WcpWriter, fid};
 use crate::protocol::{
     Caps, ClientId, CtrlPrefix, Flags, FrameBuf, FrameDecoder, FrameHeader, FrameRef, Limits,
@@ -156,6 +156,46 @@ async fn recv_seq(rx: &mut mpsc::Receiver<Bytes>) -> FrameBuf {
     decode(&bytes)
 }
 
+async fn recv_ordered(rx: &mut mpsc::Receiver<Bytes>) -> FrameBuf {
+    loop {
+        let frame = recv_seq(rx).await;
+        if frame.header.msg_type == MsgType::ORDERED {
+            return frame;
+        }
+    }
+}
+
+fn write_op(
+    op_id: [u8; 16],
+    path: &str,
+    data: &[u8],
+    class: OpClass,
+    offset: Option<u64>,
+) -> WireOp {
+    WireOp {
+        op_id,
+        class,
+        path: path.to_owned(),
+        path2: None,
+        target: None,
+        mode: None,
+        uid: 1000,
+        gid: 1000,
+        mtime_ns: 1,
+        data: Some(DataRef {
+            session: SessionId(9),
+            total_len: data.len() as u64,
+            data_hash: *blake3::hash(data).as_bytes(),
+        }),
+        offset,
+        length: None,
+        lock_type: None,
+        lock_action: None,
+        lock_start: None,
+        lock_len: None,
+    }
+}
+
 #[tokio::test]
 async fn ordered_commits_are_serial_and_broadcast_with_unique_seq() {
     let harness = Harness::start().await;
@@ -232,6 +272,68 @@ async fn plan_reject_consumes_no_seq_and_reaches_only_the_author() {
     assert_eq!(
         snapshot.current_seq,
         Seq(1),
+        "a rejection must not consume a seq"
+    );
+    assert!(
+        data.try_recv().is_err(),
+        "a rejection must not be broadcast"
+    );
+
+    let _ = harness.stop().await;
+}
+
+#[tokio::test]
+async fn an_oversized_reject_state_becomes_a_resync_marker() {
+    let harness = Harness::start().await;
+    let (author, _, mut data, mut ctrl) = harness.attach(1, Seq::UNSEQUENCED).await;
+
+    harness
+        .sequencer
+        .ordered(author, request(create_op([1; 16], "/big")))
+        .await
+        .unwrap();
+    let _ = recv_ordered(&mut data).await;
+
+    // One MiB is sixteen chunks; the rejection state for this path carries
+    // the object, every chunk ref and every chunk's data.
+    let content = vec![0x5a; 1024 * 1024];
+    let mut write = request(write_op([2; 16], "/big", &content, OpClass::WRITE, None));
+    write.content = Some(content);
+    harness.sequencer.ordered(author, write).await.unwrap();
+    let _ = recv_ordered(&mut data).await;
+
+    harness
+        .sequencer
+        .ordered(author, request(create_op([3; 16], "/big")))
+        .await
+        .unwrap();
+    let error = recv_seq(&mut ctrl).await;
+    assert_eq!(error.header.msg_type, MsgType::ERROR);
+    let body = match decode_plain(MsgType::ERROR, &error.body, &Limits::default()).unwrap() {
+        Message::Error(error) => error,
+        other => panic!("expected ERROR, got {other:?}"),
+    };
+    let detail_max = usize::from(Limits::default().detail_max);
+    assert!(
+        body.detail.len() <= detail_max,
+        "detail is {} bytes, limit {detail_max}",
+        body.detail.len()
+    );
+    assert_eq!(&body.detail[..16], &[3; 16]);
+    assert_eq!(
+        u32::from_le_bytes(body.detail[20..24].try_into().unwrap()),
+        u32::MAX,
+        "an oversized state must become the resync sentinel"
+    );
+    let encoded = body.encode().unwrap();
+    let decoded = match decode_plain(MsgType::ERROR, &encoded, &Limits::default()).unwrap() {
+        Message::Error(error) => error,
+        other => panic!("expected ERROR, got {other:?}"),
+    };
+    assert_eq!(decoded.detail, body.detail);
+    assert_eq!(
+        harness.sequencer.snapshot().await.unwrap().current_seq,
+        Seq(2),
         "a rejection must not consume a seq"
     );
     assert!(
@@ -424,9 +526,17 @@ async fn write_persists_chunks_and_replay_content_round_trips() {
     let mut request = request(op);
     request.content = Some(bytes.clone());
     harness.sequencer.ordered(author, request).await.unwrap();
-    match tokio::time::timeout(Duration::from_secs(2), data.recv()).await {
-        Ok(Some(frame)) => {
-            let frame = decode(&frame);
+    match tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let frame = recv_seq(&mut data).await;
+            if frame.header.msg_type == MsgType::ORDERED {
+                return frame;
+            }
+        }
+    })
+    .await
+    {
+        Ok(frame) => {
             assert_eq!(frame.header.seq, Seq(2), "write must be sequenced");
         }
         _ => {
@@ -499,6 +609,81 @@ async fn write_persists_chunks_and_replay_content_round_trips() {
         };
     let extra = ordered.fields.get(fid::F_EXTRA).unwrap();
     assert_eq!(extra, write_event.payload.as_slice());
+
+    let _ = harness.stop().await;
+}
+
+/// A live PWRITE broadcast must describe the server's complete file, not the
+/// author's one-chunk patch. The frame is rebuilt from the committed event,
+/// and the content stream is the same complete file the replay path sends.
+#[tokio::test]
+async fn a_live_pwrite_broadcast_carries_the_server_file() {
+    let harness = Harness::start().await;
+    let (author, _, mut data, _) = harness.attach(1, Seq::UNSEQUENCED).await;
+    harness
+        .sequencer
+        .ordered(author, request(create_op([4; 16], "/w")))
+        .await
+        .unwrap();
+    let _ = recv_ordered(&mut data).await;
+
+    let initial: Vec<u8> = (0..100_000u32).map(|i| i as u8).collect();
+    let mut write = request(write_op([5; 16], "/w", &initial, OpClass::WRITE, None));
+    write.content = Some(initial.clone());
+    harness.sequencer.ordered(author, write).await.unwrap();
+    let _ = recv_ordered(&mut data).await;
+
+    let patch = b"Z";
+    let mut pwrite = request(write_op(
+        [6; 16],
+        "/w",
+        patch,
+        OpClass::PWRITE,
+        Some(0),
+    ));
+    pwrite.content = Some(patch.to_vec());
+    harness.sequencer.ordered(author, pwrite).await.unwrap();
+
+    let ring = PskKeyRing::derive(&psk(), &PskSalt::DEFAULT).unwrap();
+    let mut stream = Vec::new();
+    let ordered = loop {
+        let frame = recv_seq(&mut data).await;
+        match frame.header.msg_type {
+            MsgType::STREAM_DATA => {
+                let opened =
+                    crate::protocol::crypto::Opener::with_session_key(&ring.session_key())
+                        .open(&frame.header, &frame.prefix, &frame.body)
+                        .unwrap();
+                stream.extend_from_slice(opened.as_slice());
+            }
+            MsgType::ORDERED => break frame,
+            _ => {}
+        }
+    };
+    assert_eq!(ordered.header.seq, Seq(3));
+    let opened = crate::protocol::crypto::Opener::with_session_key(&ring.session_key())
+        .open(&ordered.header, &ordered.prefix, &ordered.body)
+        .unwrap();
+    let message = decode_sealed(MsgType::ORDERED, opened.as_slice(), &Limits::default()).unwrap();
+    let Message::Ordered(ordered) = message else {
+        panic!("expected ORDERED, got {message:?}");
+    };
+    let extra = ordered.fields.get(fid::F_EXTRA).unwrap();
+    let payload =
+        crate::store::sqlite::EventPayload::decode(crate::store::sqlite::EventKind::Write, extra)
+            .unwrap();
+    match payload {
+        crate::store::sqlite::EventPayload::Write { chunks, size, .. } => {
+            assert_eq!(size, 100_000);
+            assert_eq!(chunks.len(), 2, "the event describes the whole file");
+            assert_eq!(chunks[0].len, 65_536);
+            assert_eq!(chunks[1].len, 34_464);
+        }
+        other => panic!("expected a write payload, got {other:?}"),
+    }
+    let mut expected = initial;
+    expected[0] = b'Z';
+    assert_eq!(stream, expected, "the live stream is the server's file");
 
     let _ = harness.stop().await;
 }
@@ -610,10 +795,12 @@ async fn http_psk_handshake_then_ordered_broadcast() {
         Caps::REQUIRED,
         now_ms,
     );
-    let hello = client.hello().encode().unwrap();
+    let nonces = NonceMinter::new(&mut rand::rng());
+    let ctrl = CtrlPrefix::new(Seq::UNSEQUENCED, 0);
+    let hello = client.hello(&nonces, &ctrl).unwrap().encode().unwrap();
     let hello_frame = crate::server::sequencer::encode_control(
         MsgType::HELLO,
-        Prefix::Ctrl(CtrlPrefix::new(Seq::UNSEQUENCED, 0)),
+        Prefix::Ctrl(ctrl),
         &hello,
         Seq::UNSEQUENCED,
     )
@@ -628,35 +815,12 @@ async fn http_psk_handshake_then_ordered_broadcast() {
             Message::Welcome(welcome) => welcome,
             other => panic!("expected WELCOME, got {other:?}"),
         };
-    let auth = client
+    // One client flight and one server flight: the next frame after HELLO is
+    // WELCOME, and the client is steady as soon as it verifies that frame.
+    let session_key = client
         .on_welcome(&welcome, &welcome_frame.body, now_ms)
         .unwrap();
-    let nonces = NonceMinter::new(&mut rand::rng());
-    let mut auth_header = FrameHeader::new(MsgType::AUTH, Flags::ENC, 0, Seq::UNSEQUENCED);
-    let auth_body = client
-        .handshake_keys()
-        .unwrap()
-        .sealer(&nonces)
-        .seal(&mut auth_header, &Prefix::None, &auth.encode())
-        .unwrap();
-    transport
-        .send(Bytes::from(
-            encode_frame(&FrameRef::new(
-                &auth_header,
-                &Prefix::None,
-                auth_body.as_bytes(),
-            ))
-            .unwrap(),
-        ))
-        .await
-        .unwrap();
-
-    let accept_bytes = transport.recv().await.unwrap().unwrap();
-    let accept_frame = decode(&accept_bytes);
-    assert_eq!(accept_frame.header.msg_type, MsgType::ACCEPT);
-    let session_key = client
-        .open_accept(&accept_frame.header, &accept_frame.body, now_ms)
-        .unwrap();
+    assert_eq!(client.phase(), ClientPhase::Steady);
 
     let mut writer = WcpWriter::new();
     writer.bytes(fid::F_CLIENT_ID, &[3; 16]);
@@ -698,4 +862,161 @@ async fn http_psk_handshake_then_ordered_broadcast() {
     transport.close().await.unwrap();
     let _ = stop_tx.send(());
     task.await.unwrap();
+}
+
+#[tokio::test]
+async fn replayed_hello_is_closed_before_welcome() {
+    let server = Server::bind(ServeConfig::for_tests(), master())
+        .await
+        .unwrap();
+    let addr = server.local_addr().unwrap();
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(server.run_with_shutdown(async {
+        let _ = stop_rx.await;
+    }));
+
+    let endpoint = Endpoint::parse(&format!("http://{addr}/")).unwrap();
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let ring = PskKeyRing::derive(&psk(), &PskSalt::DEFAULT).unwrap();
+    let client = ClientHandshake::new(
+        ring,
+        ClientId::from_bytes([9; 16]),
+        [0x5a; 32],
+        ProtoVersion::CURRENT,
+        Caps::REQUIRED,
+        now_ms,
+    );
+    let ctrl = CtrlPrefix::new(Seq::UNSEQUENCED, 0);
+    let hello = client
+        .hello(&NonceMinter::new(&mut rand::rng()), &ctrl)
+        .unwrap()
+        .encode()
+        .unwrap();
+    let hello_frame = crate::server::sequencer::encode_control(
+        MsgType::HELLO,
+        Prefix::Ctrl(ctrl),
+        &hello,
+        Seq::UNSEQUENCED,
+    )
+    .unwrap();
+
+    // First use of the nonce succeeds.
+    let mut first = HttpTransport::dial(&endpoint, &DialOptions::random())
+        .await
+        .unwrap();
+    first.send(hello_frame.clone()).await.unwrap();
+    let welcome = first.recv().await.unwrap().unwrap();
+    assert_eq!(decode(&welcome).header.msg_type, MsgType::WELCOME);
+    first.close().await.unwrap();
+
+    // The same HELLO is a replay. The server must close before WELCOME.
+    let mut replay = HttpTransport::dial(&endpoint, &DialOptions::random())
+        .await
+        .unwrap();
+    replay.send(hello_frame).await.unwrap();
+    if let Ok(Ok(Some(bytes))) =
+        tokio::time::timeout(Duration::from_secs(3), replay.recv()).await
+    {
+        let frame = decode(&bytes);
+        assert_ne!(
+            frame.header.msg_type,
+            MsgType::WELCOME,
+            "a replayed HELLO must not be accepted"
+        );
+    }
+    let _ = replay.close().await;
+    let _ = stop_tx.send(());
+    task.await.unwrap();
+}
+
+#[tokio::test]
+async fn group_commit_broadcasts_a_batch_in_sequence_order() {
+    let harness = Harness::start().await;
+    let (first, _, mut first_data, _) = harness.attach(1, Seq::UNSEQUENCED).await;
+    let (_second, _, mut second_data, _) = harness.attach(2, Seq::UNSEQUENCED).await;
+
+    // Three operations enter the actor back to back, inside one window.
+    for index in 1..=3u8 {
+        harness
+            .sequencer
+            .ordered(
+                first,
+                request(create_op([index; 16], &format!("/f{index}"))),
+            )
+            .await
+            .unwrap();
+    }
+    for expected in 1..=3u64 {
+        let frame = recv_ordered(&mut first_data).await;
+        assert_eq!(frame.header.seq, Seq(expected));
+        let frame = recv_ordered(&mut second_data).await;
+        assert_eq!(frame.header.seq, Seq(expected));
+    }
+
+    let snapshot = harness.sequencer.snapshot().await.unwrap();
+    assert_eq!(snapshot.current_seq, Seq(3));
+    let db =
+        crate::store::sqlite::Db::open(&harness.path, crate::store::sqlite::Role::Server).unwrap();
+    let read = db.read().unwrap();
+    for index in 1..=3u8 {
+        assert!(
+            read.object_by_path(&format!("/f{index}")).unwrap().is_some(),
+            "/f{index} must be committed"
+        );
+    }
+    drop(read);
+    drop(db);
+
+    let _ = harness.stop().await;
+}
+
+#[tokio::test]
+async fn group_commit_keeps_rejections_out_of_the_transaction() {
+    let harness = Harness::start().await;
+    let (author, _, mut data, mut ctrl) = harness.attach(1, Seq::UNSEQUENCED).await;
+
+    // The middle operation is rejected; the two around it must still commit
+    // consecutively and the rejection must reach only the author.
+    harness
+        .sequencer
+        .ordered(author, request(create_op([1; 16], "/a")))
+        .await
+        .unwrap();
+    harness
+        .sequencer
+        .ordered(author, request(create_op([2; 16], "/a")))
+        .await
+        .unwrap();
+    harness
+        .sequencer
+        .ordered(author, request(create_op([3; 16], "/b")))
+        .await
+        .unwrap();
+
+    let first = recv_ordered(&mut data).await;
+    assert_eq!(first.header.seq, Seq(1));
+    let second = recv_ordered(&mut data).await;
+    assert_eq!(second.header.seq, Seq(2));
+    let error = recv_seq(&mut ctrl).await;
+    assert_eq!(error.header.msg_type, MsgType::ERROR);
+    let body = match decode_plain(MsgType::ERROR, &error.body, &Limits::default()).unwrap() {
+        Message::Error(error) => error,
+        other => panic!("expected ERROR, got {other:?}"),
+    };
+    assert_eq!(&body.detail[..16], &[2; 16]);
+    assert_eq!(
+        i32::from_le_bytes(body.detail[16..20].try_into().unwrap()),
+        crate::state::Errno::EEXIST.raw()
+    );
+    assert!(
+        data.try_recv().is_err(),
+        "the rejected operation must not be broadcast"
+    );
+
+    let snapshot = harness.sequencer.snapshot().await.unwrap();
+    assert_eq!(snapshot.current_seq, Seq(2));
+    let _ = harness.stop().await;
 }

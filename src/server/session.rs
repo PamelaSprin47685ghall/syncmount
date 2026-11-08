@@ -4,9 +4,9 @@
 //! connection state machine:
 //!
 //! ```text
-//! rpc     HELLO(plain) -> WELCOME(plain+proof) -> AUTH(sealed) -> ACCEPT(sealed)
+//! rpc     HELLO(plain + sealed AUTH) -> WELCOME(plain + proof + sealed ACCEPT)
 //!         then ORDERED/PING/LEAVE/RELAY frames sealed under the PSK enc key
-//! events  park under X-SM-Nonce; the handshake writes WELCOME/ACCEPT through it
+//! events  park under X-SM-Nonce; the handshake writes WELCOME through it
 //! writer  control first, then data; KICK is deferred until data drains
 //! replay  reads events from SQLite and pushes them before live broadcasts
 //! ```
@@ -91,7 +91,7 @@ struct RpcSession {
     generation: u64,
     ctrl_tx: mpsc::Sender<Bytes>,
     detach: DetachCause,
-    /// Steady-state PSK ring, derived once after `ACCEPT`.
+    /// Steady-state PSK ring, derived once the session attaches.
     ring: Arc<crate::protocol::crypto::PskKeyRing>,
     streams: HashMap<(SessionId, StreamId), DataStream>,
     assembled: HashMap<SessionId, Vec<u8>>,
@@ -168,14 +168,6 @@ impl DataStream {
 /// Uplink state before the session is attached.
 enum Phase {
     Hello,
-    Auth {
-        handshake: Box<ServerHandshake>,
-        downlink: Option<MpscSender>,
-        session_id: SessionId,
-        epoch_seen: u64,
-        applied_seq: Seq,
-        deadline: Instant,
-    },
     Steady(RpcSession),
 }
 
@@ -191,47 +183,6 @@ async fn run_rpc(
     let mut writer_closed: Option<oneshot::Receiver<()>> = None;
 
     'session: loop {
-        if let Phase::Auth { deadline, .. } = &phase {
-            let left = deadline.saturating_duration_since(Instant::now());
-            if left.is_zero() {
-                break 'session;
-            }
-            match tokio::time::timeout(left, body.next_bytes()).await {
-                Ok(Ok(Some(chunk))) => {
-                    if let Err(error) = decoder.push(&chunk) {
-                        let reason = error.to_wire().unwrap_or(TrnReason::BadFrame);
-                        send_error(&phase, reason, &[]);
-                        break 'session;
-                    }
-                    loop {
-                        match decoder.next_frame_owned() {
-                            Ok(Some(frame)) => match advance(
-                                &context,
-                                &mut phase,
-                                &mut writer_closed,
-                                peer,
-                                nonce,
-                                frame,
-                            )
-                            .await
-                            {
-                                Ok(Flow::Continue) => {}
-                                Ok(Flow::Close) => break 'session,
-                                Err(()) => break 'session,
-                            },
-                            Ok(None) => break,
-                            Err(error) => {
-                                let reason = error.to_wire().unwrap_or(TrnReason::BadFrame);
-                                send_error(&phase, reason, &[]);
-                                break 'session;
-                            }
-                        }
-                    }
-                    continue;
-                }
-                Ok(Ok(None)) | Ok(Err(_)) | Err(_) => break 'session,
-            }
-        }
         let next = match writer_closed.as_mut() {
             Some(closed) => {
                 tokio::select! {
@@ -299,94 +250,16 @@ async fn advance(
     frame: FrameBuf,
 ) -> Result<Flow, ()> {
     match phase {
-        Phase::Hello => start_hello(context, phase, peer, nonce, frame).await,
-        Phase::Auth {
-            handshake,
-            downlink,
-            session_id,
-            epoch_seen,
-            applied_seq,
-            deadline: _,
-        } => {
-            let epoch_seen = *epoch_seen;
-            let applied_seq = *applied_seq;
-            let session_id = *session_id;
-            let downlink = downlink.take().ok_or(())?;
-            let now_ms = now_millis();
-            let accepted = match handshake.open_auth(&frame.header, &frame.body, now_ms) {
-                Ok(accepted) => accepted,
-                Err(_) => return Err(()),
-            };
-            let mut accept_header =
-                FrameHeader::new(MsgType::ACCEPT, Flags::ENC, 0, Seq::UNSEQUENCED);
-            let nonces = NonceMinter::new(&mut rand::rng());
-            let sealed = accepted
-                .keys
-                .seal(
-                    &mut accept_header,
-                    &Prefix::None,
-                    &accepted.accept.encode(),
-                    &nonces,
-                )
-                .map_err(|_| ())?;
-            let accept = encode_frame(&FrameRef::new(
-                &accept_header,
-                &Prefix::None,
-                sealed.as_bytes(),
-            ))
-            .map_err(|_| ())?;
-            if downlink.send(Bytes::from(accept)).await.is_err() {
-                return Err(());
-            }
-
-            let (outbox, data, ctrl) = Outbox::new(&context.config.outbox);
-            let request = AttachRequest {
-                session_id,
-                nonce,
+        Phase::Hello => {
+            start_hello(
+                context,
+                phase,
+                writer_closed,
                 peer,
-                outbox,
-                epoch_seen,
-                applied_seq,
-            };
-            let reply = match context.sequencer.attach(request).await {
-                Ok(reply) => reply,
-                Err(_) => return Err(()),
-            };
-            let (closed_tx, closed_rx) = oneshot::channel();
-            tokio::spawn(run_writer(
-                downlink,
-                data,
-                ctrl,
-                Arc::clone(&reply.queued),
-                closed_tx,
-            ));
-            if reply.replay_from <= reply.current_seq {
-                tokio::spawn(run_replay(
-                    context.clone(),
-                    session_id,
-                    reply.generation,
-                    reply.replay_from,
-                    reply.current_seq,
-                    reply.replay_tx.clone(),
-                ));
-            }
-            *writer_closed = Some(closed_rx);
-            let ring = Arc::new(
-                context
-                    .master
-                    .derive_psk_keyring(&PskSalt::DEFAULT)
-                    .map_err(|_| ())?,
-            );
-            *phase = Phase::Steady(RpcSession {
-                session_id,
-                generation: reply.generation,
-                ctrl_tx: reply.ctrl_tx,
-                detach: DetachCause::Disconnected,
-                ring,
-                streams: HashMap::new(),
-                assembled: HashMap::new(),
-            });
-            Ok(Flow::Continue)
+                nonce,
+                frame,
+            )
+            .await
         }
         Phase::Steady(session) => handle_frame(context, session, frame).await,
     }
@@ -395,7 +268,8 @@ async fn advance(
 async fn start_hello(
     context: &SessionContext,
     phase: &mut Phase,
-    _peer: PeerId,
+    writer_closed: &mut Option<oneshot::Receiver<()>>,
+    peer: PeerId,
     nonce: u64,
     frame: FrameBuf,
 ) -> Result<Flow, ()> {
@@ -412,13 +286,6 @@ async fn start_hello(
         Ok(Message::Hello(hello)) => hello,
         _ => return Err(()),
     };
-    let now_ms = now_millis();
-    {
-        let mut guard = context.guard.lock().await;
-        if guard.check_and_record(hello.client_nonce, now_ms).is_err() {
-            return Err(());
-        }
-    }
     let ring = context
         .master
         .derive_psk_keyring(&PskSalt::DEFAULT)
@@ -436,21 +303,35 @@ async fn start_hello(
     let session_id = random_session_id();
     let server_nonce = random_32();
     let proof_nonce = random_12();
+    let accept_nonce = random_12();
     let input = HelloInput {
         session_id,
         server_nonce,
         proof_nonce,
+        accept_nonce,
         server_time: now_secs().max(0) as u64,
         resync: if ctrl.epoch_seen != epoch || ctrl.applied_seq > current_seq {
             crate::protocol::ResyncMode::Full
         } else {
             crate::protocol::ResyncMode::None
         },
+        ctrl: *ctrl,
     };
-    let reply = match handshake.on_hello(&hello, input, now_ms) {
-        Ok(reply) => reply,
+    // Authenticate before recording the nonce. An unauthenticated flood can
+    // therefore not evict a captured nonce from the bounded replay window.
+    // The lock spans the check, the verification and the record so two
+    // connections cannot both accept the same nonce.
+    let now_ms = now_millis();
+    let mut guard = context.guard.lock().await;
+    if guard.contains(hello.client_nonce, now_ms) {
+        return Err(());
+    }
+    let accepted = match handshake.on_hello(&hello, input) {
+        Ok(accepted) => accepted,
         Err(_) => return Err(()),
     };
+    guard.record(hello.client_nonce, now_ms);
+    drop(guard);
 
     let pair = match context.sequencer.pair(nonce).await {
         Ok(pair) => pair,
@@ -472,22 +353,64 @@ async fn start_hello(
     let welcome = encode_control(
         MsgType::WELCOME,
         Prefix::None,
-        &reply.body,
+        &accepted.body,
         Seq::UNSEQUENCED,
     )
     .map_err(|_| ())?;
     if downlink.send(welcome).await.is_err() {
         return Err(());
     }
-    *phase = Phase::Auth {
-        handshake: Box::new(handshake),
-        downlink: Some(downlink),
-        session_id,
+
+    // `HELLO.AUTH` already verified, so the session may attach immediately.
+    // `WELCOME` is queued on the events stream before the writer starts, so
+    // the client always sees it before any replayed or live frame.
+    let (outbox, data, ctrl_tx) = Outbox::new(&context.config.outbox);
+    let request = AttachRequest {
+        session_id: accepted.session_id,
+        nonce,
+        peer,
+        outbox,
         epoch_seen: ctrl.epoch_seen,
         applied_seq: ctrl.applied_seq,
-        deadline: Instant::now()
-            + std::time::Duration::from_millis(crate::protocol::handshake::AUTH_TIMEOUT_MS),
     };
+    let reply = match context.sequencer.attach(request).await {
+        Ok(reply) => reply,
+        Err(_) => return Err(()),
+    };
+    let (closed_tx, closed_rx) = oneshot::channel();
+    tokio::spawn(run_writer(
+        downlink,
+        data,
+        ctrl_tx,
+        Arc::clone(&reply.queued),
+        closed_tx,
+    ));
+    if reply.replay_from <= reply.current_seq {
+        tokio::spawn(run_replay(
+            context.clone(),
+            accepted.session_id,
+            reply.generation,
+            reply.replay_from,
+            reply.current_seq,
+            reply.replay_tx.clone(),
+        ));
+    }
+    *writer_closed = Some(closed_rx);
+    let ring = Arc::new(
+        context
+            .master
+            .derive_psk_keyring(&PskSalt::DEFAULT)
+            .map_err(|_| ())?,
+    );
+    *phase = Phase::Steady(RpcSession {
+        session_id: accepted.session_id,
+        generation: reply.generation,
+        ctrl_tx: reply.ctrl_tx,
+        detach: DetachCause::Disconnected,
+        ring,
+        streams: HashMap::new(),
+        assembled: HashMap::new(),
+    });
     Ok(Flow::Continue)
 }
 
@@ -676,7 +599,12 @@ async fn decode_ordered(
         Ok(op) => Ok(Some(op)),
         Err(reject) => {
             let op_id = ordered.op_id.to_bytes();
-            let detail = super::wire::reject_body(op_id, reject);
+            let detail = super::wire::reject_body(
+                op_id,
+                reject,
+                None,
+                usize::from(context.config.limits.detail_max),
+            );
             send_error_detail_steady(session, TrnReason::Protocol, &detail);
             Ok(None)
         }
@@ -880,31 +808,19 @@ async fn run_replay(
                         return;
                     }
                 }
-                // A stored wire carries the sender's random data session id.
-                // When content is replayed, the stream uses the event-derived
-                // session, so the ORDERED frame must be synthesized with the
-                // same id; the stored ciphertext would name a different one.
+                // Rebuild every frame from the stored event. The sidecar's
+                // author frame carries the author's payload, which is not
+                // necessarily what the server committed: paths resolve to
+                // server inodes and a PWRITE event describes the complete
+                // file. Live and replay receivers must see the same bytes.
                 // Synthesized frames are unsequenced and must be stamped.
-                let frame = if content.is_some() {
-                    super::wire::replay_ordered_with_content(
-                        &event,
-                        &ring,
-                        &nonces,
-                        content.as_ref().map(|(data, _)| data.as_slice()),
-                    )
-                    .and_then(|bytes| super::wire::with_seq(&bytes, Seq(seq)))
-                } else {
-                    match store.wire(event.seq).await {
-                        Ok(Some(bytes)) => super::wire::with_seq(&bytes, Seq(seq)),
-                        _ => super::wire::replay_ordered_with_content(
-                            &event,
-                            &ring,
-                            &nonces,
-                            None,
-                        )
-                        .and_then(|bytes| super::wire::with_seq(&bytes, Seq(seq))),
-                    }
-                };
+                let frame = super::wire::replay_ordered_with_content(
+                    &event,
+                    &ring,
+                    &nonces,
+                    content.as_ref().map(|(data, _)| data.as_slice()),
+                )
+                .and_then(|bytes| super::wire::with_seq(&bytes, Seq(seq)));
                 match frame {
                     Ok(bytes) => {
                         if tx.send(Bytes::from(bytes)).await.is_err() {

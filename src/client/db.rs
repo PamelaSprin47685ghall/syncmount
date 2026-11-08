@@ -6,12 +6,13 @@
 //! `objects`/`names`/`chunks`/`object_chunks` and appends the matching row to
 //! the durable `outbox` in the same commit.
 //!
-//! # Why two handles
+//! # Handles
 //!
-//! `store::sqlite::Db::write` needs `&mut Db`; `Db::read` needs only `&Db` and
-//! opens a fresh connection per call. One `Mutex<Db>` for writes and one for
-//! the short "open a reader" step keeps a FUSE read from serialising behind a
-//! large replay transaction.
+//! One `Mutex<Db>` owns the single writer. Reads lease a long-lived connection
+//! from an eight-connection [`ReadPool`], so a FUSE callback pays one
+//! `BEGIN DEFERRED` instead of opening SQLite. A third connection serves the
+//! background PASSIVE checkpoint, and `fsync` only syncs the WAL; copying WAL
+//! pages into the main database never sits on the `fsync` path.
 //!
 //! # Sequence and identity
 //!
@@ -27,17 +28,20 @@
 use std::ffi::OsStr;
 use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, MutexGuard, PoisonError};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rusqlite::{OptionalExtension, params};
 use rustix::fs::{FlockOperation, Mode, OFlags};
 
-use crate::store::sqlite::{
-    self, CHUNK_BYTES, ChunkRef, Db, EventKind, EventPayload, MetaValue, Object, ObjectKind, ROOT_INO,
-    ReadTx, Role, StoreError, WriteTx, keys,
-};
+use crate::client::writeback::{WriteBuffer, WritebackConfig, WritebackStats};
 use crate::store::Errno;
+use crate::store::sqlite::{
+    self, CHUNK_BYTES, ChunkRef, Db, EventKind, EventPayload, MetaValue, Object, ObjectKind,
+    ROOT_INO, ReadPool, ReadPoolStats, ReadTx, Role, StoreError, WriteTx, keys,
+};
 
 /// Local inode identity. The same 16 bytes are the `objects.ino` key and the
 /// left half of a `file_handle`.
@@ -54,6 +58,13 @@ const KEY_CLIENT_ID: &str = "client_id";
 
 /// `meta.cluster_id`: the PSK-derived namespace guard.
 const KEY_CLUSTER_ID: &str = "cluster_id";
+
+/// `meta.needs_resync`: a rejection needs the server's authoritative tree.
+pub(crate) const KEY_NEEDS_RESYNC: &str = "needs_resync";
+
+/// `meta.replay_local`: after a replica reset, re-apply the pending outbox
+/// locally once the server replay is caught up.
+pub(crate) const KEY_REPLAY_LOCAL: &str = "replay_local";
 
 /// One pending operation, as the uplink sees it.
 #[derive(Clone, Debug)]
@@ -122,10 +133,80 @@ pub enum ApplyOutcome {
     Rejected,
 }
 
+/// Background WAL-checkpoint policy.
+///
+/// `fsync` no longer checkpoints: it only syncs the WAL. A PASSIVE
+/// checkpoint runs on its own connection every `interval`, or earlier when
+/// the WAL grows past `wal_bytes`. PASSIVE never waits for a reader, so a
+/// long read delays the WAL reset but never the checkpoint call.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CheckpointConfig {
+    /// Longest time the WAL may go without a checkpoint.
+    pub interval: Duration,
+    /// WAL size that forces a checkpoint between intervals.
+    pub wal_bytes: u64,
+}
+
+impl Default for CheckpointConfig {
+    fn default() -> Self {
+        Self {
+            interval: Duration::from_secs(1),
+            wal_bytes: 64 * 1024 * 1024,
+        }
+    }
+}
+
+impl CheckpointConfig {
+    /// Read the policy from the environment.
+    ///
+    /// `SYNCMOUNT_CHECKPOINT_INTERVAL_MS` and
+    /// `SYNCMOUNT_CHECKPOINT_WAL_MIB` override the defaults; an unreadable or
+    /// zero value keeps the default.
+    pub fn from_env() -> Self {
+        let mut config = Self::default();
+        if let Some(ms) = env_u64("SYNCMOUNT_CHECKPOINT_INTERVAL_MS") {
+            config.interval = Duration::from_millis(ms.max(1));
+        }
+        if let Some(mib) = env_u64("SYNCMOUNT_CHECKPOINT_WAL_MIB") {
+            config.wal_bytes = mib.saturating_mul(1024 * 1024);
+        }
+        config
+    }
+}
+
+fn env_u64(key: &str) -> Option<u64> {
+    std::env::var(key).ok()?.parse().ok()
+}
+
+/// The background checkpoint thread and its stop flag.
+struct CheckpointThread {
+    stop: Arc<AtomicBool>,
+    thread: Mutex<Option<JoinHandle<()>>>,
+}
+
+impl CheckpointThread {
+    fn new() -> Self {
+        Self {
+            stop: Arc::new(AtomicBool::new(false)),
+            thread: Mutex::new(None),
+        }
+    }
+}
+
 /// The client database and its single-instance lock.
 pub struct ClientDb {
     write: Mutex<Db>,
-    reader: Mutex<Db>,
+    /// Long-lived read connections leased by FUSE callbacks.
+    readers: ReadPool,
+    /// One connection reserved for PASSIVE checkpoints and the shutdown
+    /// TRUNCATE. It never serves a read, so a checkpoint never contends with
+    /// the writer mutex.
+    maintenance: Mutex<Db>,
+    checkpoint: CheckpointThread,
+    checkpoint_config: CheckpointConfig,
+    /// Userspace write-back buffer. Reads consult it before SQLite; commits
+    /// drain it into one transaction per inode.
+    pub(crate) writeback: WriteBuffer,
     /// `flock(LOCK_EX | LOCK_NB)` on the database file, held for the process
     /// lifetime. Dropping the descriptor releases it.
     _lock: OwnedFd,
@@ -148,6 +229,31 @@ impl ClientDb {
     /// the WAL setup, schema migration and root insert. A second process on
     /// the same file fails with [`DbError::Locked`].
     pub fn open(path: impl AsRef<Path>, cluster: [u8; 16]) -> Result<Self, DbError> {
+        Self::open_with_configs(
+            path,
+            cluster,
+            WritebackConfig::default(),
+            CheckpointConfig::from_env(),
+        )
+    }
+
+    /// Open with an explicit write-back configuration.
+    #[cfg(test)]
+    pub(crate) fn open_with_writeback(
+        path: impl AsRef<Path>,
+        cluster: [u8; 16],
+        writeback: WritebackConfig,
+    ) -> Result<Self, DbError> {
+        Self::open_with_configs(path, cluster, writeback, CheckpointConfig::default())
+    }
+
+    /// Open with explicit write-back and checkpoint configurations.
+    pub(crate) fn open_with_configs(
+        path: impl AsRef<Path>,
+        cluster: [u8; 16],
+        writeback: WritebackConfig,
+        checkpoint: CheckpointConfig,
+    ) -> Result<Self, DbError> {
         let path = path.as_ref().to_path_buf();
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(DbError::Io)?;
@@ -169,17 +275,26 @@ impl ClientDb {
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
                 .map_err(DbError::Io)?;
         }
-        rustix::fs::flock(&lock, FlockOperation::NonBlockingLockExclusive)
-            .map_err(|err| match err {
+        rustix::fs::flock(&lock, FlockOperation::NonBlockingLockExclusive).map_err(
+            |err| match err {
                 rustix::io::Errno::WOULDBLOCK => DbError::Locked(path.clone()),
                 other => DbError::Io(std::io::Error::from(other)),
-            })?;
+            },
+        )?;
 
         let write = Db::open(&path, Role::Client)?;
-        let reader = Db::open(&path, Role::Client)?;
+        // `Db::open` canonicalises the path; readers must use the same
+        // absolute path so a later `chdir` cannot redirect them.
+        let path = write.path().to_path_buf();
+        let maintenance = Db::open(&path, Role::Client)?;
+        let readers = ReadPool::new(&path, Role::Client);
         let store = Self {
             write: Mutex::new(write),
-            reader: Mutex::new(reader),
+            readers,
+            maintenance: Mutex::new(maintenance),
+            checkpoint: CheckpointThread::new(),
+            checkpoint_config: checkpoint,
+            writeback: WriteBuffer::new(writeback),
             _lock: lock,
             path,
             cluster,
@@ -254,13 +369,160 @@ impl ClientDb {
         })
     }
 
+    // -- write-back buffer -------------------------------------------------
+
+    /// Start the periodic committer. The FUSE runtime calls this once the
+    /// database is shared; tests may call it to observe the interval.
+    pub fn start_writeback(self: &Arc<Self>) {
+        self.writeback.start(self);
+    }
+
+    /// Stop and join the periodic committer.
+    pub fn stop_writeback(&self) {
+        self.writeback.stop();
+    }
+
+    /// Start the background PASSIVE checkpoint thread.
+    ///
+    /// The thread runs every [`CheckpointConfig::interval`], or earlier when
+    /// the WAL file grows past [`CheckpointConfig::wal_bytes`]. It also
+    /// reclaims idle read connections.
+    pub fn start_checkpoint(self: &Arc<Self>) {
+        let mut slot = self
+            .checkpoint
+            .thread
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if slot.is_some() {
+            return;
+        }
+        self.checkpoint.stop.store(false, Ordering::Relaxed);
+        let weak = Arc::downgrade(self);
+        let stop = Arc::clone(&self.checkpoint.stop);
+        let config = self.checkpoint_config;
+        match std::thread::Builder::new()
+            .name("syncmount-checkpoint".to_owned())
+            .spawn(move || checkpoint_loop(weak, stop, config))
+        {
+            Ok(handle) => *slot = Some(handle),
+            Err(error) => {
+                tracing::warn!(
+                    event = "checkpoint",
+                    error = %error,
+                    "cannot start the checkpoint thread"
+                );
+            }
+        }
+    }
+
+    /// Stop and join the background checkpoint thread.
+    pub fn stop_checkpoint(&self) {
+        self.checkpoint.stop.store(true, Ordering::Relaxed);
+        let handle = self
+            .checkpoint
+            .thread
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        if let Some(handle) = handle {
+            let _ = handle.join();
+        }
+    }
+
+    /// Run one PASSIVE checkpoint now.
+    pub(crate) fn checkpoint_passive(&self) -> Result<(), DbError> {
+        let db = self
+            .maintenance
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        db.checkpoint_wal_passive()?;
+        Ok(())
+    }
+
+    /// Move the WAL back into the main database and truncate it.
+    ///
+    /// Called at unmount, after FUSE and the session have stopped.
+    #[cfg_attr(not(feature = "fuse"), allow(dead_code))]
+    pub(crate) fn checkpoint_truncate(&self) -> Result<(), DbError> {
+        let db = self
+            .maintenance
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        db.checkpoint_wal()?;
+        Ok(())
+    }
+
+    /// Size of the WAL file, or zero when there is none.
+    pub fn wal_bytes(&self) -> u64 {
+        std::fs::metadata(self.wal_path())
+            .map(|metadata| metadata.len())
+            .unwrap_or(0)
+    }
+
+    fn wal_path(&self) -> PathBuf {
+        let mut path = self.path.as_os_str().to_owned();
+        path.push("-wal");
+        PathBuf::from(path)
+    }
+
+    /// Sync the WAL file to stable storage without a checkpoint.
+    ///
+    /// A commit in WAL mode writes frames to the WAL but `synchronous=NORMAL`
+    /// does not fsync them. `fsync` only needs those frames on disk; the
+    /// background PASSIVE checkpoint decides when to copy them back.
+    pub(crate) fn sync_wal(&self) -> Result<(), DbError> {
+        match std::fs::File::open(self.wal_path()) {
+            Ok(file) => file.sync_all().map_err(DbError::Io),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(DbError::Io(error)),
+        }
+    }
+
+    /// Read-pool counters, for status and tests.
+    pub fn read_pool_stats(&self) -> ReadPoolStats {
+        self.readers.stats()
+    }
+
+    /// Close read connections that have been idle past the pool timeout.
+    pub fn reap_readers(&self) {
+        self.readers.reap_idle();
+    }
+
+    /// Commit every buffered write.
+    pub fn flush_all(&self) -> Result<(), DbError> {
+        self.writeback.flush_all(self)
+    }
+
+    /// Commit one inode's buffered writes.
+    pub fn flush_ino(&self, ino: Ino) -> Result<(), DbError> {
+        self.writeback.flush_ino(self, ino)
+    }
+
+    /// Write-back counters, for logs and status.
+    pub fn writeback_stats(&self) -> WritebackStats {
+        self.writeback.stats()
+    }
+
+    /// Commit everything, for the background thread.
+    pub(crate) fn commit_pending(&self) -> Result<(), DbError> {
+        self.writeback.flush_pending(self)
+    }
+
+    /// Test access to the buffer.
+    #[cfg(test)]
+    pub(crate) fn writeback(&self) -> &WriteBuffer {
+        &self.writeback
+    }
+
     // -- transactions ------------------------------------------------------
 
-    /// Open a consistent read snapshot. The lock is held only while the
-    /// connection is created; the returned transaction is independent.
+    /// Lease a pooled read connection and open a consistent snapshot.
+    ///
+    /// No connection is opened: the pool keeps up to eight readers alive and
+    /// hands one to this snapshot. Dropping the snapshot rolls the deferred
+    /// transaction back and returns the connection to the pool.
     pub fn read(&self) -> Result<ReadTx, DbError> {
-        let db = self.lock_reader();
-        Ok(db.read()?)
+        Ok(self.readers.read()?)
     }
 
     /// Run one immediate write transaction and commit it.
@@ -279,10 +541,6 @@ impl ClientDb {
         self.write.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    pub(crate) fn lock_reader(&self) -> MutexGuard<'_, Db> {
-        self.reader.lock().unwrap_or_else(PoisonError::into_inner)
-    }
-
     /// The durable watermark: the last server sequence applied to the tree.
     pub fn applied_seq(&self) -> Result<i64, DbError> {
         let tx = self.read()?;
@@ -293,6 +551,38 @@ impl ClientDb {
     pub fn epoch(&self) -> Result<i64, DbError> {
         let tx = self.read()?;
         Ok(tx.meta_i64(keys::EPOCH)?)
+    }
+
+    /// True when a rejection needs the server's authoritative tree.
+    pub fn needs_resync(&self) -> Result<bool, DbError> {
+        let tx = self.read()?;
+        Ok(tx.meta_i64(KEY_NEEDS_RESYNC).unwrap_or(0) != 0)
+    }
+
+    /// Record that the next handshake must rebuild the replica from the
+    /// server log. The rejected local effect stays until that replay.
+    pub fn mark_needs_resync(&self) -> Result<(), DbError> {
+        self.write(|tx| {
+            tx.set_meta_i64(KEY_NEEDS_RESYNC, 1)?;
+            Ok(())
+        })
+    }
+
+    /// Clear the resync request after the replica reset.
+    pub fn clear_needs_resync(&self) -> Result<(), DbError> {
+        self.write(|tx| {
+            tx.set_meta_i64(KEY_NEEDS_RESYNC, 0)?;
+            Ok(())
+        })
+    }
+
+    /// Consume the "re-apply the pending outbox after replay" flag.
+    pub fn take_replay_local(&self) -> Result<bool, DbError> {
+        self.write(|tx| {
+            let value = tx.meta_i64(KEY_REPLAY_LOCAL).unwrap_or(0);
+            tx.set_meta_i64(KEY_REPLAY_LOCAL, 0)?;
+            Ok(value != 0)
+        })
     }
 
     /// The protocol's self-declared client label.
@@ -421,12 +711,22 @@ impl ClientDb {
 
     /// Resolve one directory entry.
     pub fn lookup(&self, parent: Ino, name: &OsStr) -> Result<Object, DbError> {
+        // Hold the buffer read lock across the SQLite snapshot: a commit
+        // either still shows its committing copy here or has already made the
+        // bytes visible to the snapshot.
+        let state = self.writeback.state_read();
+        let mut object = self.lookup_durable(parent, name)?;
+        state.overlay_object(object.ino, &mut object);
+        Ok(object)
+    }
+
+    fn lookup_durable(&self, parent: Ino, name: &OsStr) -> Result<Object, DbError> {
         let name = name.to_str().ok_or(DbError::Errno(Errno::EINVAL))?;
         let tx = self.read()?;
-        let entry = tx.name(parent, name)?.ok_or(DbError::Errno(Errno::ENOENT))?;
-        let object = tx
-            .object(entry.ino)?
+        let entry = tx
+            .name(parent, name)?
             .ok_or(DbError::Errno(Errno::ENOENT))?;
+        let object = tx.object(entry.ino)?.ok_or(DbError::Errno(Errno::ENOENT))?;
         if object.deleted {
             return Err(DbError::Errno(Errno::ENOENT));
         }
@@ -435,6 +735,13 @@ impl ClientDb {
 
     /// Resolve an absolute path to its object.
     pub fn lookup_by_path(&self, path: &str) -> Result<Object, DbError> {
+        let state = self.writeback.state_read();
+        let mut object = self.lookup_by_path_durable(path)?;
+        state.overlay_object(object.ino, &mut object);
+        Ok(object)
+    }
+
+    fn lookup_by_path_durable(&self, path: &str) -> Result<Object, DbError> {
         let tx = self.read()?;
         let object = tx
             .object_by_path(path)?
@@ -447,6 +754,13 @@ impl ClientDb {
 
     /// Read one object.
     pub fn getattr(&self, ino: Ino) -> Result<Object, DbError> {
+        let state = self.writeback.state_read();
+        let mut object = self.getattr_durable(ino)?;
+        state.overlay_object(ino, &mut object);
+        Ok(object)
+    }
+
+    fn getattr_durable(&self, ino: Ino) -> Result<Object, DbError> {
         let tx = self.read()?;
         let object = tx.object(ino)?.ok_or(DbError::Errno(Errno::ENOENT))?;
         if object.deleted {
@@ -485,6 +799,13 @@ impl ClientDb {
     /// Holes are zero-filled. A chunk whose bytes are not cached yet is
     /// [`DbError::MissingChunk`], not silent zeroes.
     pub fn read_at(&self, ino: Ino, off: u64, len: u32) -> Result<Vec<u8>, DbError> {
+        let state = self.writeback.state_read();
+        let mut data = self.read_at_durable(ino, off, len)?;
+        state.overlay_read(ino, off, len, &mut data);
+        Ok(data)
+    }
+
+    fn read_at_durable(&self, ino: Ino, off: u64, len: u32) -> Result<Vec<u8>, DbError> {
         let tx = self.read()?;
         let object = tx.object(ino)?.ok_or(DbError::Errno(Errno::ENOENT))?;
         if object.deleted {
@@ -514,9 +835,7 @@ impl ClientDb {
             let chunk = tx
                 .chunk(chunk_ref.hash)?
                 .ok_or(DbError::MissingChunk(chunk_ref.hash))?;
-            let data = chunk
-                .data
-                .ok_or(DbError::MissingChunk(chunk_ref.hash))?;
+            let data = chunk.data.ok_or(DbError::MissingChunk(chunk_ref.hash))?;
             let from = (copy_start - chunk_start) as usize;
             let to = (copy_end - chunk_start) as usize;
             let at = (copy_start - start) as usize;
@@ -658,7 +977,6 @@ impl ClientDb {
             .ok_or(DbError::Errno(Errno::ENOENT))
     }
 
-
     /// Read an object inside a write transaction.
     pub(crate) fn object_in(tx: &WriteTx<'_>, ino: Ino) -> Result<Option<Object>, DbError> {
         let mut stmt = tx.conn().prepare(
@@ -671,10 +989,6 @@ impl ClientDb {
             Some(row) => Ok(Some(object_from_row(row)?)),
             None => Ok(None),
         }
-    }
-
-    pub(crate) fn object_in_read(tx: &ReadTx, ino: Ino) -> Result<Option<Object>, DbError> {
-        Ok(tx.object(ino)?)
     }
 
     pub(crate) fn object_chunks_in(tx: &WriteTx<'_>, ino: Ino) -> Result<Vec<ChunkRef>, DbError> {
@@ -691,12 +1005,17 @@ impl ClientDb {
     }
 
     /// Read a chunk's bytes inside a write transaction.
-    pub(crate) fn chunk_data_in(tx: &WriteTx<'_>, hash: [u8; 32]) -> Result<Option<Vec<u8>>, DbError> {
+    pub(crate) fn chunk_data_in(
+        tx: &WriteTx<'_>,
+        hash: [u8; 32],
+    ) -> Result<Option<Vec<u8>>, DbError> {
         let data: Option<Option<Vec<u8>>> = tx
             .conn()
-            .query_row("SELECT data FROM chunks WHERE hash = ?1", [hash.as_slice()], |row| {
-                row.get(0)
-            })
+            .query_row(
+                "SELECT data FROM chunks WHERE hash = ?1",
+                [hash.as_slice()],
+                |row| row.get(0),
+            )
             .optional()?;
         Ok(data.flatten())
     }
@@ -736,25 +1055,12 @@ impl ClientDb {
         })
     }
 
-    /// Store a chunk reference without bytes (a remote write whose stream has
-    /// not arrived yet).
-    pub(crate) fn put_chunk_ref_lazy(
+    /// The canonical all-zero chunk of `len` bytes, stored once per length.
+    pub(crate) fn zero_chunk(
         tx: &WriteTx<'_>,
         chunk_no: u32,
-        hash: [u8; 32],
         len: u32,
     ) -> Result<ChunkRef, DbError> {
-        tx.put_chunk(hash, len, None)?;
-        Ok(ChunkRef {
-            chunk_no,
-            hash,
-            offset: u64::from(chunk_no) * CHUNK,
-            len,
-        })
-    }
-
-    /// The canonical all-zero chunk of `len` bytes, stored once per length.
-    pub(crate) fn zero_chunk(tx: &WriteTx<'_>, chunk_no: u32, len: u32) -> Result<ChunkRef, DbError> {
         let data = vec![0u8; len as usize];
         Self::put_chunk_ref(tx, chunk_no, &data)
     }
@@ -769,8 +1075,8 @@ impl ClientDb {
         let count = size.div_ceil(CHUNK);
         let mut out = Vec::with_capacity(count as usize);
         for chunk_no in 0..count {
-            let chunk_no = u32::try_from(chunk_no)
-                .map_err(|_| DbError::Corrupt("too many chunks"))?;
+            let chunk_no =
+                u32::try_from(chunk_no).map_err(|_| DbError::Corrupt("too many chunks"))?;
             let expected_len = (size - u64::from(chunk_no) * CHUNK).min(CHUNK) as u32;
             let reference = match by_no.get(&chunk_no) {
                 Some(existing) if existing.len == expected_len => existing.clone(),
@@ -779,6 +1085,58 @@ impl ClientDb {
             out.push(reference);
         }
         Ok(out)
+    }
+}
+
+/// Background loop: PASSIVE checkpoint on the maintenance connection.
+///
+/// Polls a little faster than the interval so a WAL that crosses
+/// `wal_bytes` between ticks is checkpointed early. PASSIVE never blocks the
+/// writer or a reader; when a long read pins the WAL, the checkpoint simply
+/// stops at the oldest snapshot and the next tick retries.
+fn checkpoint_loop(db: std::sync::Weak<ClientDb>, stop: Arc<AtomicBool>, config: CheckpointConfig) {
+    let poll = Duration::from_millis(100).min(config.interval.max(Duration::from_millis(1)));
+    let mut last = Instant::now();
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            return;
+        }
+        std::thread::sleep(poll);
+        let Some(db) = db.upgrade() else {
+            return;
+        };
+        if stop.load(Ordering::Relaxed) {
+            return;
+        }
+        let due = last.elapsed() >= config.interval;
+        let full = db.wal_bytes() > config.wal_bytes;
+        if due || full {
+            if let Err(error) = db.checkpoint_passive() {
+                tracing::warn!(
+                    event = "checkpoint",
+                    error = %error,
+                    "PASSIVE checkpoint failed; will retry"
+                );
+            }
+            last = Instant::now();
+        }
+        db.reap_readers();
+    }
+}
+
+impl Drop for ClientDb {
+    fn drop(&mut self) {
+        // A normal process exit commits what is still buffered. A crash does
+        // not run this method; the volatile window is documented.
+        self.stop_checkpoint();
+        self.writeback.stop();
+        if let Err(error) = self.writeback.flush_all(self) {
+            tracing::warn!(
+                event = "writeback_drop_flush",
+                error = %error,
+                "could not commit buffered writes while closing the client database"
+            );
+        }
     }
 }
 
@@ -942,13 +1300,20 @@ mod tests {
     fn create_write_read_roundtrip_and_durable_outbox() {
         let (dir, db) = open();
         let file = db
-            .create_file(ROOT_INO, OsStr::new("f"), CreateAttrs::new(0o644, 1000, 1000))
+            .create_file(
+                ROOT_INO,
+                OsStr::new("f"),
+                CreateAttrs::new(0o644, 1000, 1000),
+            )
             .unwrap();
         assert_eq!(db.write_at(file.ino, 0, b"hello").unwrap(), 5);
         assert_eq!(db.read_at(file.ino, 0, 5).unwrap(), b"hello");
         let looked = db.lookup(ROOT_INO, OsStr::new("f")).unwrap();
         assert_eq!(looked.size, 5);
         assert_eq!(looked.nlink, 1);
+        // The write is visible but still volatile.
+        assert_eq!(db.outbox_count(OutboxState::Pending).unwrap(), 1);
+        db.flush_all().unwrap();
         assert_eq!(db.outbox_count(OutboxState::Pending).unwrap(), 2);
         assert!(db.fuse_ino(file.ino).unwrap() >= 2);
         drop(db);
@@ -979,8 +1344,14 @@ mod tests {
             .collect();
         assert_eq!(names, vec!["d".to_owned()]);
 
-        db.rename(ROOT_INO, OsStr::new("d"), ROOT_INO, OsStr::new("e"), Default::default())
-            .unwrap();
+        db.rename(
+            ROOT_INO,
+            OsStr::new("d"),
+            ROOT_INO,
+            OsStr::new("e"),
+            Default::default(),
+        )
+        .unwrap();
         assert!(db.lookup(ROOT_INO, OsStr::new("d")).is_err());
         assert_eq!(db.lookup(ROOT_INO, OsStr::new("e")).unwrap().ino, sub.ino);
         assert_eq!(db.lookup(sub.ino, OsStr::new("f")).unwrap().ino, file.ino);
@@ -989,6 +1360,108 @@ mod tests {
         db.unlink(sub.ino, OsStr::new("f")).unwrap();
         db.rmdir(ROOT_INO, OsStr::new("e")).unwrap();
         assert!(db.children(ROOT_INO).unwrap().is_empty());
+    }
+
+    #[test]
+    fn rename_between_two_links_of_one_inode_is_a_no_op() {
+        let (_dir, db) = open();
+        let file = db
+            .create_file(ROOT_INO, OsStr::new("a"), CreateAttrs::new(0o644, 0, 0))
+            .unwrap();
+        db.link(file.ino, ROOT_INO, OsStr::new("b")).unwrap();
+        let before = db.outbox_count(OutboxState::Pending).unwrap();
+        db.rename(
+            ROOT_INO,
+            OsStr::new("a"),
+            ROOT_INO,
+            OsStr::new("b"),
+            Default::default(),
+        )
+        .unwrap();
+        // POSIX keeps both names and reports success.
+        assert_eq!(db.lookup(ROOT_INO, OsStr::new("a")).unwrap().ino, file.ino);
+        assert_eq!(db.lookup(ROOT_INO, OsStr::new("b")).unwrap().ino, file.ino);
+        assert_eq!(db.getattr(file.ino).unwrap().nlink, 2);
+        assert_eq!(db.outbox_count(OutboxState::Pending).unwrap(), before);
+    }
+
+    #[test]
+    fn rename_of_a_hard_link_names_the_renamed_entry() {
+        let (_dir, db) = open();
+        let file = db
+            .create_file(ROOT_INO, OsStr::new("a"), CreateAttrs::new(0o644, 0, 0))
+            .unwrap();
+        db.link(file.ino, ROOT_INO, OsStr::new("b")).unwrap();
+        db.rename(
+            ROOT_INO,
+            OsStr::new("b"),
+            ROOT_INO,
+            OsStr::new("c"),
+            Default::default(),
+        )
+        .unwrap();
+        assert_eq!(db.lookup(ROOT_INO, OsStr::new("c")).unwrap().ino, file.ino);
+        let source: String = db
+            .read()
+            .unwrap()
+            .conn()
+            .query_row(
+                "SELECT path FROM outbox WHERE kind = 'rename'
+                  ORDER BY created_at DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        // The event must name /b, the entry that was renamed, not /a.
+        assert_eq!(source, "/b");
+    }
+
+    #[test]
+    fn a_sparse_writeback_commit_carries_a_contiguous_chunk_run() {
+        let (_dir, db) = open();
+        let file = db
+            .create_file(ROOT_INO, OsStr::new("sparse"), CreateAttrs::new(0o644, 0, 0))
+            .unwrap();
+        db.write_at(file.ino, 0, b"A").unwrap();
+        db.write_at(file.ino, 200_000, b"B").unwrap();
+        db.flush_all().unwrap();
+
+        assert_eq!(db.getattr(file.ino).unwrap().size, 200_001);
+        assert_eq!(db.read_at(file.ino, 0, 1).unwrap(), b"A");
+        assert_eq!(db.read_at(file.ino, 199_999, 2).unwrap(), b"\0B");
+        assert_eq!(db.read_at(file.ino, 1, 65_535).unwrap(), vec![0u8; 65_535]);
+
+        let read = db.read().unwrap();
+        let op_id: Vec<u8> = read
+            .conn()
+            .query_row(
+                "SELECT op_id FROM outbox WHERE kind = 'write'
+                  ORDER BY created_at DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let mut statement = read
+            .conn()
+            .prepare(
+                "SELECT chunk_no, len FROM outbox_chunks
+                  WHERE op_id = ?1 ORDER BY chunk_no",
+            )
+            .unwrap();
+        let rows: Vec<(i64, i64)> = statement
+            .query_map([op_id.as_slice()], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                (0, 65_536),
+                (1, 65_536),
+                (2, 65_536),
+                (3, 3_393),
+            ]
+        );
     }
 
     #[test]
@@ -1002,7 +1475,10 @@ mod tests {
         db.write_at(file.ino, 0, &data).unwrap();
         assert_eq!(db.getattr(file.ino).unwrap().size, 100_000);
         assert_eq!(db.getattr(file.ino).unwrap().block_count, 2);
-        assert_eq!(db.read_at(file.ino, 65_530, 20).unwrap(), &data[65_530..65_550]);
+        assert_eq!(
+            db.read_at(file.ino, 65_530, 20).unwrap(),
+            &data[65_530..65_550]
+        );
 
         // A partial overwrite inside the second chunk keeps the first intact.
         db.write_at(file.ino, 70_000, b"XYZ").unwrap();
@@ -1035,5 +1511,124 @@ mod tests {
         drop(db);
         let error = ClientDb::open(dir.path().join("client.db"), [8u8; 16]);
         assert!(matches!(error, Err(DbError::ClusterMismatch)));
+    }
+
+    #[test]
+    fn pooled_reads_reuse_a_connection_and_keep_their_snapshot() {
+        let (_dir, db) = open();
+        db.write(|tx| {
+            tx.set_meta_i64("snapshot_probe", 1)?;
+            Ok(())
+        })
+        .unwrap();
+        let before = db.read().unwrap();
+        assert_eq!(before.meta_i64("snapshot_probe").unwrap(), 1);
+        db.write(|tx| {
+            tx.set_meta_i64("snapshot_probe", 2)?;
+            Ok(())
+        })
+        .unwrap();
+        // The leased snapshot keeps the value it opened with.
+        assert_eq!(before.meta_i64("snapshot_probe").unwrap(), 1);
+        let stats = db.read_pool_stats();
+        assert_eq!(stats.opens, 1, "the pool opened exactly one reader");
+        assert_eq!(stats.live, 1);
+        drop(before);
+        // The returned connection is reused, and a new snapshot sees the
+        // committed value.
+        let after = db.read().unwrap();
+        assert_eq!(after.meta_i64("snapshot_probe").unwrap(), 2);
+        assert_eq!(db.read_pool_stats().opens, 1);
+    }
+
+    #[test]
+    fn fsync_syncs_the_wal_without_checkpointing_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = ClientDb::open_with_configs(
+            dir.path().join("client.db"),
+            [7u8; 16],
+            WritebackConfig::default(),
+            CheckpointConfig {
+                interval: Duration::from_secs(3600),
+                wal_bytes: u64::MAX,
+            },
+        )
+        .unwrap();
+        let file = db
+            .create_file(ROOT_INO, OsStr::new("f"), CreateAttrs::new(0o644, 0, 0))
+            .unwrap();
+        db.write_at(file.ino, 0, &[7u8; 4096]).unwrap();
+        db.fsync().unwrap();
+        // The WAL still holds the commit: fsync must not truncate it.
+        assert!(db.wal_bytes() > 0);
+        assert_eq!(db.read_at(file.ino, 0, 4096).unwrap(), vec![7u8; 4096]);
+        db.checkpoint_truncate().unwrap();
+        assert_eq!(db.wal_bytes(), 0);
+        assert_eq!(db.read_at(file.ino, 0, 4096).unwrap(), vec![7u8; 4096]);
+    }
+
+    #[test]
+    fn a_passive_checkpoint_does_not_wait_for_a_long_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = ClientDb::open_with_configs(
+            dir.path().join("client.db"),
+            [7u8; 16],
+            WritebackConfig::default(),
+            CheckpointConfig::default(),
+        )
+        .unwrap();
+        // Hold a snapshot from before the write, so the checkpoint cannot
+        // reset the WAL past it.
+        let held = db.read().unwrap();
+        let file = db
+            .create_file(ROOT_INO, OsStr::new("f"), CreateAttrs::new(0o644, 0, 0))
+            .unwrap();
+        db.write_at(file.ino, 0, &[9u8; 4096]).unwrap();
+        db.fsync().unwrap();
+        let before = db.wal_bytes();
+        assert!(before > 0);
+        // `fsync` only syncs the WAL; an open snapshot cannot make it wait
+        // for a checkpoint.
+        let started = Instant::now();
+        db.fsync().unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "fsync waited for the read snapshot"
+        );
+        db.checkpoint_passive().unwrap();
+        // The read still pins its snapshot; the checkpoint returns anyway.
+        assert!(db.wal_bytes() > 0);
+        assert_eq!(held.meta_i64(keys::APPLIED_SEQ).unwrap(), 0);
+        drop(held);
+        db.checkpoint_truncate().unwrap();
+        assert_eq!(db.wal_bytes(), 0);
+    }
+
+    #[test]
+    fn a_passive_checkpoint_bounds_the_wal() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = ClientDb::open_with_configs(
+            dir.path().join("client.db"),
+            [7u8; 16],
+            WritebackConfig::default(),
+            CheckpointConfig::default(),
+        )
+        .unwrap();
+        let file = db
+            .create_file(ROOT_INO, OsStr::new("f"), CreateAttrs::new(0o644, 0, 0))
+            .unwrap();
+        for round in 0..20u64 {
+            let offset = round * 65_536;
+            db.write_at(file.ino, offset, &[round as u8; 65_536])
+                .unwrap();
+            db.flush_all().unwrap();
+            db.checkpoint_passive().unwrap();
+        }
+        // Without checkpoints this loop would leave ~1.3 MiB of WAL frames.
+        assert!(
+            db.wal_bytes() < 1024 * 1024,
+            "WAL grew to {} bytes",
+            db.wal_bytes()
+        );
     }
 }

@@ -42,8 +42,9 @@ disconnect or kick keeps the rows, and the next session resends them.
 
 ## Status
 
-v0.1.0, protocol 2.0. The v1 identity and join machinery has been removed;
-protocol 2.0 is a clean break, and a 1.0 peer is rejected during negotiation.
+v0.1.0, protocol 3.0. The v1 identity and join machinery has been removed;
+protocol 3.0 is a clean break from the 2.0 wire format, and 1.0 and 2.0 peers
+are rejected during negotiation.
 
 The current implementation covers the shared SQLite store, the server
 sequencer and event log, the PSK handshake, the FUSE-over-SQLite client, the
@@ -102,14 +103,15 @@ The 16-byte namespace id is `BLAKE3("sm/v2/namespace\0" ‖ PSK)[..16]`. It is
 derived from the password, not from the URL. The URL only chooses the
 connection target and the HTTP namespace prefix. Every client and the server
 must use the same password; a wrong password derives a different key and fails
-at the `WELCOME` proof before `AUTH` is sent (exit 4). The client database also
-records the namespace id and refuses to open under a different password.
+at the sealed `AUTH` inside `HELLO` (exit 4). The client database also records
+the namespace id and refuses to open under a different password.
 
-The handshake is `HELLO` (plain) → `WELCOME` (plain body plus server proof) →
-`AUTH` (sealed) → `ACCEPT` (sealed); steady-state frames are sealed with a
-per-session key derived from the PSK and both handshake nonces. There is no
-perfect forward secrecy and no in-band rotation: a new password means a new
-namespace id and new databases.
+The handshake is one round trip: `HELLO` (plain body carrying a sealed `AUTH`)
+→ `WELCOME` (plain body carrying a server proof and a sealed `ACCEPT`).
+`AUTH` and `ACCEPT` are sealed sub-bodies, not frame types; steady-state frames
+are sealed with a per-session key derived from the PSK. There is no perfect
+forward secrecy and no in-band rotation: a new password means a new namespace
+id and new databases.
 
 ## Commands
 
@@ -251,11 +253,37 @@ mountpoint and unit name. Set the same `SYNCMOUNT_RUN_DIR` when running
 
 ## Consistency and durability
 
-Every mutation is local-first. `write`, `truncate`, `setattr`, `create`,
-`mkdir`, `unlink`, `rmdir`, `rename`, `symlink`, `link` and lock operations
-commit one SQLite transaction that updates the replica and appends the outbox
-row before the FUSE callback returns. There is no synchronous arbitration round
-trip and no in-memory-only queue. Reads always use the local replica.
+Every mutation is local-first. A `write` appends to a per-inode memory
+buffer and returns; the bytes are visible to local reads at once, but SQLite
+has not seen them yet. A background thread commits each dirty inode as one
+SQLite transaction that updates the object row, the full chunk list, the size
+and the matching outbox row, every 100 ms and whenever the soft buffer cap
+forces it. `flush`, `release` (close), `fsync`, `truncate`, a size-changing
+`setattr`, `unlink` and `rename` commit the affected buffer synchronously
+first; `create`, `mkdir`, `symlink`, `link` and `rmdir` commit before
+returning. There is no synchronous arbitration round trip. Reads use the
+local replica plus the uncommitted buffer.
+
+Operation boundaries are explicit. One FUSE write request is inserted
+atomically; coalesced requests may share a transaction, but each request is
+fully in it or absent. `create`, `mkdir`, `symlink`, `link`, `rmdir`,
+`unlink`, `rename`, `truncate` and `setattr` each use one SQLite transaction.
+`rename`/`unlink` first commit the related inode's buffered content in a
+separate transaction, then change names and objects in one transaction. A
+size-changing `setattr` is one `SETATTR` operation: the client commits the
+new chunk list, the metadata and one outbox row in one transaction, and the
+server applies the size and metadata as one change set in one transaction. A
+crash therefore leaves each operation either fully visible or completely
+absent; it cannot leave a committed size with half its chunks, or a renamed
+name without its content.
+
+The buffer is volatile. A process crash loses every write that has not been
+committed: at most the current flush interval under normal load, or more if
+the soft cap is exceeded and the synchronous commit fails. A normal exit
+commits the buffer. The soft cap defaults to 64 MiB and only forces an early
+commit; it never turns a local write into `ENOSPC`. The outbox row is created
+at commit, so its sequence order matches the SQLite transaction and a
+namespace operation always follows the writes it covers.
 
 The outbox row moves through four states:
 
@@ -268,17 +296,25 @@ The outbox row moves through four states:
 
 A new session resets `sent` back to `pending` and resends it. The server
 deduplicates by `op_id`, so a resend after a lost acknowledgement receives the
-original sequence and does not create a second event. A rejection does not
-roll back the local SQLite effect. A rejected namespace operation (for example
-a create that lost a race) leaves the local name and object graph as the local
-transaction wrote it, and the server's create event for the winner does not
-overwrite an existing local name. The replica can stay diverged until an epoch change or
-a new import. Writes to an existing path are last-writer-wins and do converge.
+original sequence and does not create a second event. The client's own data
+echo is matched by `op_id` and only acknowledges the outbox row; it never
+re-applies the payload, so an older echo cannot shrink a file that newer local
+writes have extended. A rename or link echo is applied: the server resolves
+paths, so its event may name a different inode than the optimistic local
+operation. A rejection does not roll back the local SQLite effect. The outbox
+row stays in the local database as a `failed` tombstone with the server's
+errno; the server never applies it, and ordinary reconnects do not resend or
+repair it. A rejected namespace operation (for example a create that lost a
+race) leaves the local name and object graph as the local transaction wrote it.
+The replica can stay diverged until an epoch change or a new import. Writes to
+an existing path are last-writer-wins and do converge.
 
-`fsync`/`fdatasync` run `PRAGMA wal_checkpoint(TRUNCATE)` on the client
-database. They make the local SQLite file durable; they do not wait for the
-cluster. The database uses WAL and `synchronous=FULL`, so a committed
-transaction survives a crash even before the checkpoint.
+`fsync`/`fdatasync` first commit every buffered write, then run
+`PRAGMA wal_checkpoint(TRUNCATE)` on the client database. They make the local
+SQLite file durable; they do not wait for the cluster. The database uses WAL
+and `synchronous=FULL`, so a committed transaction survives a crash even
+before the checkpoint. Closing a file (`flush`/`release`) commits that file
+but does not checkpoint the WAL.
 
 A transport failure, kick or protocol violation unmounts the client and exits
 10. There is no in-process reconnect and no offline mode.
@@ -384,10 +420,11 @@ is [`docs/threat-model.md`](docs/threat-model.md).
 - **Reads can be stale and JOIN is readable.** The convergence window is about
   0.1 s on a LAN and about 1 s on a public network. A joining client allows
   reads while it replays.
-- **A rejection does not roll back local state.** The outbox row becomes
-  `failed`, and a rejected namespace operation can leave the replica diverged
-  until an epoch change or a new import. Writes to an existing path converge by
-  last-writer-wins.
+- **A rejection does not roll back local state.** The outbox row becomes a
+  `failed` tombstone with the server's errno; the server never applies it, and
+  ordinary reconnects do not resend or repair it. A rejected namespace
+  operation can leave the replica diverged until an epoch change or a new
+  import. Writes to an existing path converge by last-writer-wins.
 - **No HA, no multi-tenant routing, no P2P.** One process serves one
   namespace. All traffic goes through the server. There is no independent
   fsck, broadcast log or content verification pass; a full replay is the

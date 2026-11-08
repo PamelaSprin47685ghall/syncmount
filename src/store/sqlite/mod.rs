@@ -49,15 +49,19 @@ mod tests;
 
 pub use event::{
     EventDraft, EventKind, EventPayload, EventRow, InsertedEvent, MAX_PAYLOAD_BYTES,
-    PAYLOAD_VERSION,
+    PAYLOAD_VERSION, PAYLOAD_VERSION_V1,
 };
+#[cfg(test)]
+pub(crate) use event::V1_SETATTR_BYTES;
 pub use hash::{chunk_hash, file_root};
 pub use schema::{CHUNK_BYTES, ROOT_INO, ROOT_MODE, ROOT_NLINK, keys};
-pub use types::{Chunk, ChunkRef, MetaValue, Name, Object, ObjectKind, OpId};
+pub use types::{Chunk, ChunkRef, MetaValue, Name, Object, ObjectKind, OpId, RejectState};
 
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rusqlite::types::Value;
 use rusqlite::{
@@ -155,7 +159,7 @@ pub enum StoreError {
     #[error("event payload codec: {0}")]
     Codec(String),
 
-    #[error("event payload version {found} is not supported (expected {supported})")]
+    #[error("event payload version {found} is not supported (current is {supported})")]
     PayloadVersion { found: u8, supported: u8 },
 
     #[error("event payload is {payload} but the row says {kind}")]
@@ -240,7 +244,7 @@ impl Db {
         // Readers reopen by path, so store an absolute, symlink-resolved path:
         // a later `chdir` in the daemon must not redirect them.
         let path = std::fs::canonicalize(&path).unwrap_or(path);
-        configure(&conn)?;
+        configure(&conn, role)?;
         schema::migrate(&mut conn, role)?;
         Ok(Self { conn, role, path })
     }
@@ -265,19 +269,15 @@ impl Db {
     /// The connection is opened `READ_WRITE` (not `READ_ONLY`) so it can
     /// recover the WAL even if the writer closes first, then pinned with
     /// `query_only=ON` so no write can escape through it. A caller that wants
-    /// many concurrent readers opens many `ReadTx` values; a future read pool
-    /// can cache the underlying connections.
+    /// many concurrent readers opens many `ReadTx` values; [`ReadPool`] caches
+    /// the underlying connections for the client.
     pub fn read(&self) -> Result<ReadTx> {
-        let conn = Connection::open_with_flags(
-            &self.path,
-            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        )?;
-        conn.busy_timeout(Duration::from_millis(5_000))?;
-        conn.execute_batch("PRAGMA foreign_keys = ON; PRAGMA query_only = ON;")?;
-        conn.execute_batch("BEGIN DEFERRED")?;
+        let conn = open_reader_connection(&self.path)?;
+        begin_deferred(&conn)?;
         Ok(ReadTx {
-            conn,
+            conn: Some(conn),
             role: self.role,
+            pool: None,
         })
     }
 
@@ -312,21 +312,68 @@ impl Db {
     /// connection is closed. It is an operational step, not a correctness one:
     /// SQLite recovers the WAL on the next open either way.
     pub fn checkpoint_wal(&self) -> Result<()> {
+        self.checkpoint("TRUNCATE")
+    }
+
+    /// Copy as much of the WAL back into the main database as no reader is
+    /// using, without waiting for readers or truncating the file.
+    ///
+    /// This is the background checkpoint: it never blocks the writer and
+    /// never waits for a long read, so the WAL keeps growing while a snapshot
+    /// is open and shrinks as soon as the snapshot ends.
+    pub fn checkpoint_wal_passive(&self) -> Result<()> {
+        self.checkpoint("PASSIVE")
+    }
+
+    fn checkpoint(&self, mode: &str) -> Result<()> {
         self.conn
-            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+            .query_row(&format!("PRAGMA wal_checkpoint({mode})"), [], |row| {
                 row.get::<_, i64>(0)
             })?;
         Ok(())
     }
 }
 
-fn configure(conn: &Connection) -> Result<()> {
+/// Open a read connection without running the schema migration.
+///
+/// The connection is `READ_WRITE` (not `READ_ONLY`) so it can recover the WAL
+/// even if the writer closes first, and `query_only` so no write can escape
+/// through it. Opening the database itself is the expensive part; callers that
+/// read repeatedly should reuse the connection through [`ReadPool`].
+fn open_reader_connection(path: &Path) -> Result<Connection> {
+    let conn = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    conn.busy_timeout(Duration::from_millis(5_000))?;
+    conn.execute_batch("PRAGMA foreign_keys = ON; PRAGMA query_only = ON;")?;
+    Ok(conn)
+}
+
+fn begin_deferred(conn: &Connection) -> Result<()> {
+    conn.execute_batch("BEGIN DEFERRED")?;
+    Ok(())
+}
+
+fn configure(conn: &Connection, role: Role) -> Result<()> {
     conn.busy_timeout(Duration::from_millis(5_000))?;
     let mode: String = conn.query_row("PRAGMA journal_mode = WAL", [], |row| row.get(0))?;
     if !mode.eq_ignore_ascii_case("wal") {
         return Err(StoreError::NotWal { mode });
     }
-    conn.execute_batch("PRAGMA synchronous = FULL; PRAGMA foreign_keys = ON;")?;
+    // The server keeps FULL: a confirmed event must survive a power loss and
+    // `seq` must never move backwards. A client is a rebuildable replica and
+    // uses NORMAL; a lost recent local transaction is an accepted reconnect.
+    // OFF is never used: it can corrupt the database, not merely lose a
+    // watermark.
+    let synchronous = if matches!(role, Role::Client) {
+        "NORMAL"
+    } else {
+        "FULL"
+    };
+    conn.execute_batch(&format!(
+        "PRAGMA synchronous = {synchronous}; PRAGMA foreign_keys = ON;"
+    ))?;
     Ok(())
 }
 
@@ -334,16 +381,40 @@ fn configure(conn: &Connection) -> Result<()> {
 ///
 /// A [`Db`] owns exactly one writer connection. Every [`Db::read`] call opens a
 /// separate connection and starts a deferred transaction, so readers never
-/// block the writer and never collide with each other. Closing the connection
-/// ends the transaction.
+/// block the writer and never collide with each other. A [`ReadPool`] reader
+/// returns its connection to the pool on drop instead of closing it; closing
+/// or rolling back ends the transaction either way.
 pub struct ReadTx {
-    conn: Connection,
+    conn: Option<Connection>,
     role: Role,
+    pool: Option<Arc<ReadPoolInner>>,
 }
 
 impl fmt::Debug for ReadTx {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ReadTx").field("role", &self.role).finish()
+    }
+}
+
+impl Drop for ReadTx {
+    fn drop(&mut self) {
+        let Some(conn) = self.conn.take() else {
+            return;
+        };
+        let Some(pool) = self.pool.take() else {
+            // A standalone snapshot closes its connection, which ends the
+            // transaction; no explicit rollback is needed.
+            drop(conn);
+            return;
+        };
+        // A snapshot that is dropped without a query is still an open
+        // deferred transaction; end it before the connection can be reused.
+        let clean = conn.execute_batch("ROLLBACK").is_ok();
+        if clean {
+            pool.recycle(conn);
+        } else {
+            pool.discard(conn);
+        }
     }
 }
 
@@ -354,62 +425,65 @@ impl ReadTx {
     /// this module does not wrap yet. The connection is `query_only`, so a
     /// write through it fails. Core-table reads should use the typed methods.
     pub fn conn(&self) -> &Connection {
-        &self.conn
+        match &self.conn {
+            Some(conn) => conn,
+            None => unreachable!("a read snapshot always owns its connection"),
+        }
     }
 
     /// Read one meta value.
     pub fn get_meta(&self, key: &str) -> Result<Option<MetaValue>> {
-        meta_get(&self.conn, key)
+        meta_get(self.conn(), key)
     }
 
     /// Read one integer meta value.
     pub fn meta_i64(&self, key: &str) -> Result<i64> {
-        meta_i64(&self.conn, key)
+        meta_i64(self.conn(), key)
     }
 
     /// Read one text meta value.
     pub fn meta_text(&self, key: &str) -> Result<String> {
-        meta_text(&self.conn, key)
+        meta_text(self.conn(), key)
     }
 
     /// Read one blob meta value.
     pub fn meta_blob(&self, key: &str) -> Result<Vec<u8>> {
-        meta_blob(&self.conn, key)
+        meta_blob(self.conn(), key)
     }
 
     /// Read an object row.
     pub fn object(&self, ino: [u8; 16]) -> Result<Option<Object>> {
-        object(&self.conn, ino)
+        object(self.conn(), ino)
     }
 
     /// Read an object by its canonical path.
     pub fn object_by_path(&self, path: &str) -> Result<Option<Object>> {
-        object_by_path(&self.conn, path)
+        object_by_path(self.conn(), path)
     }
 
     /// Read one directory entry.
     pub fn name(&self, parent: [u8; 16], name: &str) -> Result<Option<Name>> {
-        name_row(&self.conn, parent, name)
+        name_row(self.conn(), parent, name)
     }
 
     /// List a directory's entries, ordered by name bytes.
     pub fn children(&self, parent: [u8; 16]) -> Result<Vec<Name>> {
-        children(&self.conn, parent)
+        children(self.conn(), parent)
     }
 
     /// Read a file's ordered chunk list.
     pub fn object_chunks(&self, ino: [u8; 16]) -> Result<Vec<ChunkRef>> {
-        object_chunks(&self.conn, ino)
+        object_chunks(self.conn(), ino)
     }
 
     /// Read one chunk row.
     pub fn chunk(&self, hash: [u8; 32]) -> Result<Option<Chunk>> {
-        chunk(&self.conn, hash)
+        chunk(self.conn(), hash)
     }
 
     /// Read one event row.
     pub fn event(&self, seq: i64) -> Result<Option<EventRow>> {
-        event(&self.conn, seq)
+        event(self.conn(), seq)
     }
 
     /// Read a page of events from one epoch.
@@ -420,20 +494,20 @@ impl ReadTx {
     /// error rather than an empty page, because an empty page looks like
     /// "caught up" to a caller.
     pub fn events_from(&self, epoch: i64, after_seq: i64, limit: u32) -> Result<Vec<EventRow>> {
-        let current = meta_i64(&self.conn, keys::EPOCH)?;
+        let current = meta_i64(self.conn(), keys::EPOCH)?;
         if epoch != current {
             return Err(StoreError::StaleEpoch {
                 requested: epoch,
                 current,
             });
         }
-        events_from(&self.conn, epoch, after_seq, limit)
+        events_from(self.conn(), epoch, after_seq, limit)
     }
 
     /// Number of rows in `events`.
     pub fn event_count(&self) -> Result<i64> {
         Ok(self
-            .conn
+            .conn()
             .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))?)
     }
 
@@ -445,13 +519,254 @@ impl ReadTx {
                 operation: "op_id",
             });
         }
-        op_id_row(&self.conn, op_id)
+        op_id_row(self.conn(), op_id)
     }
 
     /// Compute the state digest of the snapshot.
     pub fn state_hash(&self) -> Result<[u8; 32]> {
-        hash::state_hash(&self.conn)
+        hash::state_hash(self.conn())
     }
+}
+
+/// Read-pool limits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReadPoolConfig {
+    /// Connections kept open at once, leased or idle.
+    pub max_connections: usize,
+    /// An idle connection older than this is closed on the next acquisition.
+    pub idle_timeout: Duration,
+    /// How long a reader waits for a slot before opening a temporary
+    /// connection. A temporary connection is dropped on release, so a burst
+    /// never leaves more than `max_connections` idle readers behind.
+    pub acquire_timeout: Duration,
+}
+
+impl Default for ReadPoolConfig {
+    fn default() -> Self {
+        Self {
+            max_connections: 8,
+            idle_timeout: Duration::from_secs(60),
+            acquire_timeout: Duration::from_secs(1),
+        }
+    }
+}
+
+/// Read-pool counters, for diagnostics and tests.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ReadPoolStats {
+    /// Connections currently open, leased or idle.
+    pub live: usize,
+    /// Connections parked for reuse.
+    pub idle: usize,
+    /// Connections opened since the pool was created.
+    pub opens: u64,
+    /// Acquisitions that had to wait for a slot.
+    pub waits: u64,
+}
+
+/// A bounded pool of long-lived read connections.
+///
+/// A FUSE thread leases a connection, runs one `BEGIN DEFERRED` snapshot and
+/// returns the connection when [`ReadTx`] drops. Opening a SQLite connection
+/// (and recovering the WAL) is the expensive part; this pool pays it once per
+/// connection instead of once per read.
+pub struct ReadPool {
+    inner: Arc<ReadPoolInner>,
+}
+
+impl fmt::Debug for ReadPool {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ReadPool")
+            .field("stats", &self.stats())
+            .finish()
+    }
+}
+
+impl ReadPool {
+    /// Create a pool with the default limits.
+    pub fn new(path: impl AsRef<Path>, role: Role) -> Self {
+        Self::with_config(path, role, ReadPoolConfig::default())
+    }
+
+    /// Create a pool with explicit limits.
+    pub fn with_config(path: impl AsRef<Path>, role: Role, config: ReadPoolConfig) -> Self {
+        Self {
+            inner: Arc::new(ReadPoolInner {
+                path: path.as_ref().to_path_buf(),
+                role,
+                config,
+                state: Mutex::new(PoolState::default()),
+                available: Condvar::new(),
+                opens: AtomicU64::new(0),
+                waits: AtomicU64::new(0),
+            }),
+        }
+    }
+
+    /// Lease a connection and open a deferred snapshot on it.
+    pub fn read(&self) -> Result<ReadTx> {
+        let conn = self.acquire()?;
+        if let Err(error) = begin_deferred(&conn) {
+            // Never return a connection whose transaction state is unknown.
+            self.inner.discard(conn);
+            return Err(error);
+        }
+        Ok(ReadTx {
+            conn: Some(conn),
+            role: self.inner.role,
+            pool: Some(Arc::clone(&self.inner)),
+        })
+    }
+
+    /// Close connections that have been idle longer than `idle_timeout`.
+    pub fn reap_idle(&self) {
+        let mut state = self.inner.lock();
+        let removed = self.inner.reap_locked(&mut state);
+        drop(state);
+        if removed > 0 {
+            self.inner.available.notify_all();
+        }
+    }
+
+    /// A snapshot of the pool counters.
+    pub fn stats(&self) -> ReadPoolStats {
+        let state = self.inner.lock();
+        ReadPoolStats {
+            live: state.live,
+            idle: state.idle.len(),
+            opens: self.inner.opens.load(Ordering::Relaxed),
+            waits: self.inner.waits.load(Ordering::Relaxed),
+        }
+    }
+
+    fn acquire(&self) -> Result<Connection> {
+        let mut state = self.inner.lock();
+        loop {
+            let removed = self.inner.reap_locked(&mut state);
+            if removed > 0 {
+                self.inner.available.notify_all();
+            }
+            if let Some(reader) = state.idle.pop() {
+                return Ok(reader.conn);
+            }
+            if state.live < self.inner.config.max_connections {
+                state.live += 1;
+                drop(state);
+                return self.inner.open();
+            }
+            self.inner.waits.fetch_add(1, Ordering::Relaxed);
+            let (next, timeout) = self
+                .inner
+                .available
+                .wait_timeout(state, self.inner.config.acquire_timeout)
+                .unwrap_or_else(PoisonError::into_inner);
+            state = next;
+            if timeout.timed_out() {
+                // Every pooled slot stayed busy. Open one temporary
+                // connection instead of stalling a FUSE callback; the lease
+                // is accounted for and the connection is dropped on release.
+                state.live += 1;
+                drop(state);
+                return self.inner.open();
+            }
+        }
+    }
+}
+
+impl Drop for ReadPool {
+    fn drop(&mut self) {
+        self.inner.close();
+    }
+}
+
+struct ReadPoolInner {
+    path: PathBuf,
+    role: Role,
+    config: ReadPoolConfig,
+    state: Mutex<PoolState>,
+    available: Condvar,
+    opens: AtomicU64,
+    waits: AtomicU64,
+}
+
+impl ReadPoolInner {
+    fn lock(&self) -> std::sync::MutexGuard<'_, PoolState> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn open(&self) -> Result<Connection> {
+        match open_reader_connection(&self.path) {
+            Ok(conn) => {
+                self.opens.fetch_add(1, Ordering::Relaxed);
+                Ok(conn)
+            }
+            Err(error) => {
+                let mut state = self.lock();
+                state.live = state.live.saturating_sub(1);
+                drop(state);
+                self.available.notify_one();
+                Err(error)
+            }
+        }
+    }
+
+    /// Drop idle readers past `idle_timeout`; returns how many closed.
+    fn reap_locked(&self, state: &mut PoolState) -> usize {
+        let timeout = self.config.idle_timeout;
+        let before = state.idle.len();
+        state.idle.retain(|reader| reader.last_used.elapsed() < timeout);
+        let removed = before - state.idle.len();
+        state.live = state.live.saturating_sub(removed);
+        removed
+    }
+
+    fn recycle(&self, conn: Connection) {
+        let mut state = self.lock();
+        if state.closed
+            || state.live > self.config.max_connections
+            || state.idle.len() >= self.config.max_connections
+        {
+            state.live = state.live.saturating_sub(1);
+            drop(state);
+            drop(conn);
+        } else {
+            state.idle.push(IdleReader {
+                conn,
+                last_used: Instant::now(),
+            });
+            drop(state);
+        }
+        self.available.notify_one();
+    }
+
+    fn discard(&self, conn: Connection) {
+        let mut state = self.lock();
+        state.live = state.live.saturating_sub(1);
+        drop(state);
+        drop(conn);
+        self.available.notify_one();
+    }
+
+    fn close(&self) {
+        let mut state = self.lock();
+        state.closed = true;
+        state.live = state.live.saturating_sub(state.idle.len());
+        state.idle.clear();
+        drop(state);
+        self.available.notify_all();
+    }
+}
+
+#[derive(Default)]
+struct PoolState {
+    idle: Vec<IdleReader>,
+    live: usize,
+    closed: bool,
+}
+
+struct IdleReader {
+    conn: Connection,
+    last_used: Instant,
 }
 
 /// The single write transaction. Dropping it without [`WriteTx::commit`] rolls
@@ -498,6 +813,36 @@ impl WriteTx<'_> {
     /// Read one integer meta value inside the transaction.
     pub fn meta_i64(&self, key: &str) -> Result<i64> {
         meta_i64(&self.tx, key)
+    }
+
+    /// Read an object row inside the transaction.
+    pub fn object(&self, ino: [u8; 16]) -> Result<Option<Object>> {
+        object(&self.tx, ino)
+    }
+
+    /// Read an object by its canonical path inside the transaction.
+    pub fn object_by_path(&self, path: &str) -> Result<Option<Object>> {
+        object_by_path(&self.tx, path)
+    }
+
+    /// Read one directory entry inside the transaction.
+    pub fn name(&self, parent: [u8; 16], name: &str) -> Result<Option<Name>> {
+        name_row(&self.tx, parent, name)
+    }
+
+    /// List a directory's entries inside the transaction.
+    pub fn children(&self, parent: [u8; 16]) -> Result<Vec<Name>> {
+        children(&self.tx, parent)
+    }
+
+    /// Read a file's ordered chunk list inside the transaction.
+    pub fn object_chunks(&self, ino: [u8; 16]) -> Result<Vec<ChunkRef>> {
+        object_chunks(&self.tx, ino)
+    }
+
+    /// Read one chunk row inside the transaction.
+    pub fn chunk(&self, hash: [u8; 32]) -> Result<Option<Chunk>> {
+        chunk(&self.tx, hash)
     }
 
     /// Write one meta value.
@@ -903,6 +1248,7 @@ impl WriteTx<'_> {
                     uid: Some(item.object.uid),
                     gid: Some(item.object.gid),
                     mtime_ns: Some(item.object.mtime_ns),
+                    size: None,
                 },
                 result: "ok".to_owned(),
                 created_at,

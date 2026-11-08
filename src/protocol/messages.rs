@@ -33,6 +33,7 @@ use std::collections::{HashMap, VecDeque};
 use std::fmt;
 
 use crate::protocol::MAX_FIELDS;
+use crate::protocol::crypto::DETACHED_OVERHEAD;
 use crate::protocol::errors::{KickReason, SyncEndReason, TrnReason};
 use crate::protocol::frame::{
     BodyEncoding, ClientId, Limits, MsgType, OpId, PrefixKind, Seq, SessionId,
@@ -150,7 +151,25 @@ pub mod fid {
     /// handshake key. The plaintext is `BLAKE3(canonical body excluding this
     /// field)`; the AAD is `"sm/v2/welcome\0" ‖ client_nonce`.
     pub const F_SERVER_PROOF: u8 = 0x5E;
+    /// Sealed `AUTH` sub-body, 85 B (`HELLO`).
+    ///
+    /// `alg u8 | nonce 12 | ciphertext 56 | tag 16`, sealed under the
+    /// client-nonce handshake key. The AAD is
+    /// `"sm/v2/auth\0" ‖ client_nonce ‖ ctrl_prefix`.
+    pub const F_AUTH: u8 = 0x5F;
+    /// Sealed `ACCEPT` sub-body, 61 B (`WELCOME`).
+    ///
+    /// `alg u8 | nonce 12 | ciphertext 32 | tag 16`, sealed under the
+    /// two-nonce handshake key. The AAD is
+    /// `"sm/v2/accept\0" ‖ client_nonce ‖ server_nonce`.
+    pub const F_SEALED_ACCEPT: u8 = 0x5C;
 }
+
+/// Width of the sealed `AUTH` carried in `HELLO`.
+pub const AUTH_SEALED_LEN: usize = DETACHED_OVERHEAD + Auth::LEN;
+
+/// Width of the sealed `ACCEPT` carried in `WELCOME`.
+pub const ACCEPT_SEALED_LEN: usize = DETACHED_OVERHEAD + Accept::LEN;
 
 /// A WCP encoding or decoding failure.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -411,7 +430,7 @@ impl OpClass {
     pub const FLOCK: Self = Self(12);
     /// POSIX record lock.
     pub const FCNTL_LOCK: Self = Self(13);
-    /// Synchronization control. Unused in v2.
+    /// Synchronization control. Unused in v3.
     pub const SYNC_CTRL: Self = Self(14);
     /// Graceful leave.
     pub const LEAVE: Self = Self(15);
@@ -513,6 +532,17 @@ pub enum MessageError {
     UnknownSyncReason(u8),
     /// The message type does not use this body encoding.
     WrongEncoding(MsgType),
+    /// The peer announced a protocol major this build does not speak.
+    ///
+    /// This is a version rejection, not a parse failure: it is raised from
+    /// the two version fields alone, before fields that only the current
+    /// wire format carries are required.
+    ProtocolVersion {
+        /// Major this build requires.
+        local: u16,
+        /// Major the peer announced.
+        remote: u16,
+    },
     /// `F_OP_IDS` is not a whole number of 16-byte ids.
     BadOpIdsLen(usize),
     /// A field is present but forbidden or malformed in context.
@@ -541,10 +571,11 @@ pub enum MessageError {
 impl MessageError {
     /// Whether the error must stop the connection or the sync session.
     ///
-    /// Only an unknown `op_class` is fatal: ignoring it would fork state with
-    /// no replay window (49 A14). Unknown fids are ignored, not fatal (44 R7).
+    /// An unknown `op_class` is fatal: ignoring it would fork state with no
+    /// replay window (49 A14). A protocol major mismatch is fatal because no
+    /// compatible mode exists. Unknown fids are ignored, not fatal (44 R7).
     pub const fn is_fatal(self) -> bool {
-        matches!(self, Self::UnknownOpClass(_))
+        matches!(self, Self::UnknownOpClass(_) | Self::ProtocolVersion { .. })
     }
 }
 
@@ -561,6 +592,9 @@ impl fmt::Display for MessageError {
             Self::UnknownSyncReason(raw) => write!(f, "unknown sync-end reason {raw}"),
             Self::WrongEncoding(ty) => {
                 write!(f, "{} cannot use this body encoding", ty.name())
+            }
+            Self::ProtocolVersion { local, remote } => {
+                write!(f, "protocol major mismatch: local {local}, remote {remote}")
             }
             Self::BadOpIdsLen(len) => {
                 write!(f, "F_OP_IDS length {len} is not a multiple of 16")
@@ -1051,7 +1085,11 @@ pub struct DataRef {
     pub data_hash: [u8; 32],
 }
 
-/// `HELLO` body: plain WCP (44 §3.4).
+/// `HELLO` body: plain WCP with a sealed `AUTH` (44 §3.4).
+///
+/// The header fields stay readable before a key is live. `auth` is the
+/// client's proof of PSK possession, sealed under a key derived from the PSK
+/// and `client_nonce`, so one client flight completes authentication.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Hello {
     /// Protocol version.
@@ -1062,6 +1100,8 @@ pub struct Hello {
     pub client_id: ClientId,
     /// 32-byte client nonce for the join proof.
     pub client_nonce: [u8; 32],
+    /// Sealed `AUTH` body.
+    pub auth: [u8; AUTH_SEALED_LEN],
 }
 
 impl Hello {
@@ -1071,18 +1111,26 @@ impl Hello {
         caps: Caps,
         client_id: ClientId,
         client_nonce: [u8; 32],
+        auth: [u8; AUTH_SEALED_LEN],
     ) -> Self {
         Self {
             proto,
             caps,
             client_id,
             client_nonce,
+            auth,
         }
     }
 
     /// Decode a plain `HELLO` body.
+    ///
+    /// This is a pure parse. Version policy lives in [`decode_plain`], which
+    /// rejects an older major before it requires `F_AUTH`.
     pub fn decode(body: &[u8], limits: &Limits) -> Result<Self, MessageError> {
-        let fields = FieldMap::parse(body, limits)?;
+        Self::decode_fields(FieldMap::parse(body, limits)?)
+    }
+
+    fn decode_fields(fields: FieldMap<'_>) -> Result<Self, MessageError> {
         Ok(Self {
             proto: ProtoVersion {
                 major: required(fields.u16(fid::F_PROTO_MAJOR)?, fid::F_PROTO_MAJOR)?,
@@ -1097,6 +1145,7 @@ impl Hello {
                 fields.fixed::<32>(fid::F_CLIENT_NONCE)?,
                 fid::F_CLIENT_NONCE,
             )?,
+            auth: required(fields.fixed::<AUTH_SEALED_LEN>(fid::F_AUTH)?, fid::F_AUTH)?,
         })
     }
 
@@ -1108,6 +1157,7 @@ impl Hello {
         writer.u32(fid::F_CAPS, self.caps.bits());
         writer.bytes(fid::F_CLIENT_ID, &self.client_id.to_bytes());
         writer.bytes(fid::F_CLIENT_NONCE, &self.client_nonce);
+        writer.bytes(fid::F_AUTH, &self.auth);
         Ok(writer.finish()?)
     }
 }
@@ -1143,7 +1193,10 @@ impl Welcome {
 
     /// Decode a plain `WELCOME` body.
     pub fn decode(body: &[u8], limits: &Limits) -> Result<Self, MessageError> {
-        let fields = FieldMap::parse(body, limits)?;
+        Self::decode_fields(FieldMap::parse(body, limits)?, limits)
+    }
+
+    fn decode_fields(fields: FieldMap<'_>, limits: &Limits) -> Result<Self, MessageError> {
         let session_id = SessionId::from_le_bytes(required(
             fields.fixed::<16>(fid::F_SESSION_ID)?,
             fid::F_SESSION_ID,
@@ -1176,7 +1229,7 @@ impl Welcome {
 
     /// Encode a plain `WELCOME` body without a server proof.
     pub fn encode(&self) -> Result<Vec<u8>, MessageError> {
-        self.encode_with_optional_proof(None)
+        self.encode_with_optional(None, None)
     }
 
     /// Encode a plain `WELCOME` body with `F_SERVER_PROOF` appended.
@@ -1187,7 +1240,20 @@ impl Welcome {
         &self,
         proof: &[u8; Self::SERVER_PROOF_LEN],
     ) -> Result<Vec<u8>, MessageError> {
-        self.encode_with_optional_proof(Some(proof))
+        self.encode_with_optional(Some(proof), None)
+    }
+
+    /// Encode a plain `WELCOME` body with the server proof and the sealed
+    /// `ACCEPT` appended.
+    ///
+    /// The proof covers both attachments because [`Welcome::proof_input`]
+    /// excludes only `F_SERVER_PROOF`.
+    pub fn encode_with_proof_and_accept(
+        &self,
+        proof: &[u8; Self::SERVER_PROOF_LEN],
+        accept: &[u8; ACCEPT_SEALED_LEN],
+    ) -> Result<Vec<u8>, MessageError> {
+        self.encode_with_optional(Some(proof), Some(accept))
     }
 
     /// The canonical `WELCOME` bytes without `F_SERVER_PROOF`.
@@ -1208,9 +1274,19 @@ impl Welcome {
         Ok(fields.fixed::<61>(fid::F_SERVER_PROOF)?)
     }
 
-    fn encode_with_optional_proof(
+    /// Read the sealed `ACCEPT` from an encoded `WELCOME` body.
+    pub fn sealed_accept(
+        body: &[u8],
+        limits: &Limits,
+    ) -> Result<Option<[u8; ACCEPT_SEALED_LEN]>, MessageError> {
+        let fields = FieldMap::parse(body, limits)?;
+        Ok(fields.fixed::<ACCEPT_SEALED_LEN>(fid::F_SEALED_ACCEPT)?)
+    }
+
+    fn encode_with_optional(
         &self,
         proof: Option<&[u8; Self::SERVER_PROOF_LEN]>,
+        accept: Option<&[u8; ACCEPT_SEALED_LEN]>,
     ) -> Result<Vec<u8>, MessageError> {
         let mut writer = WcpWriter::new();
         writer.u16(fid::F_PROTO_MAJOR, self.proto.major);
@@ -1227,51 +1303,48 @@ impl Welcome {
         if let Some(proof) = proof {
             writer.bytes(fid::F_SERVER_PROOF, proof);
         }
+        if let Some(accept) = accept {
+            writer.bytes(fid::F_SEALED_ACCEPT, accept);
+        }
         Ok(writer.finish()?)
     }
 }
 
-/// `AUTH` body: fixed 112-byte plaintext, sealed under the handshake key.
+/// `AUTH` body: fixed 56-byte plaintext, sealed inside `HELLO`.
 ///
 /// Layout:
 ///
 /// ```text
-/// client_nonce 32 | server_nonce 32 | session_id 16 | epoch 8
-/// | client_id 16 | proto_major 2 | proto_minor 2 | caps 4
+/// client_nonce 32 | client_id 16 | proto_major 2 | proto_minor 2 | caps 4
 /// ```
+///
+/// The client seals this before it sees `WELCOME`, so the body cannot name
+/// the server nonce, session or epoch. It proves possession of the PSK and
+/// commits to the identity and version the plaintext `HELLO` advertises.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Auth {
     /// Nonce the client sent in `HELLO`.
     pub client_nonce: [u8; 32],
-    /// Nonce the server sent in `WELCOME`.
-    pub server_nonce: [u8; 32],
-    /// Join session named by `WELCOME`.
-    pub session_id: SessionId,
-    /// Server epoch named by `WELCOME`.
-    pub epoch: u64,
     /// Client identity claimed in `HELLO`.
     pub client_id: ClientId,
-    /// Negotiated protocol version.
+    /// Protocol version the client offered in `HELLO`.
     pub proto: ProtoVersion,
-    /// Negotiated capability set.
+    /// Capability set the client offered in `HELLO`.
     pub caps: Caps,
 }
 
 impl Auth {
     /// Plaintext width.
-    pub const LEN: usize = 32 + 32 + 16 + 8 + 16 + 2 + 2 + 4;
+    pub const LEN: usize = 32 + 16 + 2 + 2 + 4;
 
     /// Encode the fixed layout.
     pub fn encode(&self) -> [u8; Self::LEN] {
         let mut out = [0u8; Self::LEN];
         out[..32].copy_from_slice(&self.client_nonce);
-        out[32..64].copy_from_slice(&self.server_nonce);
-        out[64..80].copy_from_slice(&self.session_id.to_le_bytes());
-        out[80..88].copy_from_slice(&self.epoch.to_le_bytes());
-        out[88..104].copy_from_slice(&self.client_id.to_bytes());
-        out[104..106].copy_from_slice(&self.proto.major.to_le_bytes());
-        out[106..108].copy_from_slice(&self.proto.minor.to_le_bytes());
-        out[108..112].copy_from_slice(&self.caps.bits().to_le_bytes());
+        out[32..48].copy_from_slice(&self.client_id.to_bytes());
+        out[48..50].copy_from_slice(&self.proto.major.to_le_bytes());
+        out[50..52].copy_from_slice(&self.proto.minor.to_le_bytes());
+        out[52..56].copy_from_slice(&self.caps.bits().to_le_bytes());
         out
     }
 
@@ -1289,32 +1362,23 @@ impl Auth {
         }
         let mut client_nonce = [0u8; 32];
         client_nonce.copy_from_slice(&body[..32]);
-        let mut server_nonce = [0u8; 32];
-        server_nonce.copy_from_slice(&body[32..64]);
-        let mut session = [0u8; 16];
-        session.copy_from_slice(&body[64..80]);
         let mut client = [0u8; 16];
-        client.copy_from_slice(&body[88..104]);
+        client.copy_from_slice(&body[32..48]);
         Ok(Self {
             client_nonce,
-            server_nonce,
-            session_id: SessionId::from_le_bytes(session),
-            epoch: u64::from_le_bytes([
-                body[80], body[81], body[82], body[83], body[84], body[85], body[86], body[87],
-            ]),
             client_id: ClientId::from_bytes(client),
             proto: ProtoVersion {
-                major: u16::from_le_bytes([body[104], body[105]]),
-                minor: u16::from_le_bytes([body[106], body[107]]),
+                major: u16::from_le_bytes([body[48], body[49]]),
+                minor: u16::from_le_bytes([body[50], body[51]]),
             },
             caps: Caps::from_bits(u32::from_le_bytes([
-                body[108], body[109], body[110], body[111],
+                body[52], body[53], body[54], body[55],
             ])),
         })
     }
 }
 
-/// `ACCEPT` body: fixed 32-byte plaintext, sealed under the handshake key.
+/// `ACCEPT` body: fixed 32-byte plaintext, sealed inside `WELCOME`.
 ///
 /// Layout: `epoch 8 | session_id 16 | current_seq 8`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -1437,10 +1501,12 @@ pub enum OpArgs<'a> {
         /// New length.
         length: u64,
     },
-    /// `SETATTR`: optional mode change.
+    /// `SETATTR`: optional mode and size change.
     Setattr {
         /// New mode, if any.
         mode: Option<u32>,
+        /// New length, if this setattr also truncates.
+        size: Option<u64>,
     },
     /// `RENAME`: destination path.
     Rename {
@@ -1491,7 +1557,7 @@ pub enum OpArgs<'a> {
         /// Range length.
         len: u64,
     },
-    /// `SYNC_CTRL`: no extra arguments in v2.
+    /// `SYNC_CTRL`: no extra arguments in v3.
     SyncCtrl,
     /// `LEAVE`: no extra arguments.
     Leave,
@@ -1575,6 +1641,7 @@ impl<'a> Ordered<'a> {
             },
             OpClass::SETATTR => OpArgs::Setattr {
                 mode: fields.u32(fid::F_MODE)?,
+                size: fields.u64(fid::F_LENGTH)?,
             },
             OpClass::RENAME => OpArgs::Rename {
                 path2: path_field(&fields, fid::F_PATH2, limits)?,
@@ -2001,10 +2068,6 @@ pub enum Message<'a> {
     Hello(Hello),
     /// `WELCOME` (0x02).
     Welcome(Welcome),
-    /// `AUTH` (0x03), fixed plaintext.
-    Auth(Auth),
-    /// `ACCEPT` (0x04), fixed plaintext.
-    Accept(Accept),
     /// `ORDERED` (0x10).
     Ordered(Ordered<'a>),
     /// `RESPONSE` (0x11).
@@ -2037,8 +2100,6 @@ impl Message<'_> {
         match self {
             Self::Hello(_) => MsgType::HELLO,
             Self::Welcome(_) => MsgType::WELCOME,
-            Self::Auth(_) => MsgType::AUTH,
-            Self::Accept(_) => MsgType::ACCEPT,
             Self::Ordered(_) => MsgType::ORDERED,
             Self::Response(_) => MsgType::RESPONSE,
             Self::Relay(_) => MsgType::RELAY,
@@ -2069,8 +2130,6 @@ impl Message<'_> {
         match self {
             Self::Hello(message) => message.encode(),
             Self::Welcome(message) => message.encode(),
-            Self::Auth(message) => Ok(message.encode().to_vec()),
-            Self::Accept(message) => Ok(message.encode().to_vec()),
             Self::Ordered(message) => Ok(message.encode_body()),
             Self::Response(message) => message.encode(),
             Self::Relay(message) => message.encode(),
@@ -2108,15 +2167,55 @@ impl Message<'_> {
     }
 }
 
+/// Read the protocol version a plain `HELLO` or `WELCOME` announces.
+///
+/// Only the two version fields are read. This lets a decoder reject an older
+/// wire format as a version mismatch before it requires fields that older
+/// format does not carry, such as the sealed `AUTH`.
+pub fn peek_proto(body: &[u8], limits: &Limits) -> Result<ProtoVersion, MessageError> {
+    proto_from_fields(FieldMap::parse(body, limits)?)
+}
+
+fn proto_from_fields(fields: FieldMap<'_>) -> Result<ProtoVersion, MessageError> {
+    Ok(ProtoVersion {
+        major: required(fields.u16(fid::F_PROTO_MAJOR)?, fid::F_PROTO_MAJOR)?,
+        minor: required(fields.u16(fid::F_PROTO_MINOR)?, fid::F_PROTO_MINOR)?,
+    })
+}
+
+fn check_proto_major(fields: FieldMap<'_>) -> Result<(), MessageError> {
+    let remote = proto_from_fields(fields)?;
+    if remote.major == ProtoVersion::CURRENT.major {
+        Ok(())
+    } else {
+        Err(MessageError::ProtocolVersion {
+            local: ProtoVersion::CURRENT.major,
+            remote: remote.major,
+        })
+    }
+}
+
 /// Decode a plaintext body. Only the plain types in 44 §3.1 are accepted.
+///
+/// `HELLO` and `WELCOME` are version-checked first: a peer that announces an
+/// older major is rejected with [`MessageError::ProtocolVersion`] instead of
+/// failing on a field this build added.
 pub fn decode_plain<'a>(
     msg_type: MsgType,
     body: &'a [u8],
     limits: &Limits,
 ) -> Result<Message<'a>, MessageError> {
     match msg_type {
-        MsgType::HELLO => Ok(Message::Hello(Hello::decode(body, limits)?)),
-        MsgType::WELCOME => Ok(Message::Welcome(Welcome::decode(body, limits)?)),
+        MsgType::HELLO => {
+            let fields = FieldMap::parse(body, limits)?;
+            check_proto_major(fields)?;
+            Ok(Message::Hello(Hello::decode_fields(fields)?))
+        }
+        MsgType::WELCOME => {
+            let fields = FieldMap::parse(body, limits)?;
+            check_proto_major(fields)?;
+            Ok(Message::Welcome(Welcome::decode_fields(fields, limits)?))
+        }
         MsgType::ERROR => Ok(Message::Error(Error::decode(body, limits)?)),
         other => Err(MessageError::WrongEncoding(other)),
     }
@@ -2133,8 +2232,6 @@ pub fn decode_sealed<'a>(
     limits: &Limits,
 ) -> Result<Message<'a>, MessageError> {
     match msg_type {
-        MsgType::AUTH => Ok(Message::Auth(Auth::decode(body)?)),
-        MsgType::ACCEPT => Ok(Message::Accept(Accept::decode(body)?)),
         MsgType::ORDERED => Ok(Message::Ordered(Ordered::decode(body, limits)?)),
         MsgType::RESPONSE => Ok(Message::Response(Response::decode(body, limits)?)),
         MsgType::RELAY => Ok(Message::Relay(Relay::decode(body, limits)?)),
@@ -2315,7 +2412,7 @@ mod tests {
 
     fn welcome_fixture() -> Welcome {
         Welcome {
-            proto: ProtoVersion { major: 2, minor: 0 },
+            proto: ProtoVersion::CURRENT,
             caps: Caps::REQUIRED,
             epoch: 9,
             current_seq: Seq(42),
@@ -2338,20 +2435,29 @@ mod tests {
         let welcome = welcome_fixture();
         let plain = welcome.encode().unwrap();
         let proof = [0x5e; Welcome::SERVER_PROOF_LEN];
-        let body = welcome.encode_with_proof(&proof).unwrap();
+        let accept = [0x5c; ACCEPT_SEALED_LEN];
+        let body = welcome.encode_with_proof_and_accept(&proof, &accept).unwrap();
 
         assert_eq!(
             Welcome::server_proof(&body, &limits()).unwrap(),
             Some(proof)
         );
         assert_eq!(
+            Welcome::sealed_accept(&body, &limits()).unwrap(),
+            Some(accept)
+        );
+        assert_eq!(
             Welcome::proof_input(&body, &limits()).unwrap(),
-            *blake3::hash(&plain).as_bytes()
+            *blake3::hash(
+                &rebuilt(&plain, &[(fid::F_SEALED_ACCEPT, accept.to_vec())], &[])
+            )
+            .as_bytes()
         );
         assert_eq!(Welcome::decode(&body, &limits()).unwrap(), welcome);
 
         let without = welcome.encode().unwrap();
         assert_eq!(Welcome::server_proof(&without, &limits()).unwrap(), None);
+        assert_eq!(Welcome::sealed_accept(&without, &limits()).unwrap(), None);
         assert_eq!(
             Welcome::proof_input(&without, &limits()).unwrap(),
             *blake3::hash(&without).as_bytes()
@@ -2362,36 +2468,30 @@ mod tests {
     fn auth_layout_is_frozen() {
         let auth = Auth {
             client_nonce: [0x11; 32],
-            server_nonce: [0x22; 32],
-            session_id: SessionId(0x33),
-            epoch: 0x44,
             client_id: ClientId::from_bytes([0x55; 16]),
-            proto: ProtoVersion { major: 2, minor: 7 },
+            proto: ProtoVersion { major: 3, minor: 7 },
             caps: Caps::REQUIRED,
         };
         let bytes = auth.encode();
-        assert_eq!(bytes.len(), 112);
+        assert_eq!(bytes.len(), 56);
         assert_eq!(&bytes[..32], &[0x11; 32]);
-        assert_eq!(&bytes[32..64], &[0x22; 32]);
-        assert_eq!(&bytes[64..80], &SessionId(0x33).to_le_bytes());
-        assert_eq!(&bytes[80..88], &0x44u64.to_le_bytes());
-        assert_eq!(&bytes[88..104], &[0x55; 16]);
-        assert_eq!(&bytes[104..106], &2u16.to_le_bytes());
-        assert_eq!(&bytes[106..108], &7u16.to_le_bytes());
-        assert_eq!(&bytes[108..112], &Caps::REQUIRED.bits().to_le_bytes());
+        assert_eq!(&bytes[32..48], &[0x55; 16]);
+        assert_eq!(&bytes[48..50], &3u16.to_le_bytes());
+        assert_eq!(&bytes[50..52], &7u16.to_le_bytes());
+        assert_eq!(&bytes[52..56], &Caps::REQUIRED.bits().to_le_bytes());
         assert_eq!(Auth::decode(&bytes).unwrap(), auth);
         assert_eq!(
-            Auth::decode(&bytes[..111]).unwrap_err(),
+            Auth::decode(&bytes[..55]).unwrap_err(),
             MessageError::BadBodyLen {
-                len: 111,
-                need: 112
+                len: 55,
+                need: 56
             }
         );
         assert_eq!(
-            Auth::decode(&[0u8; 113]).unwrap_err(),
+            Auth::decode(&[0u8; 57]).unwrap_err(),
             MessageError::BadBodyLen {
-                len: 113,
-                need: 112
+                len: 57,
+                need: 56
             }
         );
     }
@@ -2418,8 +2518,6 @@ mod tests {
     #[test]
     fn plain_decoder_accepts_only_pre_key_frames() {
         for msg_type in [
-            MsgType::AUTH,
-            MsgType::ACCEPT,
             MsgType::PONG,
             MsgType::KICK,
             MsgType::FLOW,
@@ -2629,6 +2727,7 @@ mod tests {
             Caps::REQUIRED,
             ClientId::from_bytes([7u8; 16]),
             [9u8; 32],
+            [0xAA; AUTH_SEALED_LEN],
         );
         let welcome = Welcome {
             proto: ProtoVersion::CURRENT,
@@ -2684,26 +2783,9 @@ mod tests {
             reason: 1,
             last_signed_seq: 77,
         };
-        let auth = Auth {
-            client_nonce: [0x11; 32],
-            server_nonce: [0x22; 32],
-            session_id: SessionId(0x33),
-            epoch: 44,
-            client_id: ClientId::from_bytes([5u8; 16]),
-            proto: ProtoVersion { major: 2, minor: 0 },
-            caps: Caps::REQUIRED,
-        };
-        let accept = Accept {
-            epoch: 44,
-            session_id: SessionId(0x33),
-            current_seq: Seq(55),
-        };
-
-        let table: [(Message<'_>, MsgType); 16] = [
+        let table: [(Message<'_>, MsgType); 14] = [
             (Message::Hello(hello), MsgType::HELLO),
             (Message::Welcome(welcome), MsgType::WELCOME),
-            (Message::Auth(auth), MsgType::AUTH),
-            (Message::Accept(accept), MsgType::ACCEPT),
             (Message::Ordered(ordered), MsgType::ORDERED),
             (Message::Response(response), MsgType::RESPONSE),
             (Message::Relay(relay), MsgType::RELAY),
@@ -2770,6 +2852,7 @@ mod tests {
             Caps::REQUIRED,
             ClientId::from_bytes([7u8; 16]),
             [9u8; 32],
+            [0xAA; AUTH_SEALED_LEN],
         );
         let body = hello.encode().unwrap();
         assert_eq!(Hello::decode(&body, &limits).unwrap(), hello);
@@ -2805,6 +2888,26 @@ mod tests {
         assert_eq!(
             Welcome::decode(&body, &limits).unwrap_err(),
             MessageError::Wcp(WcpError::MissingField(fid::F_SESSION_ID))
+        );
+    }
+
+    #[test]
+    fn hello_with_sealed_auth_fits_the_frame_limits() {
+        let hello = Hello::new(
+            ProtoVersion::CURRENT,
+            Caps::REQUIRED,
+            ClientId::from_bytes([7u8; 16]),
+            [9u8; 32],
+            [0xAA; AUTH_SEALED_LEN],
+        );
+        let body = hello.encode().unwrap();
+        let limits = Limits::default();
+        assert!(body.len() <= usize::from(limits.wcp_max));
+        assert!(
+            crate::protocol::HEADER_LEN
+                + crate::protocol::CTRL_PREFIX_LEN
+                + body.len()
+                <= limits.ingress_frame as usize
         );
     }
 
@@ -2973,6 +3076,7 @@ mod tests {
             Caps::REQUIRED,
             ClientId::from_bytes([7u8; 16]),
             [9u8; 32],
+            [0xAA; AUTH_SEALED_LEN],
         );
         let body = rebuilt(&hello.encode().unwrap(), &[(0x7E, b"vendor".to_vec())], &[]);
         assert_eq!(Hello::decode(&body, &limits).unwrap(), hello);
@@ -3031,26 +3135,39 @@ mod tests {
     fn u_messages_version_matrix() {
         let caps = Caps::REQUIRED.union(Caps::ZSTD);
         let negotiated = negotiate(
-            ProtoVersion { major: 1, minor: 5 },
-            ProtoVersion { major: 1, minor: 2 },
+            ProtoVersion { major: 3, minor: 5 },
+            ProtoVersion { major: 3, minor: 2 },
             caps.union(Caps::BATCH_BROADCAST),
             caps,
         )
         .unwrap();
-        assert_eq!(negotiated.proto, ProtoVersion { major: 1, minor: 2 });
+        assert_eq!(negotiated.proto, ProtoVersion { major: 3, minor: 2 });
         assert_eq!(negotiated.caps, caps);
         assert!(!negotiated.caps.contains(Caps::BATCH_BROADCAST));
 
         assert_eq!(
             negotiate(
-                ProtoVersion { major: 1, minor: 0 },
                 ProtoVersion { major: 2, minor: 0 },
+                ProtoVersion { major: 3, minor: 0 },
                 Caps::REQUIRED,
                 Caps::REQUIRED,
             )
             .unwrap_err(),
             VersionError::MajorMismatch {
-                local: 1,
+                local: 2,
+                remote: 3,
+            }
+        );
+        assert_eq!(
+            negotiate(
+                ProtoVersion::CURRENT,
+                ProtoVersion::V2_0,
+                Caps::REQUIRED,
+                Caps::REQUIRED,
+            )
+            .unwrap_err(),
+            VersionError::MajorMismatch {
+                local: 3,
                 remote: 2,
             }
         );
@@ -3085,6 +3202,71 @@ mod tests {
                 "WCP version 0x{raw:04x}"
             );
         }
+    }
+
+    /// A 2.0 `HELLO` carries no `F_AUTH`. The version check must run before
+    /// the decoder asks for that field, so the peer sees a version mismatch.
+    #[test]
+    fn old_v2_hello_is_a_version_rejection_not_a_parse_error() {
+        let mut writer = WcpWriter::new();
+        writer.u16(fid::F_PROTO_MAJOR, 2);
+        writer.u16(fid::F_PROTO_MINOR, 0);
+        writer.u32(fid::F_CAPS, Caps::REQUIRED.bits());
+        writer.bytes(fid::F_CLIENT_ID, &[0x11; 16]);
+        writer.bytes(fid::F_CLIENT_NONCE, &[0x22; 32]);
+        let body = writer.finish().unwrap();
+
+        assert_eq!(peek_proto(&body, &limits()).unwrap(), ProtoVersion::V2_0);
+        assert_eq!(
+            decode_plain(MsgType::HELLO, &body, &limits()).unwrap_err(),
+            MessageError::ProtocolVersion {
+                local: 3,
+                remote: 2
+            }
+        );
+    }
+
+    /// A complete current-format `HELLO` still decodes.
+    #[test]
+    fn current_hello_passes_the_version_check() {
+        let hello = Hello::new(
+            ProtoVersion::CURRENT,
+            Caps::REQUIRED,
+            ClientId::from_bytes([0x11; 16]),
+            [0x22; 32],
+            [0x33; AUTH_SEALED_LEN],
+        );
+        let body = hello.encode().unwrap();
+        assert_eq!(
+            decode_plain(MsgType::HELLO, &body, &limits())
+                .unwrap()
+                .msg_type(),
+            MsgType::HELLO
+        );
+    }
+
+    /// A 2.0 `WELCOME` lacks the proof and the sealed `ACCEPT`. The version
+    /// check must reject it before those fields are inspected.
+    #[test]
+    fn old_v2_welcome_is_a_version_rejection_not_a_parse_error() {
+        let mut welcome = welcome_fixture();
+        welcome.proto = ProtoVersion::V2_0;
+        let body = welcome.encode().unwrap();
+
+        assert_eq!(
+            decode_plain(MsgType::WELCOME, &body, &limits()).unwrap_err(),
+            MessageError::ProtocolVersion {
+                local: 3,
+                remote: 2
+            }
+        );
+        assert!(
+            MessageError::ProtocolVersion {
+                local: 3,
+                remote: 2
+            }
+            .is_fatal()
+        );
     }
 
     /// 44:V12 -- replay dedup keeps the minimum seq; the gate is strict.

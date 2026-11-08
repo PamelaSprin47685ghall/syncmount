@@ -36,13 +36,14 @@
 use crate::protocol::crypto::{CryptoError, NonceMinter, PskKeyRing, Sealer};
 use crate::protocol::messages::fid;
 use crate::protocol::{
-    DataRef, FileAttrs, Flags, FrameDecoder, FrameHeader, FrameRef, Limits, MsgType, OpArgs,
-    OpClass, Ordered, Prefix, ProtocolError, Seq, SessionId, WcpError, WcpWriter, encode_frame,
+    CHUNK_PLAIN, DataRef, FileAttrs, Flags, FrameDecoder, FrameHeader, FrameRef, Limits, MsgType,
+    OpArgs, OpClass, Ordered, Prefix, ProtocolError, RoutePrefix, Seq, SessionId, StreamId,
+    WcpError, WcpWriter, encode_frame,
 };
 use crate::state::{
     self, Attrs, CHUNK_BYTES, Chunk, Errno, Ino, LockType, Op, Path, Reject, Session, State,
 };
-use crate::store::sqlite::{ChunkRef, EventDraft, EventKind, EventPayload, EventRow};
+use crate::store::sqlite::{ChunkRef, EventDraft, EventKind, EventPayload, EventRow, RejectState};
 
 /// Plaintext width of one chunk.
 const CHUNK: usize = CHUNK_BYTES as usize;
@@ -138,7 +139,10 @@ impl WireOp {
                 op.data = Some(*data);
             }
             OpArgs::Truncate { length } => op.length = Some(*length),
-            OpArgs::Setattr { mode } => op.mode = *mode,
+            OpArgs::Setattr { mode, size } => {
+                op.mode = *mode;
+                op.length = *size;
+            }
             OpArgs::Rename { path2 } => op.path2 = Some(path2.as_str().to_owned()),
             OpArgs::Mkdir { mode } => op.mode = Some(*mode),
             OpArgs::Link { target } => op.target = Some(target.as_str().as_bytes().to_vec()),
@@ -246,13 +250,23 @@ pub fn to_op(
             chunks: chunks_of(require_content(content)?),
             mtime_ns,
         },
-        OpClass::SETATTR => Op::SetAttr {
-            path,
-            attrs: Attrs {
-                mode: op.mode,
-                ..Attrs::default()
-            },
-        },
+        OpClass::SETATTR => {
+            let size = op.length;
+            let chunks = match size {
+                Some(_) => chunks_of(require_content(content)?),
+                None => Vec::new(),
+            };
+            Op::SetAttr {
+                path,
+                attrs: Attrs {
+                    mode: op.mode,
+                    mtime_ns: size.map(|_| mtime_ns),
+                    ..Attrs::default()
+                },
+                size,
+                chunks,
+            }
+        }
         OpClass::RENAME => Op::Rename {
             from: path,
             to: path_bytes(
@@ -393,13 +407,19 @@ pub fn event_for(op: &WireOp, planned: &Op, state_before: &State, session: [u8; 
             },
             None,
         ),
-        Op::SetAttr { path, attrs } => (
+        Op::SetAttr {
+            path,
+            attrs,
+            size,
+            ..
+        } => (
             EventPayload::Setattr {
                 ino: ino_bytes(resolve_or(state_before, path, op)),
                 mode: attrs.mode,
                 uid: attrs.uid,
                 gid: attrs.gid,
                 mtime_ns: attrs.mtime_ns.map(ns_i64),
+                size: *size,
             },
             None,
         ),
@@ -469,14 +489,50 @@ pub fn event_for(op: &WireOp, planned: &Op, state_before: &State, session: [u8; 
 
 /// Encode the `ERROR` detail of a semantic rejection.
 ///
-/// Layout: `op_id 16 B | errno i32 LE | reason UTF-8`. The receiver matches
-/// the rejection to its pending operation by `op_id` and reports `errno`.
-pub fn reject_body(op_id: [u8; 16], reject: Reject) -> Vec<u8> {
+/// Layout: `op_id 16 B | errno i32 LE | state_len u32 LE | state (bincode,
+/// optional) | reason UTF-8`. The state is self-delimiting, so the reason can
+/// follow it; the receiver decodes it at a fixed offset and ignores the
+/// trailing text.
+///
+/// A state that does not fit `detail_max` is not sent. `state_len` becomes
+/// `u32::MAX` and the reason is truncated; the receiver replays the server
+/// log instead. The returned detail is never longer than `detail_max`, and it
+/// is empty when `detail_max` cannot even hold the fixed header.
+pub fn reject_body(
+    op_id: [u8; 16],
+    reject: Reject,
+    state: Option<&RejectState>,
+    detail_max: usize,
+) -> Vec<u8> {
+    /// `op_id`, `errno` and `state_len`.
+    const HEADER: usize = 16 + 4 + 4;
+    if detail_max < HEADER {
+        return Vec::new();
+    }
     let reason = reject.reason.as_bytes();
-    let mut out = Vec::with_capacity(op_id.len() + 4 + reason.len());
+    let encoded = state
+        .and_then(|state| {
+            bincode::serde::encode_to_vec(state, bincode::config::standard()).ok()
+        })
+        .unwrap_or_default();
+    let full = HEADER + encoded.len() + reason.len() <= detail_max;
+    let mut out = Vec::with_capacity(if full {
+        HEADER + encoded.len() + reason.len()
+    } else {
+        detail_max
+    });
     out.extend_from_slice(&op_id);
     out.extend_from_slice(&reject.errno.raw().to_le_bytes());
-    out.extend_from_slice(reason);
+    if full {
+        out.extend_from_slice(&(encoded.len() as u32).to_le_bytes());
+        out.extend_from_slice(&encoded);
+        out.extend_from_slice(reason);
+    } else {
+        // The receiver sees the sentinel and asks for a replay; no state and
+        // no complete reason can follow it.
+        out.extend_from_slice(&u32::MAX.to_le_bytes());
+        out.extend_from_slice(&reason[..reason.len().min(detail_max - HEADER)]);
+    }
     out
 }
 
@@ -565,6 +621,68 @@ pub fn replay_ordered_with_content(
     let sealed = Sealer::with_session_key(&key, nonces).seal(&mut header, &prefix, &body)?;
     let sealed = sealed.into_vec();
     Ok(encode_frame(&FrameRef::new(&header, &prefix, &sealed))?)
+}
+
+/// Build the live content stream that accompanies a rebuilt `ORDERED`.
+///
+/// The frames use the event-derived data session, so the receiver pairs them
+/// with the `F_DATA_SESSION` that [`replay_ordered_with_content`] wrote. A
+/// live broadcast must send these frames before the `ORDERED`: the author's
+/// original stream has a random session id and carries only the patched
+/// chunks, not the server's complete file.
+pub fn replay_content_frames(
+    event: &EventRow,
+    ring: &PskKeyRing,
+    nonces: &NonceMinter,
+    data: &[u8],
+) -> Result<Vec<Vec<u8>>, WireError> {
+    let session = replay_data_session(event);
+    let mut frames = Vec::with_capacity(2 + data.len().div_ceil(CHUNK_PLAIN));
+    let open_prefix = Prefix::Route(RoutePrefix::new(session, StreamId::CTRL, 0, 0));
+    let open_body = WcpWriter::new().finish()?;
+    frames.push(seal_replay_frame(
+        MsgType::RELAY,
+        Flags::ENC.with(Flags::ROUTED),
+        open_prefix,
+        &open_body,
+        ring,
+        nonces,
+    )?);
+    let total_chunks = data.len().div_ceil(CHUNK_PLAIN).max(1) as u32;
+    for index in 0..total_chunks {
+        let start = index as usize * CHUNK_PLAIN;
+        let end = (start + CHUNK_PLAIN).min(data.len());
+        let prefix = Prefix::Route(RoutePrefix::new(
+            session,
+            StreamId::OP_DATA,
+            index,
+            total_chunks,
+        ));
+        frames.push(seal_replay_frame(
+            MsgType::STREAM_DATA,
+            Flags::ENC.with(Flags::ROUTED),
+            prefix,
+            &data[start..end],
+            ring,
+            nonces,
+        )?);
+    }
+    Ok(frames)
+}
+
+/// Seal one replay or live-content frame with the session key.
+fn seal_replay_frame(
+    msg_type: MsgType,
+    flags: Flags,
+    prefix: Prefix,
+    body: &[u8],
+    ring: &PskKeyRing,
+    nonces: &NonceMinter,
+) -> Result<Vec<u8>, WireError> {
+    let mut header = FrameHeader::new(msg_type, flags, 0, Seq::UNSEQUENCED);
+    let sealed =
+        Sealer::with_session_key(&ring.session_key(), nonces).seal(&mut header, &prefix, body)?;
+    Ok(encode_frame(&FrameRef::new(&header, &prefix, sealed.as_bytes()))?)
 }
 
 /// Rewrite the sequence number of one encoded frame.
@@ -696,9 +814,12 @@ fn replay_body(
         EventPayload::Truncate { size, .. } => {
             writer.u64(fid::F_LENGTH, *size);
         }
-        EventPayload::Setattr { mode, .. } => {
+        EventPayload::Setattr { mode, size, .. } => {
             if let Some(mode) = mode {
                 writer.u32(fid::F_MODE, *mode);
+            }
+            if let Some(size) = size {
+                writer.u64(fid::F_LENGTH, *size);
             }
         }
         EventPayload::Rename { .. } => {
@@ -1247,6 +1368,8 @@ mod tests {
                     mode: Some(0o600),
                     ..Attrs::default()
                 },
+                size: None,
+                chunks: Vec::new(),
             })
         );
     }
@@ -1297,6 +1420,24 @@ mod tests {
                 size: 3,
                 chunks: chunks_of(b"hel"),
                 mtime_ns: 13,
+            })
+        );
+
+        // A size-changing SETATTR is one operation with one chunk list.
+        let mut op = wire_op(OpClass::SETATTR, "/f");
+        op.mode = Some(0o600);
+        op.length = Some(3);
+        assert_eq!(
+            to_op(&op, Some(b"hel"), &state, SESSION).unwrap(),
+            Some(Op::SetAttr {
+                path: b"/f".to_vec(),
+                attrs: Attrs {
+                    mode: Some(0o600),
+                    mtime_ns: Some(13),
+                    ..Attrs::default()
+                },
+                size: Some(3),
+                chunks: chunks_of(b"hel"),
             })
         );
 
@@ -1476,11 +1617,84 @@ mod tests {
         let body = reject_body(
             [0xab; 16],
             Reject::new(Errno::EEXIST, "name already exists"),
+            None,
+            512,
         );
         assert_eq!(&body[..16], &[0xab; 16]);
         assert_eq!(&body[16..20], &Errno::EEXIST.raw().to_le_bytes());
-        assert_eq!(&body[20..], b"name already exists");
-        assert_eq!(body.len(), 20 + "name already exists".len());
+        assert_eq!(&body[20..24], &0u32.to_le_bytes());
+        assert_eq!(&body[24..], b"name already exists");
+        assert_eq!(body.len(), 24 + "name already exists".len());
+    }
+
+    #[test]
+    fn an_oversized_reject_state_falls_back_to_a_resync_marker() {
+        use crate::store::sqlite::{Object, ObjectKind};
+
+        let state = RejectState {
+            path: "/big".to_owned(),
+            object: Some(Object {
+                ino: [7; 16],
+                kind: ObjectKind::File,
+                mode: 0o644,
+                uid: 1000,
+                gid: 1000,
+                mtime_ns: 1_700_000_000_000_000_000,
+                size: 2 * 64 * 1024,
+                file_root: [9; 32],
+                block_count: 2,
+                target: None,
+                nlink: 1,
+                deleted: false,
+                created_seq: 1,
+                updated_seq: 2,
+            }),
+            chunks: vec![
+                ChunkRef {
+                    chunk_no: 0,
+                    hash: [1; 32],
+                    offset: 0,
+                    len: 64 * 1024,
+                },
+                ChunkRef {
+                    chunk_no: 1,
+                    hash: [2; 32],
+                    offset: 64 * 1024,
+                    len: 64 * 1024,
+                },
+            ],
+            data: vec![vec![0xaa; 64 * 1024], vec![0xbb; 64 * 1024]],
+            parent: Some([3; 16]),
+            name: Some("big".to_owned()),
+        };
+        let detail_max = usize::from(Limits::protocol().detail_max);
+        let body = reject_body(
+            [0xcd; 16],
+            Reject::new(Errno::EEXIST, "name already exists"),
+            Some(&state),
+            detail_max,
+        );
+        assert!(body.len() <= detail_max, "detail is {} bytes", body.len());
+        assert_eq!(&body[..16], &[0xcd; 16]);
+        assert_eq!(
+            i32::from_le_bytes(body[16..20].try_into().unwrap()),
+            Errno::EEXIST.raw()
+        );
+        assert_eq!(
+            u32::from_le_bytes(body[20..24].try_into().unwrap()),
+            u32::MAX
+        );
+
+        let encoded = crate::protocol::ErrorMessage {
+            reason: crate::protocol::TrnReason::Protocol,
+            detail: &body,
+            session_id: None,
+        }
+        .encode()
+        .unwrap();
+        let decoded =
+            crate::protocol::ErrorMessage::decode(&encoded, &Limits::protocol()).unwrap();
+        assert_eq!(decoded.detail, &body[..]);
     }
 
     #[test]
@@ -1522,6 +1736,55 @@ mod tests {
         assert_eq!(decoded_again.header.seq, Seq(42));
         assert_eq!(decoded_again.body, decoded.body);
         assert_eq!(plain_again, plain);
+    }
+
+    #[test]
+    fn replay_of_a_version_1_setattr_carries_no_length() {
+        let ring = ring();
+        let legacy = crate::store::sqlite::V1_SETATTR_BYTES;
+        let event = EventRow {
+            seq: 9,
+            epoch: 1,
+            op_id: Some([0x77; 16]),
+            session_id: None,
+            kind: EventKind::Setattr,
+            path: Some("/f".to_owned()),
+            path2: None,
+            ino: Some([0x11; 16]),
+            payload: legacy.to_vec(),
+            result: "ok".to_owned(),
+            applied: true,
+            created_at: 0,
+        };
+        let frame = replay_ordered(&event, &ring, &nonces()).unwrap();
+        let (decoded, plain) = decode_frame(&frame, &ring);
+        assert_eq!(decoded.header.msg_type, MsgType::ORDERED);
+        let ordered = Ordered::decode(&plain, &Limits::protocol()).unwrap();
+        assert_eq!(ordered.op_class, OpClass::SETATTR);
+        assert_eq!(
+            ordered.args,
+            OpArgs::Setattr {
+                mode: Some(0o644),
+                size: None,
+            },
+            "a version-1 setattr must not synthesize a length"
+        );
+        assert_eq!(
+            ordered.fields.get(fid::F_EXTRA),
+            Some(&legacy[..]),
+            "replay forwards the stored bytes unchanged"
+        );
+        assert_eq!(
+            EventPayload::decode(EventKind::Setattr, &legacy).unwrap(),
+            EventPayload::Setattr {
+                ino: [0x11; 16],
+                mode: Some(0o644),
+                uid: Some(1000),
+                gid: Some(1001),
+                mtime_ns: Some(1_700_000_000_000_000_000),
+                size: None,
+            }
+        );
     }
 
     #[test]

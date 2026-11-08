@@ -16,18 +16,24 @@
 //! * `Replaying` sessions do not receive live broadcasts; replay and live
 //!   frames therefore never interleave in one outbox. `ReplayDone` flips the
 //!   state to `Online` only when the replay cursor has reached `current_seq`.
+//! * Accepted operations wait in one batch for at most [`GroupCommit::window`]
+//!   or until [`GroupCommit::max_ops`] is reached. The store commits the batch
+//!   in one transaction and returns one sequence per accepted operation; the
+//!   actor then broadcasts every applied event in strictly increasing
+//!   sequence order. A rejection, duplicate or failed operation never joins
+//!   the transaction and never consumes a sequence.
 //!
 //! # Handshake pairing
 //!
 //! The downlink and uplink of one connection are paired by `X-SM-Nonce`. The
 //! actor parks an early downlink or a waiting uplink; the session task sends
-//! `WELCOME`/`ACCEPT` through the paired sender and only then calls `Attach`.
-//! An unauthenticated peer never enters the online table.
+//! `WELCOME` (carrying the sealed `ACCEPT`) through the paired sender and only
+//! then calls `Attach`. An unauthenticated peer never enters the online table.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use tokio::sync::{mpsc, oneshot};
@@ -39,7 +45,7 @@ use crate::protocol::{
     BodyEncoding, Caps, ErrorMessage, Flags, FrameBuf, FrameHeader, FrameRef, KickReason, MsgType,
     Prefix, PrefixKind, ProtocolError, Seq, SessionId, TrnReason, encode_frame,
 };
-use crate::store::sqlite::EventPayload;
+use crate::store::sqlite::{EventKind, EventPayload, EventRow};
 use crate::transport::{MpscSender, PeerId};
 
 use super::Epoch;
@@ -73,6 +79,57 @@ pub enum SequencerError {
     /// The actor task has stopped.
     #[error("sequencer stopped")]
     Stopped,
+}
+
+/// Bounds one group-commit batch.
+///
+/// The window starts when the first accepted operation enters an empty batch.
+/// The batch commits as soon as either bound is reached, so a quiet server
+/// waits at most one window and never for a fixed number of operations.
+///
+/// Both values are configurable without a rebuild:
+///
+/// * `SYNCMOUNT_GROUP_COMMIT_US` — window in microseconds (`0` commits the
+///   batch on the next actor iteration).
+/// * `SYNCMOUNT_GROUP_COMMIT_OPS` — maximum accepted operations per batch
+///   (`0` and unparsable values fall back to the default).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GroupCommit {
+    /// Maximum wait for more operations after the first one.
+    pub window: Duration,
+    /// Maximum operations in one commit transaction.
+    pub max_ops: usize,
+}
+
+impl GroupCommit {
+    /// Default window: one millisecond.
+    pub const DEFAULT_WINDOW: Duration = Duration::from_millis(1);
+    /// Default operation cap: 64.
+    pub const DEFAULT_MAX_OPS: usize = 64;
+
+    /// Read the deployment overrides, falling back to the defaults.
+    fn from_env() -> Self {
+        let window = std::env::var("SYNCMOUNT_GROUP_COMMIT_US")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .map(Duration::from_micros)
+            .unwrap_or(Self::DEFAULT_WINDOW);
+        let max_ops = std::env::var("SYNCMOUNT_GROUP_COMMIT_OPS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(Self::DEFAULT_MAX_OPS);
+        Self { window, max_ops }
+    }
+}
+
+impl Default for GroupCommit {
+    fn default() -> Self {
+        Self {
+            window: Self::DEFAULT_WINDOW,
+            max_ops: Self::DEFAULT_MAX_OPS,
+        }
+    }
 }
 
 /// Why an `events` half could not be registered.
@@ -340,6 +397,21 @@ impl Sequencer {
         ring: Arc<PskKeyRing>,
         metrics: Arc<Metrics>,
     ) -> (Self, JoinHandle<()>) {
+        Self::start_with_group_commit(config, meta, store, ring, metrics, GroupCommit::from_env())
+    }
+
+    /// Start the actor task with an explicit group-commit bound.
+    ///
+    /// Tests and embedders use this to make the window deterministic; the
+    /// binary calls [`Sequencer::start`], which reads the environment.
+    pub fn start_with_group_commit(
+        config: Arc<ServeConfig>,
+        meta: StoreMeta,
+        store: StoreHandle,
+        ring: Arc<PskKeyRing>,
+        metrics: Arc<Metrics>,
+        group: GroupCommit,
+    ) -> (Self, JoinHandle<()>) {
         let (cmd_tx, cmd_rx) = mpsc::channel(config.command_capacity.max(1));
         let epoch = Epoch::new(meta.epoch.max(1) as u64);
         let seq_view = Arc::new(AtomicU64::new(meta.seq.max(0) as u64));
@@ -363,6 +435,8 @@ impl Sequencer {
             pending_detaches: Vec::new(),
             pending_leaves: Vec::new(),
             pending_leave_wires: Vec::new(),
+            pending_commits: Vec::new(),
+            group,
             config,
             metrics: Arc::clone(&metrics),
             seq_view: Arc::clone(&seq_view),
@@ -615,6 +689,14 @@ struct AwaitingEvents {
     since: Instant,
 }
 
+/// One accepted operation waiting for the group commit.
+struct PendingCommit {
+    /// Author.
+    session: SessionId,
+    /// Prepared commit.
+    request: CommitRequest,
+}
+
 struct SequencerCore {
     seq: u64,
     /// Highest committed sequence. `LEAVE` also consumes one, but assigns no
@@ -633,6 +715,10 @@ struct SequencerCore {
     pending_detaches: Vec<SessionId>,
     pending_leaves: Vec<(SessionId, Seq)>,
     pending_leave_wires: Vec<Vec<u8>>,
+    /// Accepted operations waiting for the next group commit.
+    pending_commits: Vec<PendingCommit>,
+    /// Batch window and operation cap.
+    group: GroupCommit,
     config: Arc<ServeConfig>,
     metrics: Arc<Metrics>,
     seq_view: Arc<AtomicU64>,
@@ -645,63 +731,136 @@ struct SequencerCore {
 
 impl SequencerCore {
     async fn run(mut self, mut rx: mpsc::Receiver<SeqCmd>) {
-        while let Some(cmd) = rx.recv().await {
+        let mut deadline: Option<Instant> = None;
+        loop {
+            // While a batch is open, wait at most until its deadline. The
+            // timeout is the only source of unbounded delay, and it is
+            // bounded by `group.window`.
+            let mut cmd = None;
+            if self.pending_commits.is_empty() {
+                match rx.recv().await {
+                    Some(received) => cmd = Some(received),
+                    None => break,
+                }
+            } else {
+                let limit = deadline.unwrap_or_else(Instant::now);
+                let now = Instant::now();
+                // A batch that already holds more than one operation and has
+                // no queued successor is the whole burst: commit it now
+                // instead of burning the rest of the window. A lone
+                // operation still waits, because another client may be
+                // microseconds behind.
+                let idle = self.pending_commits.len() > 1 && rx.is_empty();
+                if now >= limit || idle {
+                    self.flush_pending().await;
+                    deadline = None;
+                } else {
+                    match tokio::time::timeout(limit - now, rx.recv()).await {
+                        Ok(Some(received)) => cmd = Some(received),
+                        Ok(None) => {
+                            self.flush_pending().await;
+                            break;
+                        }
+                        Err(_) => {
+                            self.flush_pending().await;
+                            deadline = None;
+                        }
+                    }
+                }
+            }
+
             let now = Instant::now();
             let now_us = wall_clock_us();
             let mut stop = false;
-            match cmd {
-                SeqCmd::Pair { nonce, reply } => {
-                    let _ = reply.send(self.on_pair(nonce, now));
+
+            if let Some(command) = cmd {
+                // Commands that observe the sequence must see every earlier
+                // accepted operation committed and broadcast first.
+                let flush_first = matches!(
+                    &command,
+                    SeqCmd::Leave { .. }
+                        | SeqCmd::Drain { .. }
+                        | SeqCmd::Snapshot { .. }
+                        | SeqCmd::Compact { .. }
+                        | SeqCmd::Shutdown { .. }
+                );
+                if flush_first && !self.pending_commits.is_empty() {
+                    self.flush_pending().await;
+                    deadline = None;
                 }
-                SeqCmd::CancelPair { nonce } => {
-                    self.awaiting_events.remove(&nonce);
-                    self.pending_events.remove(&nonce);
+                match command {
+                    SeqCmd::Pair { nonce, reply } => {
+                        let _ = reply.send(self.on_pair(nonce, now));
+                    }
+                    SeqCmd::CancelPair { nonce } => {
+                        self.awaiting_events.remove(&nonce);
+                        self.pending_events.remove(&nonce);
+                    }
+                    SeqCmd::Events { nonce, out, reply } => {
+                        let _ = reply.send(self.on_events(nonce, out, now));
+                    }
+                    SeqCmd::Attach { request, reply } => {
+                        let _ = reply.send(self.on_attach(*request, now));
+                    }
+                    SeqCmd::Ordered { session, request } => {
+                        self.queue_ordered(session, *request, now);
+                        if self.pending_commits.len() == 1 {
+                            deadline = Some(now + self.group.window);
+                        }
+                        if self.pending_commits.len() >= self.group.max_ops {
+                            self.flush_pending().await;
+                            deadline = None;
+                        }
+                    }
+                    SeqCmd::Relay { from, frame } => self.on_relay(from, *frame, now),
+                    SeqCmd::Watermark(report) => self.on_watermark(report),
+                    SeqCmd::Seen { session } => self.on_seen(session, now),
+                    SeqCmd::Leave { session, wire } => {
+                        self.on_leave(session, wire, now_us).await;
+                    }
+                    SeqCmd::Detach {
+                        session,
+                        generation,
+                        cause,
+                    } => self.on_detach(session, generation, cause, now_us),
+                    SeqCmd::ReplayDone {
+                        session,
+                        generation,
+                        upto,
+                        reply,
+                    } => {
+                        let _ = reply.send(self.on_replay_done(session, generation, upto));
+                    }
+                    SeqCmd::Tick { now } => self.on_tick(now),
+                    SeqCmd::Snapshot { reply } => {
+                        let _ = reply.send(self.snapshot());
+                    }
+                    SeqCmd::Drain { deadline, reply } => {
+                        self.draining = Some((deadline, reply));
+                        self.check_drain(now);
+                    }
+                    SeqCmd::Compact { reply } => {
+                        let result = self.on_compact(now_us).await;
+                        let _ = reply.send(result);
+                    }
+                    SeqCmd::Shutdown { reply } => {
+                        self.on_shutdown(now_us);
+                        let _ = reply.send(());
+                        stop = true;
+                    }
                 }
-                SeqCmd::Events { nonce, out, reply } => {
-                    let _ = reply.send(self.on_events(nonce, out, now));
-                }
-                SeqCmd::Attach { request, reply } => {
-                    let _ = reply.send(self.on_attach(*request, now));
-                }
-                SeqCmd::Ordered { session, request } => {
-                    self.on_ordered(session, *request, now, now_us).await;
-                }
-                SeqCmd::Relay { from, frame } => self.on_relay(from, *frame, now),
-                SeqCmd::Watermark(report) => self.on_watermark(report),
-                SeqCmd::Seen { session } => self.on_seen(session, now),
-                SeqCmd::Leave { session, wire } => {
-                    self.on_leave(session, wire, now_us).await;
-                }
-                SeqCmd::Detach {
-                    session,
-                    generation,
-                    cause,
-                } => self.on_detach(session, generation, cause, now_us),
-                SeqCmd::ReplayDone {
-                    session,
-                    generation,
-                    upto,
-                    reply,
-                } => {
-                    let _ = reply.send(self.on_replay_done(session, generation, upto));
-                }
-                SeqCmd::Tick { now } => self.on_tick(now),
-                SeqCmd::Snapshot { reply } => {
-                    let _ = reply.send(self.snapshot());
-                }
-                SeqCmd::Drain { deadline, reply } => {
-                    self.draining = Some((deadline, reply));
-                    self.check_drain(now);
-                }
-                SeqCmd::Compact { reply } => {
-                    let result = self.on_compact(now_us).await;
-                    let _ = reply.send(result);
-                }
-                SeqCmd::Shutdown { reply } => {
-                    self.on_shutdown(now_us);
-                    let _ = reply.send(());
-                    stop = true;
-                }
+            }
+
+            // A synthesized `leave` must follow every accepted operation.
+            if !self.pending_commits.is_empty() && !self.pending_leaves.is_empty() {
+                self.flush_pending().await;
+                deadline = None;
+            }
+            // A drain includes every accepted operation, as it did when each
+            // operation committed on its own.
+            if self.draining.is_some() && !self.pending_commits.is_empty() {
+                self.flush_pending().await;
+                deadline = None;
             }
             self.check_drain(now);
             self.flush_kicks(now_us);
@@ -861,13 +1020,12 @@ impl SequencerCore {
         })
     }
 
-    async fn on_ordered(
-        &mut self,
-        session_id: SessionId,
-        request: CommitRequest,
-        now: Instant,
-        now_us: u64,
-    ) {
+    /// Accept one operation into the open batch.
+    ///
+    /// The session checks happen at arrival, not at flush time, so an
+    /// operation that arrived before a kick or detach still commits. That is
+    /// the same order the sequential actor gave it.
+    fn queue_ordered(&mut self, session_id: SessionId, request: CommitRequest, now: Instant) {
         let Some(state) = self.online.get(&session_id).map(|s| s.state) else {
             return;
         };
@@ -877,58 +1035,154 @@ impl SequencerCore {
         if let Some(session) = self.online.get_mut(&session_id) {
             session.last_seen_at = now;
         }
+        self.pending_commits.push(PendingCommit {
+            session: session_id,
+            request,
+        });
+    }
+
+    /// Commit the open batch and broadcast every applied event in sequence.
+    async fn flush_pending(&mut self) {
+        if self.pending_commits.is_empty() {
+            return;
+        }
         let before = self.last_op();
-        let op_id = request.op.op_id;
-        let original = request.wire.clone();
-        let outcome = self.store.commit(request).await;
+        let now = Instant::now();
+        let pending = std::mem::take(&mut self.pending_commits);
+        let mut requests = Vec::with_capacity(pending.len());
+        let mut authors = Vec::with_capacity(pending.len());
+        for item in pending {
+            authors.push((
+                item.session,
+                item.request.op.op_id,
+                item.request.op.path.clone(),
+            ));
+            requests.push(item.request);
+        }
+        let outcomes = self.store.commit_batch(requests).await;
+        if outcomes.len() != authors.len() {
+            tracing::error!(
+                expected = authors.len(),
+                got = outcomes.len(),
+                "store returned the wrong group-commit outcome count"
+            );
+            self.fatal = true;
+            return;
+        }
+        let mut applied = false;
+        for ((session_id, op_id, reject_path), outcome) in authors.into_iter().zip(outcomes) {
+            applied |= self
+                .apply_outcome(session_id, op_id, &reject_path, outcome)
+                .await;
+        }
+        if applied {
+            self.note_work(before, now);
+        }
+    }
+
+    /// Handle one store outcome. Returns true when an event was broadcast.
+    async fn apply_outcome(
+        &mut self,
+        session_id: SessionId,
+        op_id: [u8; 16],
+        reject_path: &str,
+        outcome: CommitOutcome,
+    ) -> bool {
         match outcome {
-            CommitOutcome::Applied { seq } => {
+            CommitOutcome::Applied {
+                seq,
+                event,
+                content,
+            } => {
                 let seq = Seq(seq.max(0) as u64);
                 if seq.get() <= self.seq {
                     tracing::error!(seq = seq.get(), "store returned a non-monotonic sequence");
                     self.fatal = true;
-                    return;
+                    return false;
                 }
                 self.seq = seq.get();
                 self.seq_view.store(self.seq, Ordering::Release);
-                match wire::with_seq(&original, seq) {
+                // Broadcast the server's committed event, never the author's
+                // original frame. The author's `F_EXTRA` is its local payload;
+                // the server resolves paths and builds the complete file, so
+                // live and replay receivers must see the same bytes.
+                let frame = wire::replay_ordered_with_content(
+                    &event,
+                    &self.ring,
+                    &self.nonces,
+                    content.as_deref(),
+                )
+                .and_then(|bytes| wire::with_seq(&bytes, seq));
+                match frame {
                     Ok(bytes) => {
-                        self.broadcast(Bytes::from(bytes), seq);
-                        self.last_op_seq = seq.get();
-                        self.note_work(before, now);
+                        match self.broadcast_ordered(
+                            Bytes::from(bytes),
+                            &event,
+                            content.as_deref(),
+                            seq,
+                        ) {
+                            Ok(()) => {
+                                self.last_op_seq = seq.get();
+                                true
+                            }
+                            Err(error) => {
+                                tracing::error!(
+                                    ?error,
+                                    seq = seq.get(),
+                                    "cannot build broadcast content"
+                                );
+                                self.fatal = true;
+                                false
+                            }
+                        }
                     }
                     Err(error) => {
-                        tracing::error!(?error, seq = seq.get(), "cannot rewrite broadcast seq");
+                        tracing::error!(?error, seq = seq.get(), "cannot rebuild broadcast frame");
                         self.fatal = true;
+                        false
                     }
                 }
             }
             CommitOutcome::Rejected { reject } => {
-                self.send_reject(session_id, op_id, reject);
+                let state = self.store.path_state(reject_path).await.ok().flatten();
+                self.send_reject(session_id, op_id, reject, state.as_ref());
+                false
             }
             CommitOutcome::Duplicate { seq } => {
                 let seq = Seq(seq.max(0) as u64);
-                match self.store.wire(seq.get() as i64).await {
-                    Ok(Some(bytes)) => {
-                        if let Ok(bytes) = wire::with_seq(&bytes, seq) {
-                            self.send_to_author(session_id, Bytes::from(bytes));
+                // A replaying session must receive sequence numbers in order.
+                // The replay task will deliver this event; sending the stored
+                // frame now would overtake the replay cursor and make the
+                // receiver fail with a sequence gap. The replay frame also
+                // acknowledges the resent outbox row.
+                let online = self
+                    .online
+                    .get(&session_id)
+                    .is_some_and(|session| session.state == SessionState::Online);
+                if online {
+                    match self.store.wire(seq.get() as i64).await {
+                        Ok(Some(bytes)) => {
+                            if let Ok(bytes) = wire::with_seq(&bytes, seq) {
+                                self.send_to_author(session_id, Bytes::from(bytes));
+                            }
+                        }
+                        Ok(None) => {
+                            self.send_error_to(session_id, TrnReason::Internal, None);
+                        }
+                        Err(message) => {
+                            tracing::error!(%message, "cannot read duplicate wire");
+                            self.send_error_to(session_id, TrnReason::Internal, None);
                         }
                     }
-                    Ok(None) => {
-                        self.send_error_to(session_id, TrnReason::Internal, None);
-                    }
-                    Err(message) => {
-                        tracing::error!(%message, "cannot read duplicate wire");
-                        self.send_error_to(session_id, TrnReason::Internal, None);
-                    }
                 }
+                false
             }
             CommitOutcome::Failed { message } => {
                 tracing::error!(%message, op_id = ?op_id, "commit failed");
                 self.send_error_detail(session_id, TrnReason::Internal, message.as_bytes());
+                false
             }
         }
-        let _ = now_us;
     }
 
     async fn on_leave(&mut self, session_id: SessionId, wire: Vec<u8>, now_us: u64) {
@@ -954,7 +1208,7 @@ impl SequencerCore {
             .store
             .leave(session_id.to_le_bytes(), wire.clone())
             .await;
-        if let CommitOutcome::Applied { seq } = outcome {
+        if let CommitOutcome::Applied { seq, .. } = outcome {
             let seq = Seq(seq.max(0) as u64);
             self.seq = seq.get();
             self.seq_view.store(self.seq, Ordering::Release);
@@ -1101,8 +1355,19 @@ impl SequencerCore {
         }
     }
 
-    fn send_reject(&self, session_id: SessionId, op_id: [u8; 16], reject: crate::state::Reject) {
-        let detail = wire::reject_body(op_id, reject);
+    fn send_reject(
+        &self,
+        session_id: SessionId,
+        op_id: [u8; 16],
+        reject: crate::state::Reject,
+        state: Option<&crate::store::sqlite::RejectState>,
+    ) {
+        let detail = wire::reject_body(
+            op_id,
+            reject,
+            state,
+            usize::from(self.config.limits.detail_max),
+        );
         self.send_error_detail(session_id, TrnReason::Protocol, &detail);
     }
 
@@ -1299,6 +1564,76 @@ impl SequencerCore {
         self.fanout(wire, None, Some(seq));
     }
 
+    /// Broadcast one rebuilt `ORDERED` plus the content stream it describes.
+    ///
+    /// The author's original stream is not reusable: it carries the author's
+    /// random data session id and only the patched chunks. The rebuilt frame
+    /// names the server's complete file, so the matching `STREAM_DATA`
+    /// frames must precede it. A session that cannot take the content skips
+    /// the `ORDERED`; the resulting sequence gap makes it reconnect and
+    /// replay from the server's log.
+    fn broadcast_ordered(
+        &mut self,
+        ordered: Bytes,
+        event: &EventRow,
+        content: Option<&[u8]>,
+        seq: Seq,
+    ) -> Result<(), wire::WireError> {
+        let frames = match (event.kind, content) {
+            (EventKind::Write, Some(data)) if !data.is_empty() => {
+                wire::replay_content_frames(event, &self.ring, &self.nonces, data)?
+            }
+            _ => Vec::new(),
+        };
+        let mut kicked = Vec::new();
+        for (session_id, session) in self.online.iter_mut() {
+            if !session.state.receives_broadcast() {
+                continue;
+            }
+            let mut delivered = true;
+            for frame in &frames {
+                match session.outbox.try_push_data(Bytes::from(frame.clone())) {
+                    PushOutcome::Queued => {}
+                    PushOutcome::Overflow if session.outbox.queued.since_drain() > DRAIN_GRACE => {
+                        kicked.push((*session_id, KickReason::QueueOverflow));
+                        delivered = false;
+                        break;
+                    }
+                    PushOutcome::Overflow => {
+                        self.metrics.dropped_frames.fetch_add(1, Ordering::Relaxed);
+                        delivered = false;
+                        break;
+                    }
+                    PushOutcome::Closed => {
+                        self.pending_detaches.push(*session_id);
+                        delivered = false;
+                        break;
+                    }
+                }
+            }
+            if !delivered {
+                continue;
+            }
+            match session.outbox.try_push_data(ordered.clone()) {
+                PushOutcome::Queued => session.last_good_seq = seq,
+                PushOutcome::Overflow if session.outbox.queued.since_drain() > DRAIN_GRACE => {
+                    kicked.push((*session_id, KickReason::QueueOverflow));
+                }
+                PushOutcome::Overflow => {
+                    self.metrics.dropped_frames.fetch_add(1, Ordering::Relaxed);
+                    tracing::debug!(
+                        session = ?session_id,
+                        queued_bytes = session.outbox.queued.bytes(),
+                        "downlink queue full but draining; frame dropped, client will replay"
+                    );
+                }
+                PushOutcome::Closed => self.pending_detaches.push(*session_id),
+            }
+        }
+        self.pending_kicks.extend(kicked);
+        Ok(())
+    }
+
     fn fanout(&mut self, wire: Bytes, except: Option<SessionId>, seq: Option<Seq>) {
         let mut kicked = Vec::new();
         for (session_id, session) in self.online.iter_mut() {
@@ -1413,7 +1748,7 @@ impl SequencerCore {
                 .leave(session_id.to_le_bytes(), wire.clone())
                 .await
             {
-                CommitOutcome::Applied { seq } => {
+                CommitOutcome::Applied { seq, .. } => {
                     let seq = Seq(seq.max(0) as u64);
                     self.seq = seq.get();
                     self.seq_view.store(self.seq, Ordering::Release);

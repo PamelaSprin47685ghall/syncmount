@@ -84,12 +84,19 @@ pub enum Op {
         /// Modification time.
         mtime_ns: u64,
     },
-    /// Change attributes.
+    /// Change attributes, optionally with a size change.
+    ///
+    /// A size change carries the complete post-truncate chunk list, so one
+    /// event applies the new length and the new metadata together.
     SetAttr {
         /// Absolute path.
         path: Path,
         /// Fields to change; `None` leaves a field unchanged.
         attrs: Attrs,
+        /// New size, if this operation also truncates.
+        size: Option<u64>,
+        /// Complete ordered chunk list when `size` is `Some`.
+        chunks: Vec<Chunk>,
     },
     /// Rename or move one directory entry.
     Rename {
@@ -223,7 +230,12 @@ fn plan_inner(op: &Op, state: &State) -> Result<Vec<Change>, Reject> {
             chunks,
             mtime_ns,
         } => plan_truncate(state, path, *size, chunks, *mtime_ns),
-        Op::SetAttr { path, attrs } => plan_setattr(state, path, attrs),
+        Op::SetAttr {
+            path,
+            attrs,
+            size,
+            chunks,
+        } => plan_setattr(state, path, attrs, *size, chunks),
         Op::Rename { from, to, mtime_ns } => plan_rename(state, from, to, *mtime_ns),
         Op::Unlink { path, mtime_ns } => plan_unlink(state, path, *mtime_ns),
         Op::Rmdir { path, mtime_ns } => plan_rmdir(state, path, *mtime_ns),
@@ -446,10 +458,41 @@ fn plan_truncate(
     ])
 }
 
-fn plan_setattr(state: &State, path: &[u8], attrs: &Attrs) -> Result<Vec<Change>, Reject> {
+fn plan_setattr(
+    state: &State,
+    path: &[u8],
+    attrs: &Attrs,
+    size: Option<u64>,
+    chunks: &[Chunk],
+) -> Result<Vec<Change>, Reject> {
     let ino = resolve_path(state, path)?;
-    if state.object(ino).is_none() {
-        return Err(Reject::new(Errno::ENOENT, "object does not exist"));
+    let object = state
+        .object(ino)
+        .ok_or_else(|| Reject::new(Errno::ENOENT, "object does not exist"))?;
+    let mut changes = Vec::new();
+    if let Some(size) = size {
+        match object.kind {
+            Kind::File => {}
+            Kind::Dir => {
+                return Err(Reject::new(Errno::EISDIR, "setattr size targets a directory"));
+            }
+            Kind::Symlink => {
+                return Err(Reject::new(Errno::EINVAL, "setattr size targets a symlink"));
+            }
+        }
+        let (computed, root) = validate_chunks(chunks)?;
+        if computed != size {
+            return Err(Reject::new(
+                Errno::EINVAL,
+                "setattr size does not match its chunks",
+            ));
+        }
+        changes.push(Change::UpdateChunks {
+            ino,
+            chunks: chunks.to_vec(),
+            size,
+            file_root: root,
+        });
     }
     let attrs = Attrs {
         mode: attrs.mode.map(|mode| mode & 0o7777),
@@ -457,14 +500,14 @@ fn plan_setattr(state: &State, path: &[u8], attrs: &Attrs) -> Result<Vec<Change>
         gid: attrs.gid,
         mtime_ns: attrs.mtime_ns,
     };
-    if attrs.mode.is_none()
-        && attrs.uid.is_none()
-        && attrs.gid.is_none()
-        && attrs.mtime_ns.is_none()
+    if attrs.mode.is_some()
+        || attrs.uid.is_some()
+        || attrs.gid.is_some()
+        || attrs.mtime_ns.is_some()
     {
-        return Ok(Vec::new());
+        changes.push(Change::SetAttrs { ino, attrs });
     }
-    Ok(vec![Change::SetAttrs { ino, attrs }])
+    Ok(changes)
 }
 
 fn plan_unlink(state: &State, path: &[u8], mtime_ns: u64) -> Result<Vec<Change>, Reject> {

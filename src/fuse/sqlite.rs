@@ -9,10 +9,11 @@
 //! a stale page in the kernel cache. Attribute TTLs are one second for the
 //! same reason.
 
+use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, PoisonError, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use fuser::{
@@ -39,6 +40,16 @@ pub const GENERATION: Generation = Generation(0);
 pub struct SqliteFs {
     store: Arc<ClientDb>,
     gate: Arc<WriteGate>,
+    /// `fuse_inos` is immutable once written, so both directions can be
+    /// cached for the mount's lifetime. The write path uses the reverse map
+    /// to avoid a SQLite read per callback.
+    inos: RwLock<InoCache>,
+}
+
+#[derive(Debug, Default)]
+struct InoCache {
+    by_fuse: HashMap<u64, Ino>,
+    by_ino: HashMap<Ino, u64>,
 }
 
 impl std::fmt::Debug for SqliteFs {
@@ -52,23 +63,64 @@ impl std::fmt::Debug for SqliteFs {
 impl SqliteFs {
     /// Build the view.
     pub fn new(store: Arc<ClientDb>, gate: Arc<WriteGate>) -> Self {
-        Self { store, gate }
+        Self {
+            store,
+            gate,
+            inos: RwLock::new(InoCache::default()),
+        }
     }
 
     fn ino(&self, fuse_ino: INodeNo) -> Result<Ino, fuser::Errno> {
-        self.store
+        if let Some(ino) = self
+            .inos
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .by_fuse
+            .get(&fuse_ino.0)
+            .copied()
+        {
+            return Ok(ino);
+        }
+        let ino = self
+            .store
             .ino_by_fuse(fuse_ino.0)
             .map_err(to_errno)?
-            .ok_or(fuser::Errno::ENOENT)
+            .ok_or(fuser::Errno::ENOENT)?;
+        self.cache_ino(fuse_ino.0, ino);
+        Ok(ino)
+    }
+
+    fn fuse_ino(&self, ino: Ino) -> Result<u64, fuser::Errno> {
+        if let Some(fuse_ino) = self
+            .inos
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .by_ino
+            .get(&ino)
+            .copied()
+        {
+            return Ok(fuse_ino);
+        }
+        let fuse_ino = self.store.fuse_ino(ino).map_err(to_errno)?;
+        self.cache_ino(fuse_ino, ino);
+        Ok(fuse_ino)
+    }
+
+    fn cache_ino(&self, fuse_ino: u64, ino: Ino) {
+        let mut cache = self.inos.write().unwrap_or_else(PoisonError::into_inner);
+        cache.by_fuse.insert(fuse_ino, ino);
+        cache.by_ino.insert(ino, fuse_ino);
     }
 
     fn attr(&self, ino: Ino, object: &Object) -> Result<FileAttr, fuser::Errno> {
-        let fuse_ino = self.store.fuse_ino(ino).map_err(to_errno)?;
+        let fuse_ino = self.fuse_ino(ino)?;
         Ok(to_attr(fuse_ino, object))
     }
 
     fn gate(&self) -> Result<(), fuser::Errno> {
-        self.gate.check_write().map_err(|errno| fuser::Errno::from_i32(errno.raw()))
+        self.gate
+            .check_write()
+            .map_err(|errno| fuser::Errno::from_i32(errno.raw()))
     }
 }
 
@@ -162,7 +214,10 @@ impl Filesystem for SqliteFs {
             }
             let parent = self.ino(parent)?;
             let attrs = CreateAttrs::new(mode & !umask & 0o7777, 0, 0);
-            let object = self.store.create_file(parent, name, attrs).map_err(to_errno)?;
+            let object = self
+                .store
+                .create_file(parent, name, attrs)
+                .map_err(to_errno)?;
             self.attr(object.ino, &object)
         })();
         match result {
@@ -184,7 +239,10 @@ impl Filesystem for SqliteFs {
             self.gate()?;
             let parent = self.ino(parent)?;
             let attrs = CreateAttrs::new(mode & !umask & 0o7777, 0, 0);
-            let object = self.store.create_dir(parent, name, attrs).map_err(to_errno)?;
+            let object = self
+                .store
+                .create_dir(parent, name, attrs)
+                .map_err(to_errno)?;
             self.attr(object.ino, &object)
         })();
         match result {
@@ -352,28 +410,59 @@ impl Filesystem for SqliteFs {
     fn flush(
         &self,
         _req: &Request,
-        _ino: INodeNo,
+        ino: INodeNo,
         _fh: FileHandle,
         _lock_owner: LockOwner,
         reply: ReplyEmpty,
     ) {
-        reply.ok();
+        let result = (|| {
+            let ino = self.ino(ino)?;
+            self.store.flush_ino(ino).map_err(to_errno)
+        })();
+        match result {
+            Ok(()) => reply.ok(),
+            Err(error) => reply.error(error),
+        }
     }
 
     fn release(
         &self,
         _req: &Request,
-        _ino: INodeNo,
+        ino: INodeNo,
         _fh: FileHandle,
         _flags: OpenFlags,
         _lock_owner: Option<LockOwner>,
         _flush: bool,
         reply: ReplyEmpty,
     ) {
-        reply.ok();
+        let result = (|| {
+            let ino = self.ino(ino)?;
+            self.store.flush_ino(ino).map_err(to_errno)
+        })();
+        match result {
+            Ok(()) => reply.ok(),
+            Err(error) => reply.error(error),
+        }
     }
 
-    fn fsync(&self, _req: &Request, _ino: INodeNo, _fh: FileHandle, _datasync: bool, reply: ReplyEmpty) {
+    fn destroy(&mut self) {
+        if let Err(error) = self.store.flush_all() {
+            tracing::warn!(
+                event = "fuse_destroy_flush",
+                error = %error,
+                "could not commit buffered writes while unmounting"
+            );
+        }
+    }
+
+    fn fsync(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        _fh: FileHandle,
+        _datasync: bool,
+        reply: ReplyEmpty,
+    ) {
         match self.store.fsync() {
             Ok(()) => reply.ok(),
             Err(error) => reply.error(to_errno(error)),
@@ -411,16 +500,8 @@ impl Filesystem for SqliteFs {
             }
             let parent = self.store.parent_of(ino).unwrap_or(ino);
             let mut entries: Vec<(String, Ino, FileType)> = Vec::new();
-            entries.push((
-                ".".to_owned(),
-                ino,
-                FileType::Directory,
-            ));
-            entries.push((
-                "..".to_owned(),
-                parent,
-                FileType::Directory,
-            ));
+            entries.push((".".to_owned(), ino, FileType::Directory));
+            entries.push(("..".to_owned(), parent, FileType::Directory));
             for (name, child, kind) in self.store.children(ino).map_err(to_errno)? {
                 entries.push((name, child, file_type(kind)));
             }
@@ -454,7 +535,8 @@ impl Filesystem for SqliteFs {
                 return Err(fuser::Errno::ENOTDIR);
             }
             let parent = self.store.parent_of(ino).unwrap_or(ino);
-            let mut entries: Vec<(String, Ino)> = vec![(".".to_owned(), ino), ("..".to_owned(), parent)];
+            let mut entries: Vec<(String, Ino)> =
+                vec![(".".to_owned(), ino), ("..".to_owned(), parent)];
             for (name, child, _) in self.store.children(ino).map_err(to_errno)? {
                 entries.push((name, child));
             }
@@ -509,7 +591,10 @@ impl Filesystem for SqliteFs {
     }
 
     fn access(&self, _req: &Request, ino: INodeNo, _mask: AccessFlags, reply: ReplyEmpty) {
-        match self.ino(ino).and_then(|ino| self.store.getattr(ino).map_err(to_errno)) {
+        match self
+            .ino(ino)
+            .and_then(|ino| self.store.getattr(ino).map_err(to_errno))
+        {
             Ok(_) => reply.ok(),
             Err(error) => reply.error(error),
         }
@@ -529,7 +614,10 @@ impl Filesystem for SqliteFs {
             self.gate()?;
             let parent = self.ino(parent)?;
             let attrs = CreateAttrs::new(mode & !umask & 0o7777, 0, 0);
-            let object = self.store.create_file(parent, name, attrs).map_err(to_errno)?;
+            let object = self
+                .store
+                .create_file(parent, name, attrs)
+                .map_err(to_errno)?;
             self.attr(object.ino, &object)
         })();
         match result {
@@ -544,7 +632,14 @@ impl Filesystem for SqliteFs {
         }
     }
 
-    fn getxattr(&self, _req: &Request, _ino: INodeNo, _name: &OsStr, _size: u32, reply: ReplyXattr) {
+    fn getxattr(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        _name: &OsStr,
+        _size: u32,
+        reply: ReplyXattr,
+    ) {
         reply.error(fuser::Errno::ENODATA);
     }
 
@@ -828,7 +923,10 @@ mod tests {
         assert_eq!(attr.uid, 1000);
         assert_eq!(attr.gid, 1000);
         assert_eq!(attr.nlink, 1);
-        assert_eq!(attr.mtime.duration_since(UNIX_EPOCH).unwrap().as_secs(), 1_700_000_000);
+        assert_eq!(
+            attr.mtime.duration_since(UNIX_EPOCH).unwrap().as_secs(),
+            1_700_000_000
+        );
     }
 
     #[test]
@@ -913,9 +1011,7 @@ mod mount_tests {
             return;
         }
         let (dir, mount) = mountpoint();
-        let store = Arc::new(
-            ClientDb::open(dir.path().join("client.db"), [5u8; 16]).unwrap(),
-        );
+        let store = Arc::new(ClientDb::open(dir.path().join("client.db"), [5u8; 16]).unwrap());
         let gate = Arc::new(WriteGate::new(State::Steady));
         let filesystem = SqliteFs::new(Arc::clone(&store), gate);
         let mut config = crate::fuse::mount_config();
@@ -960,7 +1056,12 @@ mod mount_tests {
         let _ = Command::new("fusermount3").arg("-uz").arg(&mount).output();
         assert!(session.umount_and_join().is_ok());
         assert!(!mounted(&mount));
-        assert!(store.outbox_count(crate::client::db::OutboxState::Pending).unwrap() > 0);
+        assert!(
+            store
+                .outbox_count(crate::client::db::OutboxState::Pending)
+                .unwrap()
+                > 0
+        );
     }
 
     #[test]
@@ -970,9 +1071,7 @@ mod mount_tests {
             return;
         }
         let (dir, mount) = mountpoint();
-        let store = Arc::new(
-            ClientDb::open(dir.path().join("client.db"), [6u8; 16]).unwrap(),
-        );
+        let store = Arc::new(ClientDb::open(dir.path().join("client.db"), [6u8; 16]).unwrap());
         let gate = Arc::new(WriteGate::new(State::Joining));
         let filesystem = SqliteFs::new(Arc::clone(&store), Arc::clone(&gate));
         let mut config = crate::fuse::mount_config();
@@ -1000,7 +1099,10 @@ mod mount_tests {
             .current_dir(&mount)
             .output()
             .unwrap();
-        assert!(!output.status.success(), "a closed gate must refuse the write");
+        assert!(
+            !output.status.success(),
+            "a closed gate must refuse the write"
+        );
         assert!(store.lookup_by_path("/g").is_err());
         gate.set(State::Steady);
         run(&mount, "echo open > g");
@@ -1014,12 +1116,26 @@ mod mount_tests {
         let dir = tempfile::tempdir().unwrap();
         let store = ClientDb::open(dir.path().join("client.db"), [7u8; 16]).unwrap();
         let file = store
-            .create_file(crate::store::sqlite::ROOT_INO, OsStr::new("f"), CreateAttrs::new(0o644, 0, 0))
+            .create_file(
+                crate::store::sqlite::ROOT_INO,
+                OsStr::new("f"),
+                CreateAttrs::new(0o644, 0, 0),
+            )
             .unwrap();
         assert_eq!(store.write_at(file.ino, 0, b"local").unwrap(), 5);
         assert_eq!(store.read_at(file.ino, 0, 5).unwrap(), b"local");
         assert_eq!(
-            store.outbox_count(crate::client::db::OutboxState::Pending).unwrap(),
+            store
+                .outbox_count(crate::client::db::OutboxState::Pending)
+                .unwrap(),
+            1,
+            "the write is still volatile"
+        );
+        store.flush_all().unwrap();
+        assert_eq!(
+            store
+                .outbox_count(crate::client::db::OutboxState::Pending)
+                .unwrap(),
             2
         );
     }

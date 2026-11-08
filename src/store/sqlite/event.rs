@@ -8,8 +8,14 @@
 //! # Payload format
 //!
 //! ```text
-//! version:u8 = 1  ||  bincode(serde) EventPayload
+//! version:u8  ||  bincode(serde) EventPayload
 //! ```
+//!
+//! Version 2 is current. It appended `size` to `setattr`, so a version-1
+//! `setattr` decodes as an attribute-only change with `size: None`, exactly
+//! the operation version 1 recorded. Every other variant has the same layout
+//! in both versions, so only `setattr` needs a legacy decoder. New payloads
+//! are always written as version 2.
 //!
 //! The version byte is the escape hatch for a future layout change. The
 //! bincode body is length-limited on decode so a corrupt or hostile row cannot
@@ -21,7 +27,19 @@ use super::types::ChunkRef;
 use super::{Result, StoreError, now_secs};
 
 /// Current payload encoding version.
-pub const PAYLOAD_VERSION: u8 = 1;
+pub const PAYLOAD_VERSION: u8 = 2;
+
+/// First payload version, still accepted on decode.
+///
+/// Versions 1 and 2 differ only in `setattr`; every other variant decodes
+/// with the current layout.
+pub const PAYLOAD_VERSION_V1: u8 = 1;
+
+/// Bincode's enum tag of `EventPayload::Setattr`, frozen at version 1.
+///
+/// Version 2 keeps the variant order, so the tag is unchanged. The legacy
+/// decoder reads it explicitly because it does not decode an `EventPayload`.
+const SETATTR_TAG: u32 = 5;
 
 /// Upper bound on a payload body, matching the design's 4 MiB event ceiling.
 ///
@@ -110,6 +128,10 @@ impl std::fmt::Display for EventKind {
 /// `create_*` and `symlink` carry the attributes so a replay does not need a
 /// separate lookup, and `write` carries the chunk references so the receiver
 /// can fetch content by hash.
+///
+/// The variant order is the bincode tag and part of the stored format. Never
+/// reorder or remove a variant; append new ones at the end and bump
+/// [`PAYLOAD_VERSION`].
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EventPayload {
     CreateFile {
@@ -163,6 +185,9 @@ pub enum EventPayload {
         uid: Option<u32>,
         gid: Option<u32>,
         mtime_ns: Option<i64>,
+        /// Resulting file size when this event also truncates. `None` for an
+        /// attribute-only change.
+        size: Option<u64>,
     },
     Rename {
         ino: [u8; 16],
@@ -260,18 +285,17 @@ impl EventPayload {
         let Some((&version, body)) = bytes.split_first() else {
             return Err(StoreError::Codec("empty payload".to_owned()));
         };
-        if version != PAYLOAD_VERSION {
-            return Err(StoreError::PayloadVersion {
-                found: version,
-                supported: PAYLOAD_VERSION,
-            });
-        }
-        let (payload, used): (Self, usize) =
-            bincode::serde::decode_from_slice(body, codec_config())
-                .map_err(|err| StoreError::Codec(format!("decode: {err}")))?;
-        if used != body.len() {
-            return Err(StoreError::Codec("trailing payload bytes".to_owned()));
-        }
+        let payload = match version {
+            PAYLOAD_VERSION => decode_body(body, "payload")?,
+            PAYLOAD_VERSION_V1 if kind == EventKind::Setattr => decode_setattr_v1(body)?,
+            PAYLOAD_VERSION_V1 => decode_body(body, "payload")?,
+            found => {
+                return Err(StoreError::PayloadVersion {
+                    found,
+                    supported: PAYLOAD_VERSION,
+                })
+            }
+        };
         let actual = payload.kind();
         if actual != kind {
             return Err(StoreError::PayloadKindMismatch {
@@ -282,6 +306,68 @@ impl EventPayload {
         Ok(payload)
     }
 }
+
+/// A version-1 `setattr` body: the enum tag, then the five fields it had.
+///
+/// An externally tagged bincode enum is `u32 tag || variant fields`, so a
+/// struct decodes the same bytes when its first field is the tag. The tag is
+/// checked so a corrupt or mismatched body cannot pose as a `setattr`.
+#[derive(Deserialize)]
+struct SetattrV1 {
+    tag: u32,
+    ino: [u8; 16],
+    mode: Option<u32>,
+    uid: Option<u32>,
+    gid: Option<u32>,
+    mtime_ns: Option<i64>,
+}
+
+/// Decode one bincode body and require that it consumes every byte.
+fn decode_body<T: serde::de::DeserializeOwned>(body: &[u8], what: &str) -> Result<T> {
+    let (value, used): (T, usize) = bincode::serde::decode_from_slice(body, codec_config())
+        .map_err(|err| StoreError::Codec(format!("decode {what}: {err}")))?;
+    if used != body.len() {
+        return Err(StoreError::Codec("trailing payload bytes".to_owned()));
+    }
+    Ok(value)
+}
+
+/// Decode the version-1 `setattr` body into the current payload.
+fn decode_setattr_v1(body: &[u8]) -> Result<EventPayload> {
+    let legacy: SetattrV1 = decode_body(body, "v1 setattr")?;
+    if legacy.tag != SETATTR_TAG {
+        return Err(StoreError::Codec(format!(
+            "v1 setattr has variant tag {}, expected {SETATTR_TAG}",
+            legacy.tag
+        )));
+    }
+    Ok(EventPayload::Setattr {
+        ino: legacy.ino,
+        mode: legacy.mode,
+        uid: legacy.uid,
+        gid: legacy.gid,
+        mtime_ns: legacy.mtime_ns,
+        size: None,
+    })
+}
+
+/// Version-1 `setattr` bytes, as written before the payload gained `size`.
+///
+/// Layout: version 1, enum tag 5, ino `[0x11; 16]`, `Some(0o644)`,
+/// `Some(1000)`, `Some(1001)`, `Some(1_700_000_000_000_000_000)`. Bincode uses
+/// one byte for integers up to 250, then `0xFB` plus a little-endian `u16` (or
+/// `0xFD` plus a `u64`); a signed value is zigzag-encoded first. The bytes are
+/// frozen; do not regenerate them from the current encoder.
+#[cfg(test)]
+pub(crate) const V1_SETATTR_BYTES: [u8; 40] = [
+    1, 5, //
+    0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, //
+    0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, //
+    1, 0xfb, 0xa4, 0x01, // mode: Some(0o644)
+    1, 0xfb, 0xe8, 0x03, // uid: Some(1000)
+    1, 0xfb, 0xe9, 0x03, // gid: Some(1001)
+    1, 0xfd, 0x00, 0x00, 0x54, 0x6c, 0xfc, 0x39, 0x2f, 0x2f, // mtime_ns
+];
 
 /// A row waiting to be inserted into `events`.
 #[derive(Clone, Debug)]

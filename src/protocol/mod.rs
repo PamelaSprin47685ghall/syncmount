@@ -53,15 +53,15 @@ pub use frame::{
     RoutePrefix, Seq, SessionId, StreamId,
 };
 pub use handshake::{
-    AUTH_TIMEOUT_MS, Accepted, CLIENT_HANDSHAKE_TIMEOUT_MS, ClientHandshake, ClientPhase,
-    HandshakeError, HelloInput, MAX_RECENT_NONCES, NONCE_REPLAY_WINDOW_MS, NonceReplayGuard,
-    ServerHandshake, WelcomeReply,
+    Accepted, CLIENT_HANDSHAKE_TIMEOUT_MS, ClientHandshake, ClientPhase, HandshakeError,
+    HelloInput, MAX_RECENT_NONCES, NONCE_REPLAY_WINDOW_MS, NonceReplayGuard, ServerHandshake,
 };
 pub use messages::{
-    Accept, Ack, Auth, DataRef, Error as ErrorMessage, FieldMap, FileAttrs, Flow, Hello, Kick,
-    Leave, Message, MessageError, OpArgs, OpClass, OpIdLog, OpIdVerdict, Ordered, PathError, Ping,
-    Pong, Relay, RelaySub, ResyncMode, SeqGate, SeqVerdict, StreamData, SyncEnd, WcpError,
-    WcpWriter, Welcome, WelcomeLimits, WirePath, decode_plain, decode_sealed,
+    ACCEPT_SEALED_LEN, AUTH_SEALED_LEN, Accept, Ack, Auth, DataRef, Error as ErrorMessage,
+    FieldMap, FileAttrs, Flow, Hello, Kick, Leave, Message, MessageError, OpArgs, OpClass,
+    OpIdLog, OpIdVerdict, Ordered, PathError, Ping, Pong, Relay, RelaySub, ResyncMode, SeqGate,
+    SeqVerdict, StreamData, SyncEnd, WcpError, WcpWriter, Welcome, WelcomeLimits, WirePath,
+    decode_plain, decode_sealed,
 };
 pub use version::{Caps, FrameVer, Negotiated, ProtoVersion, VersionError, WcpVer, negotiate};
 

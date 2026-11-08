@@ -1,16 +1,15 @@
 //! One PSK session: handshake, replay, uplink and downlink.
 //!
 //! ```text
-//! HELLO(plain, ctrl prefix: applied_seq, epoch_seen)
-//!   -> WELCOME(plain body + server proof)
-//! AUTH(sealed under the handshake key)
-//!   -> ACCEPT(sealed under the handshake key)
+//! HELLO(plain, ctrl prefix: applied_seq, epoch_seen, sealed AUTH)
+//!   -> WELCOME(plain body + server proof + sealed ACCEPT)
 //! STEADY (enc key): STREAM_DATA* + ORDERED up, ORDERED* down
 //! ```
 //!
-//! The downlink applies events to SQLite as they arrive. The uplink reads the
-//! durable outbox and sends each row, coalescing adjacent writes. Neither task
-//! touches the other's stream: the transport is split once, after `ACCEPT`.
+//! The downlink applies events to SQLite in batches of up to 64 events or
+//! 4 MiB, one `BEGIN IMMEDIATE` per batch. The uplink reads the durable outbox
+//! and sends each row, coalescing adjacent writes. Neither task touches the
+//! other's stream: the transport is split once, after `WELCOME`.
 //!
 //! Replay needs no extra entry point: `HELLO`'s `CtrlPrefix` carries the local
 //! watermark, the server replays from there, and the client skips any frame at
@@ -23,13 +22,16 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use bytes::Bytes;
 use tokio::sync::mpsc;
 
-use super::db::{ClientDb, DbError, OutboxOp};
+use super::db::{ApplyOutcome, ClientDb, DbError, OutboxOp};
 use super::lifecycle::{EXIT_AUTH, EXIT_DISCONNECTED, EXIT_OK, State, WriteGate};
+use super::replay::{MAX_BATCH_BYTES, MAX_BATCH_EVENTS, RemoteEvent};
 use super::status::{Conntrace, Counters, TraceEntry};
 use super::writer::{CoalesceTuning, Coalescer, LocalOp, LocalSeq, QueuedOp, Span, WireOp};
 use crate::protocol::crypto::{NonceMinter, Opener, PskKeyRing, Sealer, SessionKey};
 use crate::protocol::fragment::{CHUNK_PLAIN, Fragmenter};
-use crate::protocol::handshake::{ClientHandshake, HandshakeError};
+use crate::protocol::handshake::{
+    CLIENT_HANDSHAKE_TIMEOUT_MS, ClientHandshake, HandshakeError,
+};
 use crate::protocol::messages::{
     Error as ErrorMessage, FieldMap, Kick, OpClass, Ping, Pong, SyncEnd, WcpWriter, Welcome, fid,
 };
@@ -37,7 +39,7 @@ use crate::protocol::{
     CtrlPrefix, Flags, FrameBuf, FrameDecoder, FrameEncoder, FrameHeader, FrameRef, Limits,
     MsgType, OpId, Prefix, RoutePrefix, Seq, SessionId, StreamId,
 };
-use crate::store::sqlite::{ChunkRef, EventKind, EventPayload};
+use crate::store::sqlite::{ChunkRef, EventKind, EventPayload, RejectState};
 use crate::transport::{DialOptions, Endpoint, EventsStream, HttpTransport, RpcStream, Transport};
 
 /// How long the whole handshake may take.
@@ -48,6 +50,13 @@ const IDLE_POLL: Duration = Duration::from_millis(2);
 
 /// How often the client reports its applied watermark to the server.
 const PING_INTERVAL: Duration = Duration::from_secs(1);
+
+/// How long a replay batch waits for more ORDERED frames before committing.
+///
+/// The transport may deliver one frame per chunk; without this window every
+/// ORDERED would become its own transaction. The window matches the writer's
+/// aggregate window and bounds how long an isolated event stays unapplied.
+const REPLAY_BATCH_WINDOW: Duration = Duration::from_millis(2);
 
 /// Largest number of outbox rows one uplink page holds.
 const OUTBOX_PAGE: usize = 64;
@@ -96,6 +105,7 @@ impl std::fmt::Debug for SessionOptions {
 enum Signal {
     CaughtUp,
     Disconnected,
+    Resync,
     Kicked(crate::protocol::KickReason),
     Fatal(String),
 }
@@ -107,10 +117,26 @@ pub async fn run(
     gate: Arc<WriteGate>,
     counters: Arc<Counters>,
     conntrace: Arc<Conntrace>,
-    mut shutdown: mpsc::Receiver<()>,
+    shutdown: &mut mpsc::Receiver<()>,
 ) -> SessionExit {
     if let Err(error) = store.reset_sent() {
         tracing::error!(event = "outbox_reset", error = %error, "cannot reset sent rows");
+    }
+    // A rejection marks the replica for a full replay. Reset before HELLO so
+    // the handshake advertises `applied_seq = 0` and the server replays its
+    // whole log; resetting after HELLO would tell the server we are current.
+    if store.needs_resync().unwrap_or(false) {
+        let epoch = store.epoch().unwrap_or(1);
+        if let Err(error) = store.reset_epoch(epoch) {
+            tracing::error!(event = "resync", error = %error, "cannot reset the replica");
+            return SessionExit {
+                code: 2,
+                reason: "resync reset",
+            };
+        }
+        if let Err(error) = store.clear_needs_resync() {
+            tracing::warn!(event = "resync", error = %error, "cannot clear the resync flag");
+        }
     }
     let applied = store.applied_seq().unwrap_or(0);
     let epoch_seen = store.epoch().unwrap_or(0);
@@ -155,7 +181,7 @@ pub async fn run(
         &conntrace,
     )
     .await;
-    let (transport, welcome, key) = match handshake {
+    let (transport, decoder, welcome, key) = match handshake {
         Ok(value) => value,
         Err(SessionError::Auth) => {
             tracing::error!(event = "handshake", "master password rejected");
@@ -226,6 +252,7 @@ pub async fn run(
 
     let downlink_task = tokio::spawn(downlink(
         events,
+        decoder,
         Arc::clone(&store),
         Arc::clone(&key),
         epoch,
@@ -268,6 +295,14 @@ pub async fn run(
                     Some(Signal::Kicked(reason)) => {
                         tracing::warn!(event = "kicked", reason = ?reason, "server ended the session");
                         exit = SessionExit::disconnected();
+                        break;
+                    }
+                    Some(Signal::Resync) => {
+                        tracing::warn!(event = "resync", "a rejection requires a replica replay");
+                        exit = SessionExit {
+                            code: EXIT_DISCONNECTED,
+                            reason: "resync",
+                        };
                         break;
                     }
                     Some(Signal::Fatal(reason)) => {
@@ -332,8 +367,9 @@ async fn handshake(
     epoch_seen: i64,
     counters: &Counters,
     conntrace: &Conntrace,
-) -> Result<(HttpTransport, Welcome, SessionKey), SessionError> {
+) -> Result<(HttpTransport, FrameDecoder, Welcome, SessionKey), SessionError> {
     let now_ms = unix_millis();
+    let deadline_ms = now_ms.saturating_add(CLIENT_HANDSHAKE_TIMEOUT_MS);
     let nonces = NonceMinter::with_instance(rand::random());
     let mut client = ClientHandshake::new(
         ring,
@@ -343,47 +379,48 @@ async fn handshake(
         crate::protocol::version::Caps::REQUIRED,
         now_ms,
     );
-    let hello = client.hello().encode()?;
-    let prefix = Prefix::Ctrl(CtrlPrefix::new(
+    let ctrl = CtrlPrefix::new(
         Seq(u64::try_from(applied.max(0)).unwrap_or(0)),
         u64::try_from(epoch_seen.max(0)).unwrap_or(0),
-    ));
+    );
+    let hello = client.hello(&nonces, &ctrl)?.encode()?;
+    let prefix = Prefix::Ctrl(ctrl);
     let header = FrameHeader::new(MsgType::HELLO, Flags::CTRL, 0, Seq::UNSEQUENCED);
     send_frame(&mut transport, &header, &prefix, &hello, counters, conntrace).await?;
 
     let limits = Limits::default();
     let mut decoder = FrameDecoder::new(limits);
-    let welcome_frame = read_frame(&mut transport, &mut decoder, counters, conntrace).await?;
+    let remaining_ms = deadline_ms.saturating_sub(unix_millis());
+    if remaining_ms == 0 {
+        return Err(SessionError::Handshake(HandshakeError::Timeout));
+    }
+    let welcome_frame = match tokio::time::timeout(
+        Duration::from_millis(remaining_ms),
+        read_frame(&mut transport, &mut decoder, counters, conntrace),
+    )
+    .await
+    {
+        Ok(Ok(frame)) => frame,
+        // The server verifies the sealed AUTH before it sends WELCOME. A
+        // wrong PSK, a tampered AUTH and a version rejection all close the
+        // connection without a distinguishable reply, so a close before
+        // WELCOME is the client's only authentication-failure signal.
+        Ok(Err(SessionError::Closed)) => return Err(SessionError::Auth),
+        Ok(Err(error)) => return Err(error),
+        Err(_) => return Err(SessionError::Handshake(HandshakeError::Timeout)),
+    };
     if welcome_frame.header.msg_type != MsgType::WELCOME {
         return Err(SessionError::Unexpected(welcome_frame.header.msg_type));
     }
     let welcome = Welcome::decode(&welcome_frame.body, &limits)?;
-    let auth = match client.on_welcome(&welcome, &welcome_frame.body, now_ms) {
-        Ok(auth) => auth,
-        Err(HandshakeError::AuthFailed) => return Err(SessionError::Auth),
-        Err(error) => return Err(SessionError::Handshake(error)),
-    };
-
-    let keys = client
-        .handshake_keys()
-        .ok_or(SessionError::Auth)?;
-    let mut auth_header = FrameHeader::new(MsgType::AUTH, Flags::ENC, 0, Seq::UNSEQUENCED);
-    let sealed = keys
-        .sealer(&nonces)
-        .seal(&mut auth_header, &Prefix::None, &auth.encode())?;
-    send_bytes(&mut transport, &auth_header, &Prefix::None, sealed.as_bytes(), counters, conntrace)
-        .await?;
-
-    let accept_frame = read_frame(&mut transport, &mut decoder, counters, conntrace).await?;
-    if accept_frame.header.msg_type != MsgType::ACCEPT {
-        return Err(SessionError::Unexpected(accept_frame.header.msg_type));
-    }
-    let session_key = match client.open_accept(&accept_frame.header, &accept_frame.body, now_ms) {
+    let session_key = match client.on_welcome(&welcome, &welcome_frame.body, unix_millis()) {
         Ok(key) => key,
         Err(HandshakeError::AuthFailed) => return Err(SessionError::Auth),
         Err(error) => return Err(SessionError::Handshake(error)),
     };
-    Ok((transport, welcome, session_key))
+    // The decoder may already hold frames that followed WELCOME in the same
+    // HTTP chunk. Hand it to the downlink task instead of dropping them.
+    Ok((transport, decoder, welcome, session_key))
 }
 
 async fn read_frame(
@@ -452,6 +489,7 @@ async fn send_bytes(
 #[allow(clippy::too_many_arguments)]
 async fn downlink(
     mut events: EventsStream,
+    mut decoder: FrameDecoder,
     store: Arc<ClientDb>,
     key: Arc<SessionKey>,
     epoch: u64,
@@ -464,28 +502,14 @@ async fn downlink(
     control: mpsc::Sender<Vec<u8>>,
 ) {
     let limits = Limits::default();
-    let mut decoder = FrameDecoder::new(limits);
     let opener = Opener::with_session_key(&key);
     let mut data = super::net::DataCache::new();
     let mut caught_up = current_seq == 0;
+    let mut pending: Vec<RemoteEvent> = Vec::new();
+    let mut pending_bytes = 0usize;
     let nonces = NonceMinter::with_instance(rand::random());
 
     loop {
-        let chunk = match events.recv().await {
-            Ok(Some(bytes)) => bytes,
-            Ok(None) => {
-                let _ = signal.send(Signal::Disconnected).await;
-                return;
-            }
-            Err(error) => {
-                let _ = signal.send(Signal::Fatal(error.to_string())).await;
-                return;
-            }
-        };
-        if let Err(error) = decoder.push(&chunk) {
-            let _ = signal.send(Signal::Fatal(error.to_string())).await;
-            return;
-        }
         loop {
             let frame = match decoder.next_frame_owned() {
                 Ok(Some(frame)) => frame,
@@ -503,6 +527,39 @@ async fn downlink(
                 frame.body.len() as u32,
                 frame.header.seq,
             ));
+            // A control frame observes the stream after the events before it,
+            // so commit the pending batch first. The frames that carry one
+            // event's content (`RELAY` opens the stream, `STREAM_DATA` fills
+            // it) only feed the cache for a later ORDERED and must not break
+            // the batch.
+            if !matches!(
+                frame.header.msg_type,
+                MsgType::ORDERED | MsgType::STREAM_DATA | MsgType::RELAY | MsgType::FLOW
+            ) && !pending.is_empty()
+            {
+                tracing::debug!(
+                    event = "replay_flush",
+                    reason = "control",
+                    frame = ?frame.header.msg_type,
+                    events = pending.len(),
+                    "control frame closed the pending batch"
+                );
+                if !settle_batch(
+                    &store,
+                    &mut pending,
+                    &mut pending_bytes,
+                    &watermark,
+                    &counters,
+                    &mut caught_up,
+                    current_seq,
+                    &gate,
+                    &signal,
+                )
+                .await
+                {
+                    return;
+                }
+            }
             match frame.header.msg_type {
                 MsgType::STREAM_DATA => {
                     if let Err(error) = data.push(&frame, &opener) {
@@ -510,26 +567,111 @@ async fn downlink(
                     }
                 }
                 MsgType::ORDERED => {
-                    match apply_ordered(&store, &opener, &mut data, &frame, epoch, &counters) {
-                        Ok(applied) => {
-                            let seq = frame.header.seq.get() as i64;
-                            if applied {
-                                watermark.store(seq, Ordering::Release);
+                    // A frame without `F_EXTRA` must rebuild its payload from
+                    // the committed tree, so earlier events have to land
+                    // first. This only affects compacted or legacy servers.
+                    let decoded = decode_ordered(
+                        &store,
+                        &opener,
+                        &mut data,
+                        &frame,
+                        epoch,
+                        pending.is_empty(),
+                    );
+                    let event = match decoded {
+                        Ok(Some(event)) => event,
+                        Ok(None) => {
+                            if !settle_batch(
+                                &store,
+                                &mut pending,
+                                &mut pending_bytes,
+                                &watermark,
+                                &counters,
+                                &mut caught_up,
+                                current_seq,
+                                &gate,
+                                &signal,
+                            )
+                            .await
+                            {
+                                return;
                             }
-                            if !caught_up && seq >= current_seq as i64 {
-                                caught_up = true;
-                                gate.set(State::Steady);
-                                let _ = signal.send(Signal::CaughtUp).await;
+                            match decode_ordered(
+                                &store,
+                                &opener,
+                                &mut data,
+                                &frame,
+                                epoch,
+                                true,
+                            ) {
+                                Ok(Some(event)) => event,
+                                Ok(None) => {
+                                    tracing::error!(
+                                        event = "apply",
+                                        seq = frame.header.seq.get(),
+                                        "ORDERED payload still needs an uncommitted tree"
+                                    );
+                                    let _ = signal
+                                        .send(Signal::Fatal(
+                                            "apply: legacy ORDERED payload".to_owned(),
+                                        ))
+                                        .await;
+                                    return;
+                                }
+                                Err(error) => {
+                                    tracing::error!(event = "apply", seq = frame.header.seq.get(), error = %error, "cannot decode an event");
+                                    Counters::bump(&counters.materialize_errors);
+                                    let _ = signal
+                                        .send(Signal::Fatal(format!("apply: {error}")))
+                                        .await;
+                                    return;
+                                }
                             }
                         }
                         Err(error) => {
-                            tracing::error!(event = "apply", seq = frame.header.seq.get(), error = %error, "cannot apply an event");
+                            tracing::error!(event = "apply", seq = frame.header.seq.get(), error = %error, "cannot decode an event");
                             Counters::bump(&counters.materialize_errors);
                             let _ = signal
                                 .send(Signal::Fatal(format!("apply: {error}")))
                                 .await;
                             return;
                         }
+                    };
+                    let bytes = event.batch_bytes();
+                    if (pending.len() >= MAX_BATCH_EVENTS
+                        || (!pending.is_empty() && pending_bytes + bytes > MAX_BATCH_BYTES))
+                        && !settle_batch(
+                            &store,
+                            &mut pending,
+                            &mut pending_bytes,
+                            &watermark,
+                            &counters,
+                            &mut caught_up,
+                            current_seq,
+                            &gate,
+                            &signal,
+                        )
+                        .await
+                    {
+                        return;
+                    }
+                    pending_bytes += bytes;
+                    pending.push(event);
+                    if (pending.len() >= MAX_BATCH_EVENTS || pending_bytes >= MAX_BATCH_BYTES)
+                        && !settle_batch(
+                            &store,
+                            &mut pending,
+                            &mut pending_bytes,
+                            &watermark,
+                            &counters,
+                            &mut caught_up,
+                            current_seq,
+                            &gate,
+                            &signal,
+                        )
+                        .await
+                    {
+                        return;
                     }
                 }
                 MsgType::PING => {
@@ -563,11 +705,27 @@ async fn downlink(
                 }
                 MsgType::ERROR => {
                     if let Ok(error) = ErrorMessage::decode(&frame.body, &limits) {
-                        if let Some((op_id, errno)) = decode_rejection(error.detail) {
-                            if let Err(store_error) = store.reject_op(op_id, errno) {
+                        if let Some((op_id, errno, rejection)) = decode_rejection(error.detail) {
+                            let (state, resync) = match rejection {
+                                RejectionState::Snapshot(state) => (Some(*state), false),
+                                RejectionState::None => (None, false),
+                                RejectionState::Resync => (None, true),
+                            };
+                            if let Err(store_error) = store.reject_op(op_id, errno, state) {
                                 tracing::warn!(event = "reject", error = %store_error, "cannot record a rejection");
                             }
+                            // The failed tombstone is durable before the
+                            // replay request is recorded and signalled.
+                            if resync {
+                                if let Err(store_error) = store.mark_needs_resync() {
+                                    tracing::warn!(event = "reject", error = %store_error, "cannot request a replay");
+                                }
+                            }
                             Counters::bump(&counters.ops_rejected);
+                            if store.needs_resync().unwrap_or(false) {
+                                let _ = signal.send(Signal::Resync).await;
+                                return;
+                            }
                             continue;
                         }
                         let _ = signal
@@ -589,23 +747,112 @@ async fn downlink(
                     // Advisory locks are session-scoped and die with the
                     // connection; nothing durable to do here.
                 }
-                MsgType::WELCOME | MsgType::AUTH | MsgType::ACCEPT | MsgType::HELLO => {}
+                MsgType::WELCOME | MsgType::HELLO => {}
                 other => {
                     tracing::warn!(event = "unexpected_frame", msg_type = ?other, "ignoring");
                 }
             }
         }
+        // The decoder is drained. A pending batch waits a short window for
+        // more frames so a chunk-per-frame transport still batches; the size
+        // caps and control frames flush it earlier.
+        let chunk = if pending.is_empty() {
+            match events.recv().await {
+                Ok(Some(bytes)) => bytes,
+                Ok(None) => {
+                    let _ = signal.send(Signal::Disconnected).await;
+                    return;
+                }
+                Err(error) => {
+                    let _ = signal.send(Signal::Fatal(error.to_string())).await;
+                    return;
+                }
+            }
+        } else {
+            match tokio::time::timeout(REPLAY_BATCH_WINDOW, events.recv()).await {
+                Ok(Ok(Some(bytes))) => bytes,
+                Ok(Ok(None)) => {
+                    if !settle_batch(
+                        &store,
+                        &mut pending,
+                        &mut pending_bytes,
+                        &watermark,
+                        &counters,
+                        &mut caught_up,
+                        current_seq,
+                        &gate,
+                        &signal,
+                    )
+                    .await
+                    {
+                        return;
+                    }
+                    let _ = signal.send(Signal::Disconnected).await;
+                    return;
+                }
+                Ok(Err(error)) => {
+                    let _ = signal.send(Signal::Fatal(error.to_string())).await;
+                    return;
+                }
+                Err(_elapsed) => {
+                    tracing::debug!(
+                        event = "replay_flush",
+                        reason = "idle",
+                        events = pending.len(),
+                        "idle window closed the pending batch"
+                    );
+                    if !settle_batch(
+                        &store,
+                        &mut pending,
+                        &mut pending_bytes,
+                        &watermark,
+                        &counters,
+                        &mut caught_up,
+                        current_seq,
+                        &gate,
+                        &signal,
+                    )
+                    .await
+                    {
+                        return;
+                    }
+                    match events.recv().await {
+                        Ok(Some(bytes)) => bytes,
+                        Ok(None) => {
+                            let _ = signal.send(Signal::Disconnected).await;
+                            return;
+                        }
+                        Err(error) => {
+                            let _ = signal.send(Signal::Fatal(error.to_string())).await;
+                            return;
+                        }
+                    }
+                }
+            }
+        };
+        if let Err(error) = decoder.push(&chunk) {
+            let _ = signal.send(Signal::Fatal(error.to_string())).await;
+            return;
+        }
     }
 }
 
-fn apply_ordered(
+/// Decode one ORDERED frame into a batchable event.
+///
+/// Nothing is written here: the downlink accumulates decoded events and hands
+/// them to [`ClientDb::apply_remote_batch`] as one transaction.
+///
+/// `Ok(None)` means the frame carries no `F_EXTRA`; rebuilding its payload
+/// needs the tree as of the preceding event, which is still in the pending
+/// batch. The caller commits that batch and decodes again.
+fn decode_ordered(
     store: &ClientDb,
     opener: &Opener<'_>,
     data: &mut super::net::DataCache,
     frame: &FrameBuf,
     epoch: u64,
-    counters: &Counters,
-) -> Result<bool, DbError> {
+    allow_synthesize: bool,
+) -> Result<Option<RemoteEvent>, DbError> {
     let opened = opener
         .open(&frame.header, &frame.prefix, &frame.body)
         .map_err(|_| DbError::Corrupt("ORDERED failed to open"))?;
@@ -645,30 +892,124 @@ fn apply_ordered(
     let payload = match fields.get(fid::F_EXTRA) {
         Some(extra) => EventPayload::decode(kind_for(class), extra)
             .map_err(|_| DbError::Corrupt("ORDERED payload does not decode"))?,
+        None if !allow_synthesize => return Ok(None),
         None => synthesize_payload(store, class, path, path2, offset, &fields)?,
     };
-    let bytes = data_session.and_then(|session| data.take(session));
-    let outcome = store.apply_remote(
-        frame.header.seq.get() as i64,
-        epoch as i64,
+    Ok(Some(RemoteEvent {
+        seq: frame.header.seq.get() as i64,
+        epoch: epoch as i64,
         op_id,
-        "ok",
-        &payload,
-        path,
-        path2,
-        bytes.as_deref(),
-    )?;
-    match outcome {
-        super::db::ApplyOutcome::Applied => {
-            Counters::bump(&counters.ops_applied);
-            Ok(true)
-        }
-        super::db::ApplyOutcome::Duplicate => {
-            Counters::bump(&counters.ops_duplicate);
-            Ok(false)
-        }
-        super::db::ApplyOutcome::Rejected => Ok(true),
+        result: "ok".to_owned(),
+        payload,
+        path: path.map(str::to_owned),
+        path2: path2.map(str::to_owned),
+        data: data_session.and_then(|session| data.take(session)),
+    }))
+}
+
+/// Apply and clear the pending replay batch.
+///
+/// Returns the highest sequence the transaction reached (including duplicates
+/// and a rejection). `Err(())` means a fatal signal was sent and the downlink
+/// must stop.
+async fn flush_replay(
+    store: &ClientDb,
+    pending: &mut Vec<RemoteEvent>,
+    pending_bytes: &mut usize,
+    watermark: &AtomicI64,
+    counters: &Counters,
+    signal: &mpsc::Sender<Signal>,
+) -> Result<Option<i64>, ()> {
+    if pending.is_empty() {
+        return Ok(None);
     }
+    tracing::debug!(
+        event = "replay_batch",
+        events = pending.len(),
+        bytes = *pending_bytes,
+        "applying a replay batch"
+    );
+    let report = match store.apply_remote_batch(pending) {
+        Ok(report) => report,
+        Err(error) => {
+            tracing::error!(
+                event = "apply",
+                events = pending.len(),
+                error = %error,
+                "cannot apply an event batch"
+            );
+            Counters::bump(&counters.materialize_errors);
+            let _ = signal.send(Signal::Fatal(format!("apply: {error}"))).await;
+            return Err(());
+        }
+    };
+    let mut last = None;
+    for (event, outcome) in pending.iter().zip(report.outcomes.iter()) {
+        last = Some(event.seq);
+        match outcome {
+            ApplyOutcome::Applied => {
+                Counters::bump(&counters.ops_applied);
+                watermark.store(event.seq, Ordering::Release);
+            }
+            ApplyOutcome::Duplicate => Counters::bump(&counters.ops_duplicate),
+            ApplyOutcome::Rejected => {
+                watermark.store(event.seq, Ordering::Release);
+            }
+        }
+    }
+    if report.rejected {
+        tracing::warn!(
+            event = "apply",
+            skipped = pending.len().saturating_sub(report.outcomes.len()),
+            "a rejection stopped the replay batch; the session will resync"
+        );
+    }
+    pending.clear();
+    *pending_bytes = 0;
+    Ok(last)
+}
+
+/// Commit the pending batch and react to its outcome.
+///
+/// Returns false when the downlink must stop because a fatal error was
+/// signalled or the session must resync.
+#[allow(clippy::too_many_arguments)]
+async fn settle_batch(
+    store: &ClientDb,
+    pending: &mut Vec<RemoteEvent>,
+    pending_bytes: &mut usize,
+    watermark: &AtomicI64,
+    counters: &Counters,
+    caught_up: &mut bool,
+    current_seq: u64,
+    gate: &WriteGate,
+    signal: &mpsc::Sender<Signal>,
+) -> bool {
+    let last = match flush_replay(store, pending, pending_bytes, watermark, counters, signal).await {
+        Ok(last) => last,
+        Err(()) => return false,
+    };
+    if let Some(seq) = last {
+        if !*caught_up && seq >= current_seq as i64 {
+            *caught_up = true;
+            // The server log is authoritative. Re-apply the pending local
+            // intent on top of it, off the FUSE path, before opening the gate.
+            if let Err(error) = store.replay_local_outbox() {
+                tracing::warn!(
+                    event = "replay_local",
+                    error = %error,
+                    "cannot re-apply the pending outbox"
+                );
+            }
+            gate.set(State::Steady);
+            let _ = signal.send(Signal::CaughtUp).await;
+        }
+    }
+    if store.needs_resync().unwrap_or(false) {
+        let _ = signal.send(Signal::Resync).await;
+        return false;
+    }
+    true
 }
 
 /// Rebuild an event payload from ORDERED fields when the peer omitted
@@ -716,6 +1057,7 @@ fn synthesize_payload(
             uid: fields.u32(fid::F_UID).ok().flatten(),
             gid: fields.u32(fid::F_GID).ok().flatten(),
             mtime_ns: fields.u64(fid::F_MTIME_NS).ok().flatten().map(|v| v as i64),
+            size: fields.u64(fid::F_LENGTH).ok().flatten(),
         },
         OpClass::RENAME => EventPayload::Rename { ino: object.ino },
         OpClass::UNLINK => EventPayload::Unlink { ino: object.ino },
@@ -774,14 +1116,46 @@ fn kind_for(class: OpClass) -> EventKind {
     }
 }
 
-fn decode_rejection(detail: &[u8]) -> Option<([u8; 16], i32)> {
+/// What one `ERROR` detail carried for the rejected operation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum RejectionState {
+    /// The server sent no snapshot; there is nothing to replace.
+    None,
+    /// The server's authoritative snapshot of the affected path.
+    Snapshot(Box<RejectState>),
+    /// The snapshot did not fit the detail; replay the server log instead.
+    Resync,
+}
+
+fn decode_rejection(detail: &[u8]) -> Option<([u8; 16], i32, RejectionState)> {
     if detail.len() < 20 {
         return None;
     }
     let mut op_id = [0u8; 16];
     op_id.copy_from_slice(&detail[..16]);
     let errno = i32::from_le_bytes([detail[16], detail[17], detail[18], detail[19]]);
-    Some((op_id, errno))
+    if detail.len() < 24 {
+        return Some((op_id, errno, RejectionState::None));
+    }
+    let len = u32::from_le_bytes([detail[20], detail[21], detail[22], detail[23]]);
+    let payload = &detail[24..];
+    let state = if len == u32::MAX {
+        // The server's snapshot exceeded the detail budget. Only this
+        // explicit sentinel asks for a replay.
+        RejectionState::Resync
+    } else if len == 0 || payload.len() < len as usize {
+        // A missing or truncated snapshot is not a replay request.
+        RejectionState::None
+    } else {
+        match bincode::serde::decode_from_slice(
+            &payload[..len as usize],
+            bincode::config::standard(),
+        ) {
+            Ok((state, _)) => RejectionState::Snapshot(Box::new(state)),
+            Err(_) => RejectionState::None,
+        }
+    };
+    Some((op_id, errno, state))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1161,11 +1535,11 @@ async fn send_wire(
         .encode()
         .map_err(|error| SessionError::Fatal(format!("payload encode: {error}")))?;
 
-    let class = if wire.off == 0 {
-        OpClass::WRITE
-    } else {
-        OpClass::PWRITE
-    };
+    // `WRITE` replaces the whole file with the stream; `PWRITE` patches the
+    // range at `F_OFFSET`. A write that starts at chunk zero but covers less
+    // than the file is still a patch, so the class must compare both the
+    // offset and the stream length against the object size.
+    let class = write_class(wire.off, data.len(), size);
     let mut fields = vec![
         (fid::F_CLIENT_ID, wire_client_id(store)),
         (fid::F_OP_ID, wire.op_id.as_bytes().to_vec()),
@@ -1178,7 +1552,7 @@ async fn send_wire(
         (fid::F_TOTAL_LEN, (data.len() as u64).to_le_bytes().to_vec()),
         (fid::F_DATA_HASH, hash.to_vec()),
     ];
-    if wire.off != 0 {
+    if class == OpClass::PWRITE {
         fields.push((fid::F_OFFSET, wire.off.to_le_bytes().to_vec()));
     }
     fields.push((fid::F_EXTRA, encoded));
@@ -1188,6 +1562,19 @@ async fn send_wire(
     let mut header = FrameHeader::new(MsgType::ORDERED, Flags::ENC, 0, Seq::UNSEQUENCED);
     let sealed = sealer.seal(&mut header, &Prefix::None, &body)?;
     send_raw(rpc, &header, &Prefix::None, sealed.as_bytes(), counters, conntrace).await
+}
+
+/// The wire class for one buffered write.
+///
+/// `WRITE` replaces the whole file with the stream. Only an offset-zero
+/// stream whose length equals the object size qualifies; every other range
+/// is a `PWRITE` patch.
+fn write_class(off: u64, len: usize, size: u64) -> OpClass {
+    if off == 0 && len as u64 == size {
+        OpClass::WRITE
+    } else {
+        OpClass::PWRITE
+    }
 }
 
 async fn send_meta(
@@ -1255,19 +1642,18 @@ async fn send_meta(
             uid,
             gid,
             mtime_ns,
+            size,
             ..
         } => {
             if let Some(mode) = mode {
                 fields.push((fid::F_MODE, mode.to_le_bytes().to_vec()));
             }
-            if let Some(uid) = uid {
-                fields.push((fid::F_UID, uid.to_le_bytes().to_vec()));
-            }
-            if let Some(gid) = gid {
-                fields.push((fid::F_GID, gid.to_le_bytes().to_vec()));
-            }
-            if let Some(mtime_ns) = mtime_ns {
-                fields.push((fid::F_MTIME_NS, (*mtime_ns as u64).to_le_bytes().to_vec()));
+            // `F_UID`, `F_GID` and `F_MTIME_NS` are already in the base
+            // fields from the post-change object; adding them again would
+            // duplicate a WCP field.
+            let _ = (uid, gid, mtime_ns);
+            if let Some(size) = size {
+                fields.push((fid::F_LENGTH, size.to_le_bytes().to_vec()));
             }
         }
         EventPayload::Rename { .. } => {
@@ -1407,10 +1793,59 @@ mod tests {
         let mut detail = vec![0xab; 16];
         detail.extend_from_slice(&(-28i32).to_le_bytes());
         detail.extend_from_slice(b"no space");
-        let (op_id, errno) = decode_rejection(&detail).unwrap();
+        let (op_id, errno, state) = decode_rejection(&detail).unwrap();
         assert_eq!(op_id, [0xab; 16]);
         assert_eq!(errno, -28);
+        assert_eq!(state, RejectionState::None);
         assert!(decode_rejection(&detail[..19]).is_none());
+    }
+
+    #[test]
+    fn a_resync_marker_decodes_as_resync() {
+        let mut detail = vec![0xab; 16];
+        detail.extend_from_slice(&(-17i32).to_le_bytes());
+        detail.extend_from_slice(&u32::MAX.to_le_bytes());
+        let (op_id, errno, state) = decode_rejection(&detail).unwrap();
+        assert_eq!(op_id, [0xab; 16]);
+        assert_eq!(errno, -17);
+        assert_eq!(state, RejectionState::Resync);
+    }
+
+    #[test]
+    fn an_empty_snapshot_length_decodes_as_none() {
+        let mut detail = vec![0xab; 16];
+        detail.extend_from_slice(&0i32.to_le_bytes());
+        detail.extend_from_slice(&0u32.to_le_bytes());
+        let (_, _, state) = decode_rejection(&detail).unwrap();
+        assert_eq!(state, RejectionState::None);
+    }
+
+    #[test]
+    fn a_rejection_snapshot_decodes_and_a_corrupt_one_stays_empty() {
+        let snapshot = RejectState {
+            path: "/big".to_owned(),
+            object: None,
+            chunks: Vec::new(),
+            data: Vec::new(),
+            parent: Some([3; 16]),
+            name: Some("big".to_owned()),
+        };
+        let encoded =
+            bincode::serde::encode_to_vec(&snapshot, bincode::config::standard()).unwrap();
+        let mut detail = vec![0xcd; 16];
+        detail.extend_from_slice(&0i32.to_le_bytes());
+        detail.extend_from_slice(&(encoded.len() as u32).to_le_bytes());
+        detail.extend_from_slice(&encoded);
+        let (_, _, state) = decode_rejection(&detail).unwrap();
+        assert_eq!(state, RejectionState::Snapshot(Box::new(snapshot)));
+
+        // A corrupt payload is not a resync request.
+        let mut corrupt = vec![0xcd; 16];
+        corrupt.extend_from_slice(&0i32.to_le_bytes());
+        corrupt.extend_from_slice(&3u32.to_le_bytes());
+        corrupt.extend_from_slice(&[0xff; 3]);
+        let (_, _, state) = decode_rejection(&corrupt).unwrap();
+        assert_eq!(state, RejectionState::None);
     }
 
     #[test]
@@ -1424,5 +1859,18 @@ mod tests {
         assert_eq!(kind_for(OpClass::UNLINK), EventKind::Unlink);
         assert_eq!(kind_for(OpClass::RMDIR), EventKind::Rmdir);
         assert_eq!(kind_for(OpClass::LINK), EventKind::Link);
+    }
+
+    #[test]
+    fn a_partial_write_from_offset_zero_is_a_pwrite() {
+        let size = 150 * 1024;
+        // One byte at offset zero over a larger file must not become WRITE:
+        // the server would replace the file with the single-byte stream.
+        assert_eq!(write_class(0, 1, size), OpClass::PWRITE);
+        assert_eq!(write_class(0, 64 * 1024, size), OpClass::PWRITE);
+        assert_eq!(write_class(10, 1, size), OpClass::PWRITE);
+        // The whole file at offset zero is the only WRITE.
+        assert_eq!(write_class(0, size as usize, size), OpClass::WRITE);
+        assert_eq!(write_class(0, 0, 0), OpClass::WRITE);
     }
 }

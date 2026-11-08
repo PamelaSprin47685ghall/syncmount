@@ -25,10 +25,9 @@ use std::os::unix::ffi::OsStrExt;
 use rusqlite::{OptionalExtension, params};
 
 use super::db::{CHUNK, ClientDb, DbError, Ino, join_path, now_ns};
+use super::writeback::InodeBuffer;
 use crate::store::Errno;
-use crate::store::sqlite::{
-    self, ChunkRef, EventPayload, Object, ObjectKind, ROOT_INO, WriteTx,
-};
+use crate::store::sqlite::{self, ChunkRef, EventPayload, Object, ObjectKind, ROOT_INO, WriteTx};
 
 /// Attributes a create carries into the event.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -110,8 +109,8 @@ impl ClientDb {
         let name_text = validate_name(name)?;
         let mtime_ns = now_ns();
         self.write(|tx| {
-            let parent_object = Self::object_in(tx, parent)?
-                .ok_or(DbError::Errno(Errno::ENOENT))?;
+            let parent_object =
+                Self::object_in(tx, parent)?.ok_or(DbError::Errno(Errno::ENOENT))?;
             if parent_object.deleted || !parent_object.kind.is_dir() {
                 return Err(DbError::Errno(Errno::ENOTDIR));
             }
@@ -198,8 +197,7 @@ impl ClientDb {
             if object.kind.is_dir() {
                 return Err(DbError::Errno(Errno::EPERM));
             }
-            let parent = Self::object_in(tx, newparent)?
-                .ok_or(DbError::Errno(Errno::ENOENT))?;
+            let parent = Self::object_in(tx, newparent)?.ok_or(DbError::Errno(Errno::ENOENT))?;
             if !parent.kind.is_dir() || parent.deleted {
                 return Err(DbError::Errno(Errno::ENOTDIR));
             }
@@ -234,6 +232,7 @@ impl ClientDb {
     /// Remove one non-directory entry.
     pub fn unlink(&self, parent: Ino, name: &OsStr) -> Result<(), DbError> {
         let name_text = validate_name(name)?;
+        self.flush_entry(parent, name)?;
         self.write(|tx| {
             let object = Self::remove_name(tx, parent, &name_text)?;
             if object.kind.is_dir() {
@@ -259,10 +258,9 @@ impl ClientDb {
     pub fn rmdir(&self, parent: Ino, name: &OsStr) -> Result<(), DbError> {
         let name_text = validate_name(name)?;
         self.write(|tx| {
-            let entry = Self::name_in(tx, parent, &name_text)?
-                .ok_or(DbError::Errno(Errno::ENOENT))?;
-            let object = Self::object_in(tx, entry)?
-                .ok_or(DbError::Errno(Errno::ENOENT))?;
+            let entry =
+                Self::name_in(tx, parent, &name_text)?.ok_or(DbError::Errno(Errno::ENOENT))?;
+            let object = Self::object_in(tx, entry)?.ok_or(DbError::Errno(Errno::ENOENT))?;
             if !object.kind.is_dir() {
                 return Err(DbError::Errno(Errno::ENOTDIR));
             }
@@ -305,17 +303,21 @@ impl ClientDb {
         }
         let old_text = validate_name(old_name)?;
         let new_text = validate_name(new_name)?;
+        self.flush_entry(old_parent, old_name)?;
+        self.flush_entry(new_parent, new_name)?;
         self.write(|tx| {
-            let entry = Self::name_in(tx, old_parent, &old_text)?
-                .ok_or(DbError::Errno(Errno::ENOENT))?;
-            let object = Self::object_in(tx, entry)?
-                .ok_or(DbError::Errno(Errno::ENOENT))?;
-            let new_parent_object = Self::object_in(tx, new_parent)?
-                .ok_or(DbError::Errno(Errno::ENOENT))?;
+            let entry =
+                Self::name_in(tx, old_parent, &old_text)?.ok_or(DbError::Errno(Errno::ENOENT))?;
+            let object = Self::object_in(tx, entry)?.ok_or(DbError::Errno(Errno::ENOENT))?;
+            let new_parent_object =
+                Self::object_in(tx, new_parent)?.ok_or(DbError::Errno(Errno::ENOENT))?;
             if !new_parent_object.kind.is_dir() || new_parent_object.deleted {
                 return Err(DbError::Errno(Errno::ENOTDIR));
             }
-            let old_path = Self::path_in(tx, entry)?;
+            // The source path is the directory entry being renamed, not the
+            // object's smallest path: a hard-linked inode has several names.
+            let old_parent_path = Self::path_in(tx, old_parent)?;
+            let old_path = join_path(&old_parent_path, &old_text);
             let new_parent_path = Self::path_in(tx, new_parent)?;
             let new_path = join_path(&new_parent_path, &new_text);
 
@@ -334,23 +336,27 @@ impl ClientDb {
                 if flags.noreplace {
                     return Err(Errno::EEXIST.into());
                 }
-                if target_ino != object.ino {
-                    let target_object = Self::object_in(tx, target_ino)?
-                        .ok_or(DbError::Errno(Errno::ENOENT))?;
-                    if target_object.kind.is_dir() {
-                        let children: i64 = tx.conn().query_row(
-                            "SELECT COUNT(*) FROM names WHERE parent = ?1",
-                            [target_ino.as_slice()],
-                            |row| row.get(0),
-                        )?;
-                        if children != 0 {
-                            return Err(DbError::Errno(Errno::ENOTEMPTY));
-                        }
-                    } else if object.kind.is_dir() {
-                        return Err(DbError::Errno(Errno::ENOTDIR));
-                    }
-                    Self::remove_name(tx, new_parent, &new_text)?;
+                if target_ino == object.ino {
+                    // POSIX: renaming one hard link of a file onto another
+                    // link of the same file succeeds and does nothing. Both
+                    // names stay and no event is needed.
+                    return Ok(());
                 }
+                let target_object =
+                    Self::object_in(tx, target_ino)?.ok_or(DbError::Errno(Errno::ENOENT))?;
+                if target_object.kind.is_dir() {
+                    let children: i64 = tx.conn().query_row(
+                        "SELECT COUNT(*) FROM names WHERE parent = ?1",
+                        [target_ino.as_slice()],
+                        |row| row.get(0),
+                    )?;
+                    if children != 0 {
+                        return Err(DbError::Errno(Errno::ENOTEMPTY));
+                    }
+                } else if object.kind.is_dir() {
+                    return Err(DbError::Errno(Errno::ENOTDIR));
+                }
+                Self::remove_name(tx, new_parent, &new_text)?;
             }
 
             let seq = Self::next_local_seq(tx)?;
@@ -380,106 +386,250 @@ impl ClientDb {
         })
     }
 
-    /// Write at an offset. Returns the number of bytes written.
+    /// Buffer a write and return. The bytes are visible to local reads at
+    /// once; SQLite receives them on the next flush or background commit.
     pub fn write_at(&self, ino: Ino, off: u64, data: &[u8]) -> Result<usize, DbError> {
         if data.is_empty() {
             return Ok(0);
         }
-        let mut db = self.lock_writer();
-        let snapshot = db.read()?;
-        let object = Self::object_in_read(&snapshot, ino)?
-            .ok_or(DbError::Errno(Errno::ENOENT))?;
-        if object.deleted {
-            return Err(DbError::Errno(Errno::ENOENT));
-        }
+        let object = self.getattr(ino)?;
         if object.kind.is_dir() {
             return Err(DbError::Errno(Errno::EISDIR));
         }
         if !object.kind.is_file() {
             return Err(DbError::Errno(Errno::EINVAL));
         }
-        let old_refs = snapshot.object_chunks(ino)?;
-        let mut by_no: BTreeMap<u32, ChunkRef> =
-            old_refs.iter().map(|chunk| (chunk.chunk_no, chunk.clone())).collect();
-        let old_size = object.size;
+        off.checked_add(data.len() as u64)
+            .ok_or(DbError::Errno(Errno::EOVERFLOW))?;
+
+        if self.writeback.insert(ino, off, data) {
+            self.writeback.note_cap_hit();
+            tracing::warn!(
+                event = "writeback_cap",
+                buffered = self.writeback.stats().buffered_bytes,
+                cap = self.writeback.config().max_bytes,
+                "write-back buffer reached its soft cap; committing synchronously"
+            );
+            if let Err(error) = self.flush_all() {
+                tracing::warn!(
+                    event = "writeback_cap_flush",
+                    error = %error,
+                    "synchronous cap commit failed; the bytes stay buffered"
+                );
+            }
+        }
+        Ok(data.len())
+    }
+
+    /// Commit one buffered inode into SQLite and the outbox.
+    ///
+    /// All ranges held for the inode become one `Write` event whose offset
+    /// spans them and whose chunk list carries every touched chunk. This is
+    /// the same chunk-granular overwrite the synchronous path used, with a
+    /// window of at most one flush interval.
+    /// Commit a whole write-back tick in one transaction.
+    ///
+    /// Every dirty inode is part of the same `BEGIN IMMEDIATE` and the same
+    /// commit. A failure rolls the whole batch back; no inode is committed
+    /// alone. There is no inode or byte cap here: the buffer's memory bound is
+    /// the only limit.
+    pub(crate) fn commit_buffered_batch(
+        &self,
+        batch: &[(Ino, &InodeBuffer)],
+    ) -> Result<(), DbError> {
+        if batch.is_empty() {
+            return Ok(());
+        }
+        let mut db = self.lock_writer();
+        let tx = db.write()?;
+        for (ino, buffer) in batch {
+            Self::commit_buffered_in_tx(&tx, *ino, buffer)?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn commit_buffered_in_tx(
+        tx: &WriteTx<'_>,
+        ino: Ino,
+        buffer: &InodeBuffer,
+    ) -> Result<(), DbError> {
+        if buffer.is_empty() {
+            return Ok(());
+        }
+        let Some(mut object) = Self::object_in(tx, ino)? else {
+            return Err(DbError::Errno(Errno::ENOENT));
+        };
+        if object.deleted {
+            return Err(DbError::Errno(Errno::ENOENT));
+        }
+        if !object.kind.is_file() {
+            return Err(DbError::Errno(Errno::EINVAL));
+        }
+
+        let old_refs = Self::object_chunks_in(tx, ino)?;
+        let mut by_no: BTreeMap<u32, ChunkRef> = old_refs
+            .into_iter()
+            .map(|chunk| (chunk.chunk_no, chunk))
+            .collect();
+        let mut written: BTreeMap<u32, ChunkRef> = BTreeMap::new();
+        let mut min_off = u64::MAX;
+        let mut max_end = 0u64;
+        for (off, data) in buffer.segments() {
+            if data.is_empty() {
+                continue;
+            }
+            let end = off
+                .checked_add(data.len() as u64)
+                .ok_or(DbError::Errno(Errno::EOVERFLOW))?;
+            Self::overlay_in(tx, &mut object.size, &mut by_no, off, data, &mut written)?;
+            min_off = min_off.min(off);
+            max_end = max_end.max(end);
+        }
+        if min_off == u64::MAX {
+            return Ok(());
+        }
+
+        let size = object.size;
+        // A short chunk that was final before this commit is no longer final
+        // once a later range extends the file. Pad it so `assemble_chunks`
+        // does not replace it with a zero chunk.
+        let chunk_numbers: Vec<u32> = by_no.keys().copied().collect();
+        for chunk_no in chunk_numbers {
+            let chunk_start = u64::from(chunk_no) * CHUNK;
+            if chunk_start >= size {
+                by_no.remove(&chunk_no);
+                continue;
+            }
+            let expected = ((size - chunk_start).min(CHUNK)) as u32;
+            let Some(reference) = by_no.get(&chunk_no).cloned() else {
+                continue;
+            };
+            if reference.len == expected {
+                continue;
+            }
+            let mut bytes = Self::chunk_data_in(tx, reference.hash)?
+                .ok_or(DbError::MissingChunk(reference.hash))?;
+            bytes.resize(expected as usize, 0);
+            let reference = Self::put_chunk_ref(tx, chunk_no, &bytes)?;
+            by_no.insert(chunk_no, reference.clone());
+            written.insert(chunk_no, reference);
+            // The event range must cover every chunk it carries.
+            min_off = min_off.min(chunk_start);
+            max_end = max_end.max(chunk_start + u64::from(expected));
+        }
+
+        // The event's chunk list is also the uplink's byte stream: `send_wire`
+        // walks it in chunk order. Every chunk between the first and the last
+        // touched chunk must be present, or the holes vanish and the later
+        // chunks land at the wrong offsets on the server. Fill each untouched
+        // hole with its zero chunk; the local tree already got the same zero
+        // chunk from `assemble_chunks`.
+        let first_chunk = u32::try_from(min_off / CHUNK)
+            .map_err(|_| DbError::Corrupt("chunk number out of range"))?;
+        let last_chunk = u32::try_from((max_end - 1) / CHUNK)
+            .map_err(|_| DbError::Corrupt("chunk number out of range"))?;
+        for chunk_no in first_chunk..=last_chunk {
+            if written.contains_key(&chunk_no) {
+                continue;
+            }
+            let chunk_start = u64::from(chunk_no) * CHUNK;
+            let len = ((size - chunk_start).min(CHUNK)) as u32;
+            let reference = Self::zero_chunk(tx, chunk_no, len)?;
+            by_no.insert(chunk_no, reference.clone());
+            written.insert(chunk_no, reference);
+        }
+
+        let refs = Self::assemble_chunks(tx, size, &by_no)?;
+        let file_root = sqlite::file_root(ObjectKind::File, None, &refs);
+        let mtime_ns = now_ns();
+        object.size = size;
+        object.block_count =
+            u32::try_from(refs.len()).map_err(|_| DbError::Corrupt("too many chunks"))?;
+        object.file_root = file_root;
+        object.mtime_ns = mtime_ns;
+        object.updated_seq = Self::current_local_seq(tx)?;
+        tx.put_object(&object)?;
+        tx.set_object_chunks(ino, &refs)?;
+
+        let chunks: Vec<ChunkRef> = written.into_values().collect();
+        let payload = EventPayload::Write {
+            ino,
+            offset: min_off,
+            len: max_end - min_off,
+            size,
+            file_root,
+            mtime_ns,
+            chunks: chunks.clone(),
+        };
+        let seq = Self::next_local_seq(tx)?;
+        let op_id = alloc_op_id();
+        let path = Self::path_in(tx, ino)?;
+        Self::enqueue(tx, op_id, &payload, Some(&path), None, &chunks, seq)?;
+        Ok(())
+    }
+
+    /// Apply one byte range to the chunk map inside a write transaction.
+    fn overlay_in(
+        tx: &WriteTx<'_>,
+        size: &mut u64,
+        by_no: &mut BTreeMap<u32, ChunkRef>,
+        off: u64,
+        data: &[u8],
+        written: &mut BTreeMap<u32, ChunkRef>,
+    ) -> Result<(), DbError> {
         let end = off
             .checked_add(data.len() as u64)
             .ok_or(DbError::Errno(Errno::EOVERFLOW))?;
-        let new_size = old_size.max(end);
+        let new_size = (*size).max(end);
         let first = off / CHUNK;
         let last = (end - 1) / CHUNK;
-        let mtime_ns = now_ns();
-
-        let tx = db.write()?;
-        let mut written = Vec::new();
         for chunk_no in first..=last {
             let chunk_no_u32 = u32::try_from(chunk_no)
                 .map_err(|_| DbError::Corrupt("chunk number out of range"))?;
             let chunk_start = chunk_no * CHUNK;
             let final_len = ((new_size - chunk_start).min(CHUNK)) as u32;
-            let mut buffer = if chunk_no_u32 as u64 * CHUNK < old_size {
-                match by_no.get(&chunk_no_u32) {
-                    Some(existing) => {
-                        let chunk = snapshot
-                            .chunk(existing.hash)?
-                            .ok_or(DbError::MissingChunk(existing.hash))?;
-                        chunk
-                            .data
-                            .ok_or(DbError::MissingChunk(existing.hash))?
-                    }
-                    None => Vec::new(),
-                }
-            } else {
-                Vec::new()
-            };
-            buffer.resize(final_len as usize, 0);
             let write_start = off.max(chunk_start);
             let write_end = end.min(chunk_start + CHUNK);
+            let covers_chunk =
+                write_start == chunk_start && write_end == chunk_start + u64::from(final_len);
+            let mut bytes = if covers_chunk {
+                Vec::new()
+            } else {
+                match by_no.get(&chunk_no_u32) {
+                    Some(existing) => Self::chunk_data_in(tx, existing.hash)?
+                        .ok_or(DbError::MissingChunk(existing.hash))?,
+                    None => Vec::new(),
+                }
+            };
+            bytes.resize(final_len as usize, 0);
             if write_start < write_end {
                 let from = (write_start - chunk_start) as usize;
                 let to = (write_end - chunk_start) as usize;
                 let src = (write_start - off) as usize;
-                buffer[from..to].copy_from_slice(&data[src..src + (to - from)]);
+                bytes[from..to].copy_from_slice(&data[src..src + (to - from)]);
             }
-            let reference = Self::put_chunk_ref(&tx, chunk_no_u32, &buffer)?;
+            let reference = Self::put_chunk_ref(tx, chunk_no_u32, &bytes)?;
             by_no.insert(chunk_no_u32, reference.clone());
-            written.push(reference);
+            written.insert(chunk_no_u32, reference);
         }
-
-        let refs = Self::assemble_chunks(&tx, new_size, &by_no)?;
-        let file_root = sqlite::file_root(ObjectKind::File, None, &refs);
-        let mut updated = object.clone();
-        updated.size = new_size;
-        updated.block_count = u32::try_from(refs.len())
-            .map_err(|_| DbError::Corrupt("too many chunks"))?;
-        updated.file_root = file_root;
-        updated.mtime_ns = mtime_ns;
-        updated.updated_seq = Self::current_local_seq(&tx)?;
-        tx.put_object(&updated)?;
-        tx.set_object_chunks(ino, &refs)?;
-        let payload = EventPayload::Write {
-            ino,
-            offset: off,
-            len: data.len() as u64,
-            size: new_size,
-            file_root,
-            mtime_ns,
-            chunks: written.clone(),
-        };
-        let seq = Self::next_local_seq(&tx)?;
-        let op_id = alloc_op_id();
-        let path = Self::path_in(&tx, ino)?;
-        Self::enqueue(&tx, op_id, &payload, Some(&path), None, &written, seq)?;
-        tx.commit()?;
-        Ok(data.len())
+        *size = new_size;
+        Ok(())
     }
 
-    /// Truncate a regular file.
-    pub fn truncate(&self, ino: Ino, size: u64) -> Result<(), DbError> {
-        let mut db = self.lock_writer();
-        let snapshot = db.read()?;
-        let object = Self::object_in_read(&snapshot, ino)?
-            .ok_or(DbError::Errno(Errno::ENOENT))?;
+    /// Apply a size change inside `tx` and return the touched chunks.
+    ///
+    /// The caller owns the transaction and decides which event records the
+    /// change. `truncate` records a `truncate` event; a size-changing
+    /// `setattr` records one `setattr` event that carries size and metadata
+    /// together. Both keep the object row, the chunk list and the outbox row
+    /// in one commit.
+    fn resize_in(
+        tx: &WriteTx<'_>,
+        ino: Ino,
+        size: u64,
+    ) -> Result<(Object, Vec<ChunkRef>), DbError> {
+        let mut object = Self::object_in(tx, ino)?.ok_or(DbError::Errno(Errno::ENOENT))?;
         if object.deleted {
             return Err(DbError::Errno(Errno::ENOENT));
         }
@@ -490,32 +640,27 @@ impl ClientDb {
             return Err(DbError::Errno(Errno::EINVAL));
         }
         if object.size == size {
-            return Ok(());
+            return Ok((object, Vec::new()));
         }
-        let old_refs = snapshot.object_chunks(ino)?;
-        let mut by_no: BTreeMap<u32, ChunkRef> =
-            old_refs.iter().map(|chunk| (chunk.chunk_no, chunk.clone())).collect();
+        let old_refs = Self::object_chunks_in(tx, ino)?;
+        let mut by_no: BTreeMap<u32, ChunkRef> = old_refs
+            .into_iter()
+            .map(|chunk| (chunk.chunk_no, chunk))
+            .collect();
         let old_size = object.size;
         let mtime_ns = now_ns();
-
-        let tx = db.write()?;
         let mut touched = Vec::new();
         if size > old_size {
             // Extend the boundary chunk with zeroes when the old size was not
             // chunk-aligned; `assemble_chunks` fills whole missing chunks.
             let chunk_no = old_size / CHUNK;
             if let Some(existing) = by_no.get(&(chunk_no as u32)).cloned() {
-                let chunk = snapshot
-                    .chunk(existing.hash)?
-                    .ok_or(DbError::MissingChunk(existing.hash))?;
-                let mut buffer = chunk
-                    .data
+                let mut buffer = Self::chunk_data_in(tx, existing.hash)?
                     .ok_or(DbError::MissingChunk(existing.hash))?;
                 let final_len = ((size - chunk_no * CHUNK).min(CHUNK)) as usize;
                 if buffer.len() < final_len {
                     buffer.resize(final_len, 0);
-                    let reference =
-                        Self::put_chunk_ref(&tx, chunk_no as u32, &buffer)?;
+                    let reference = Self::put_chunk_ref(tx, chunk_no as u32, &buffer)?;
                     by_no.insert(chunk_no as u32, reference.clone());
                     touched.push(reference);
                 }
@@ -525,15 +670,10 @@ impl ClientDb {
             let chunk_no = size / CHUNK;
             if size % CHUNK != 0 {
                 if let Some(existing) = by_no.get(&(chunk_no as u32)).cloned() {
-                    let chunk = snapshot
-                        .chunk(existing.hash)?
-                        .ok_or(DbError::MissingChunk(existing.hash))?;
-                    let mut buffer = chunk
-                        .data
+                    let mut buffer = Self::chunk_data_in(tx, existing.hash)?
                         .ok_or(DbError::MissingChunk(existing.hash))?;
                     buffer.truncate((size - chunk_no * CHUNK) as usize);
-                    let reference =
-                        Self::put_chunk_ref(&tx, chunk_no as u32, &buffer)?;
+                    let reference = Self::put_chunk_ref(tx, chunk_no as u32, &buffer)?;
                     by_no.insert(chunk_no as u32, reference.clone());
                     touched.push(reference);
                 }
@@ -541,47 +681,85 @@ impl ClientDb {
             let keep = size.div_ceil(CHUNK) as u32;
             by_no.retain(|chunk_no, _| *chunk_no < keep);
         }
-        let refs = Self::assemble_chunks(&tx, size, &by_no)?;
+        let refs = Self::assemble_chunks(tx, size, &by_no)?;
         let file_root = sqlite::file_root(ObjectKind::File, None, &refs);
-        let mut updated = object.clone();
-        updated.size = size;
-        updated.block_count = u32::try_from(refs.len())
-            .map_err(|_| DbError::Corrupt("too many chunks"))?;
-        updated.file_root = file_root;
-        updated.mtime_ns = mtime_ns;
-        updated.updated_seq = Self::current_local_seq(&tx)?;
-        tx.put_object(&updated)?;
+        object.size = size;
+        object.block_count =
+            u32::try_from(refs.len()).map_err(|_| DbError::Corrupt("too many chunks"))?;
+        object.file_root = file_root;
+        object.mtime_ns = mtime_ns;
+        object.updated_seq = Self::current_local_seq(tx)?;
+        tx.put_object(&object)?;
         tx.set_object_chunks(ino, &refs)?;
+        Ok((object, touched))
+    }
+
+    /// Apply a size change and enqueue its `truncate` event inside `tx`.
+    fn truncate_in(tx: &WriteTx<'_>, ino: Ino, size: u64) -> Result<Object, DbError> {
+        let current = Self::object_in(tx, ino)?.ok_or(DbError::Errno(Errno::ENOENT))?;
+        if current.deleted {
+            return Err(DbError::Errno(Errno::ENOENT));
+        }
+        if current.kind.is_dir() {
+            return Err(DbError::Errno(Errno::EISDIR));
+        }
+        if !current.kind.is_file() {
+            return Err(DbError::Errno(Errno::EINVAL));
+        }
+        if current.size == size {
+            return Ok(current);
+        }
+        let (object, touched) = Self::resize_in(tx, ino, size)?;
+        let file_root = object.file_root;
+        let mtime_ns = object.mtime_ns;
         let payload = EventPayload::Truncate {
             ino,
             size,
             file_root,
             mtime_ns,
         };
-        let seq = Self::next_local_seq(&tx)?;
+        let seq = Self::next_local_seq(tx)?;
         let op_id = alloc_op_id();
-        let path = Self::path_in(&tx, ino)?;
-        Self::enqueue(&tx, op_id, &payload, Some(&path), None, &touched, seq)?;
-        tx.commit()?;
-        Ok(())
+        let path = Self::path_in(tx, ino)?;
+        Self::enqueue(tx, op_id, &payload, Some(&path), None, &touched, seq)?;
+        Ok(object)
     }
 
-    /// Apply attribute changes, including a size change.
+    /// Truncate a regular file in one transaction.
+    pub fn truncate(&self, ino: Ino, size: u64) -> Result<(), DbError> {
+        self.flush_ino(ino)?;
+        self.write(|tx| {
+            Self::truncate_in(tx, ino, size)?;
+            Ok(())
+        })
+    }
+
+    /// Apply attribute changes, including a size change, in one transaction.
+    ///
+    /// A size change and the metadata change become one `setattr` event, so
+    /// the server commits both in one transaction and a crash cannot leave
+    /// the new size with the old mode.
     pub fn setattr(&self, ino: Ino, change: AttrChange) -> Result<Object, DbError> {
-        let object = self.getattr(ino)?;
-        if let Some(size) = change.size {
-            if size != object.size {
-                self.truncate(ino, size)?;
-            }
+        if change.size.is_some() {
+            self.flush_ino(ino)?;
         }
         let mtime_ns = change.mtime_ns.unwrap_or_else(now_ns);
         self.write(|tx| {
-            let mut object = Self::object_in(tx, ino)?
-                .ok_or(DbError::Errno(Errno::ENOENT))?;
+            let mut object = Self::object_in(tx, ino)?.ok_or(DbError::Errno(Errno::ENOENT))?;
             if object.deleted {
                 return Err(DbError::Errno(Errno::ENOENT));
             }
-            let mut changed = false;
+            let mut touched = Vec::new();
+            let mut size_changed = false;
+            if let Some(size) = change.size {
+                if size != object.size {
+                    let (resized, chunks) = Self::resize_in(tx, ino, size)?;
+                    object = resized;
+                    touched = chunks;
+                    size_changed = true;
+                }
+            }
+            let mut changed = size_changed;
             if let Some(mode) = change.mode {
                 if object.mode != mode {
                     object.mode = mode;
@@ -617,29 +795,52 @@ impl ClientDb {
                 mode: change.mode,
                 uid: change.uid,
                 gid: change.gid,
-                mtime_ns: change.mtime_ns.map(|_| mtime_ns),
+                mtime_ns: if size_changed {
+                    Some(object.mtime_ns)
+                } else {
+                    change.mtime_ns.map(|_| mtime_ns)
+                },
+                size: if size_changed { Some(object.size) } else { None },
             };
-            Self::enqueue(tx, op_id, &payload, Some(&path), None, &[], seq)?;
+            Self::enqueue(tx, op_id, &payload, Some(&path), None, &touched, seq)?;
             Ok(object)
         })
     }
 
-    /// `fsync`: commit the WAL and return. Durability is local, not remote.
+    /// `fsync`: commit buffered writes, sync the WAL and return.
+    ///
+    /// Durability is local, not remote. The checkpoint moved to the
+    /// background PASSIVE thread: copying WAL pages into the main database is
+    /// housekeeping, and doing it here made every `fsync` wait for a
+    /// TRUNCATE checkpoint that a concurrent reader can block.
     pub fn fsync(&self) -> Result<(), DbError> {
-        let db = self.lock_reader();
-        db.checkpoint_wal()?;
-        Ok(())
+        self.flush_all()?;
+        self.sync_wal()
     }
 
     /// Drop chunks no longer referenced by the tree or the outbox.
     pub fn gc_chunks(&self) -> Result<u64, DbError> {
         self.write(|tx| {
-            let removed = tx.conn().execute("DELETE FROM chunks WHERE refcount = 0", [])?;
+            let removed = tx
+                .conn()
+                .execute("DELETE FROM chunks WHERE refcount = 0", [])?;
             Ok(removed as u64)
         })
     }
 
     // -- helpers -----------------------------------------------------------
+
+    /// Commit the buffered data of one directory entry, if the entry exists.
+    ///
+    /// Namespace mutations call this before changing the tree so a buffered
+    /// write keeps its outbox position ahead of the rename/unlink event.
+    fn flush_entry(&self, parent: Ino, name: &OsStr) -> Result<(), DbError> {
+        match self.lookup(parent, name) {
+            Ok(object) => self.flush_ino(object.ino),
+            Err(DbError::Errno(Errno::ENOENT)) => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
 
     fn current_local_seq(tx: &WriteTx<'_>) -> Result<i64, DbError> {
         let value: Option<i64> = tx
@@ -668,7 +869,11 @@ impl ClientDb {
         path.ok_or(DbError::Errno(Errno::ENOENT))
     }
 
-    pub(crate) fn name_in(tx: &WriteTx<'_>, parent: Ino, name: &str) -> Result<Option<Ino>, DbError> {
+    pub(crate) fn name_in(
+        tx: &WriteTx<'_>,
+        parent: Ino,
+        name: &str,
+    ) -> Result<Option<Ino>, DbError> {
         let bytes: Option<Vec<u8>> = tx
             .conn()
             .query_row(

@@ -1,6 +1,6 @@
 # Known limitations
 
-Status: normative design boundary for syncmount v2 (protocol 2.0). This
+Status: normative design boundary for syncmount v2 (protocol 3.0). This
 document states the guarantees the design makes, the guarantees it weakens,
 and the behaviour it refuses. It describes the design, not a particular build.
 
@@ -31,11 +31,41 @@ operation. A large write may be split into several wire operations.
 
 ### 1.2 Every mutation is local-first
 
-`write`, `truncate`, `setattr`, `create`, `mkdir`, `unlink`, `rmdir`,
-`rename`, `symlink`, `link` and lock operations commit one client SQLite
-transaction that updates the replica and appends the matching outbox row
-before the FUSE callback returns. The network is not consulted on the write
-path. There is no synchronous arbitration round trip.
+A `write` appends to a per-inode memory buffer and returns. The bytes are
+visible to local reads immediately, but they are volatile until the buffer is
+committed. A background thread commits the buffer as one client SQLite
+transaction that updates the replica and appends the matching outbox row,
+every 100 ms and whenever the soft buffer cap forces it. `flush`, `release`
+(close), `fsync`, `truncate`, a size-changing `setattr`, `unlink` and `rename`
+commit the affected buffer synchronously first; `create`, `mkdir`, `symlink`,
+`link`, `rmdir` and the namespace part of `unlink`/`rename` commit before the
+FUSE callback returns. The network is not consulted on the write path. There
+is no synchronous arbitration round trip.
+
+A crash loses every buffered write that was not committed. The window is at
+most one flush interval under normal load, or longer if the soft cap is
+exceeded and the synchronous commit fails. The cap defaults to 64 MiB, logs
+one warning when crossed and never returns `ENOSPC`. A normal process exit
+commits the buffer. Reads consult the buffer before SQLite, so read-after-write
+is consistent inside the window; `stat` reports the buffered size.
+
+Operation boundaries are explicit. One FUSE write request is inserted
+atomically; coalesced requests may share a transaction, but each request is
+fully in it or absent. `create`, `mkdir`, `symlink`, `link`, `rmdir`,
+`unlink`, `rename`, `truncate` and `setattr` each use one client transaction.
+`rename`/`unlink` first commit the related inode's buffered content in a
+separate transaction, then change names and objects in one transaction. A
+size-changing `setattr` is one `SETATTR` operation carrying `F_LENGTH` and the
+metadata fields, one outbox row and one `setattr` event. The server plans the
+new chunk list and the metadata change as one change set in one transaction,
+so a crash cannot leave the new size with the old mode. A client crash leaves
+an operation fully visible or completely absent; it cannot leave a committed
+size with a partial chunk list. The client's own
+data echo is acknowledgement-only and never
+re-applies the payload, so it cannot roll back a newer local write. A rename or
+link echo is applied: the server resolves paths, so its event may name a
+different inode than the optimistic local operation, and skipping the echo
+would leave this replica permanently split.
 
 Reads use the local replica only. During the convergence window a reader can
 see old data, an old directory listing or old attributes. The design target is
@@ -43,16 +73,19 @@ about 100 ms on a LAN and about 1 s on a public network; no latency is
 guaranteed.
 
 Concurrent writes to the same offset are resolved by last-writer-wins in
-server sequence order. Concurrent writes to non-overlapping ranges are merged
-by the client coalescer before they reach the server.
+server sequence order. The write-back buffer merges the ranges of one inode
+into one event. Its chunk list is contiguous: holes between the first and the
+last touched chunk are filled with zero chunks, so every chunk keeps its server
+offset in the uplink stream. (The coalescer only joins adjacent ranges.)
 
-A server rejection does **not** roll back the local SQLite effect. The outbox
-row becomes `failed` and keeps the errno. A rejected namespace operation (for
-example a create that lost a race) leaves the local name and object graph as
-the local transaction wrote it; the server's create event for the winner does
-not overwrite an existing local name. The replica can stay diverged until an epoch
-change or a new import. Writes to an existing path are last-writer-wins and do
-converge.
+A server rejection does **not** roll back unrelated local work. The outbox row
+stays in the local database as a `failed` tombstone with the server's errno;
+the server never applies it, and ordinary reconnects do not resend it. The
+affected path is repaired from the server: the ERROR detail carries the
+server's snapshot when it fits the 512-byte detail budget, and a larger
+snapshot falls back to a resync marker, so the client records the tombstone,
+reconnects and replays the server log. Other paths and pending operations are
+untouched. Writes to an existing path are last-writer-wins and do converge.
 
 ### 1.3 The outbox is durable
 
@@ -433,10 +466,12 @@ These are scope exclusions, not bugs and not promises:
 > data. A JOIN allows reads while it replays, so a reader can see a stale or
 > mixed tree; writes return `EROFS` until the replay completes.
 >
-> A server rejection marks the outbox row `failed` but does not roll back the
-> local effect. A rejected namespace operation can leave the replica diverged
-> until an epoch change or a new import; writes to an existing path converge by
-> last-writer-wins.
+> A server rejection marks the outbox row `failed` but does not roll back
+> unrelated local work. The row stays as a tombstone with the server's errno;
+> the server never applies it, and ordinary reconnects do not resend it. The
+> affected path is repaired from the server snapshot or by a full replay when
+> the snapshot exceeds the ERROR detail budget; writes to an existing path
+> converge by last-writer-wins.
 >
 > Names must be valid UTF-8 and at most 255 bytes. xattrs, POSIX ACLs, `fcntl`
 > record locks, device nodes, FIFOs and Unix sockets are not supported.

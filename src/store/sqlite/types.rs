@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use super::StoreError;
 
 /// Object kind, stored as the `objects.kind` text.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ObjectKind {
     File,
     Dir,
@@ -85,7 +85,7 @@ impl fmt::Display for ObjectKind {
 }
 
 /// A row of `objects`.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Object {
     pub ino: [u8; 16],
     pub kind: ObjectKind,
@@ -107,6 +107,23 @@ pub struct Object {
 ///
 /// `offset` is redundant with `chunk_no` (`offset = chunk_no * 64 KiB`) but is
 /// stored and carried on the wire so a reader never has to re-derive it.
+/// The server's authoritative state for one rejected path.
+///
+/// A rejection is point-to-point: the author receives this snapshot in the
+/// ERROR detail and replaces the affected path locally. Other clients never
+/// see it and it consumes no sequence number.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RejectState {
+    pub path: String,
+    pub object: Option<Object>,
+    pub chunks: Vec<ChunkRef>,
+    /// Plaintext for each chunk, aligned with `chunks`. Empty when the
+    /// server could not read a chunk.
+    pub data: Vec<Vec<u8>>,
+    pub parent: Option<[u8; 16]>,
+    pub name: Option<String>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChunkRef {
     pub chunk_no: u32,

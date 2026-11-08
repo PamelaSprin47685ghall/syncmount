@@ -60,10 +60,19 @@ pub struct ProtoVersion {
 impl ProtoVersion {
     /// Version 1.0.
     pub const V1_0: Self = Self { major: 1, minor: 0 };
-    /// Version 2.0: PSK handshake, clean break from 1.x.
+    /// Version 2.0: the retired PSK wire format.
+    ///
+    /// It had a 16-entry frame table and a three-flight handshake. Version
+    /// 3.0 replaced both; a 2.0 peer is rejected during negotiation.
     pub const V2_0: Self = Self { major: 2, minor: 0 };
+    /// Version 3.0: 1-RTT PSK handshake and the 14-entry frame table.
+    ///
+    /// `HELLO` carries the sealed `AUTH` and `WELCOME` carries the sealed
+    /// `ACCEPT`, so the wire format is not compatible with 2.0 even though
+    /// both use WCP. The major bump makes the break explicit.
+    pub const V3_0: Self = Self { major: 3, minor: 0 };
     /// The version this crate speaks.
-    pub const CURRENT: Self = Self::V2_0;
+    pub const CURRENT: Self = Self::V3_0;
 }
 
 /// WCP field-stream version carried in `F_WCP_VER`.
@@ -130,11 +139,11 @@ impl Caps {
     pub const BATCH_BROADCAST: Self = Self(1 << 2);
     /// Per-session keys. Reserved.
     pub const SESSION_KEYS: Self = Self(1 << 3);
-    /// PSK handshake support. Mandatory in v2. Reuses bit 5, which carried
+    /// PSK handshake support. Mandatory in v3. Reuses bit 5, which carried
     /// `OP_SIGNATURE` in v1.
     pub const PSK_AUTH: Self = Self(1 << 5);
 
-    /// Capabilities without which v2 cannot operate.
+    /// Capabilities without which v3 cannot operate.
     pub const REQUIRED: Self = Self(Self::CHACHA8_POLY1305.0 | Self::PSK_AUTH.0);
 
     /// No bits set.
@@ -284,7 +293,7 @@ impl std::error::Error for VersionError {}
 /// Rules (44 §6): majors must match, the minor is the lower of the two, caps
 /// are intersected, and both [`Caps::CHACHA8_POLY1305`] and
 /// [`Caps::PSK_AUTH`] must survive the intersection. There is no
-/// unencrypted or unauthenticated compatibility mode in v2.
+/// unencrypted, unauthenticated or older-wire compatibility mode in v3.
 pub fn negotiate(
     local: ProtoVersion,
     remote: ProtoVersion,
@@ -348,14 +357,14 @@ mod tests {
 
     #[test]
     fn negotiate_takes_lower_minor_and_capability_intersection() {
-        let local = ProtoVersion { major: 2, minor: 5 };
-        let remote = ProtoVersion { major: 2, minor: 2 };
+        let local = ProtoVersion { major: 3, minor: 5 };
+        let remote = ProtoVersion { major: 3, minor: 2 };
         let caps = Caps::REQUIRED
             .union(Caps::ZSTD)
             .union(Caps::BATCH_BROADCAST);
         let got = negotiate(local, remote, caps, Caps::REQUIRED.union(Caps::ZSTD))
             .expect("negotiation succeeds");
-        assert_eq!(got.proto, ProtoVersion { major: 2, minor: 2 });
+        assert_eq!(got.proto, ProtoVersion { major: 3, minor: 2 });
         assert_eq!(got.caps, Caps::REQUIRED.union(Caps::ZSTD));
         assert!(!got.caps.contains(Caps::BATCH_BROADCAST));
     }
@@ -363,8 +372,8 @@ mod tests {
     #[test]
     fn negotiate_rejects_major_mismatch() {
         let err = negotiate(
-            ProtoVersion { major: 1, minor: 0 },
-            ProtoVersion { major: 2, minor: 0 },
+            ProtoVersion::V3_0,
+            ProtoVersion::V2_0,
             Caps::REQUIRED,
             Caps::REQUIRED,
         )
@@ -372,7 +381,7 @@ mod tests {
         assert_eq!(
             err,
             VersionError::MajorMismatch {
-                local: 1,
+                local: 3,
                 remote: 2
             }
         );
@@ -410,20 +419,38 @@ mod tests {
     }
 
     #[test]
-    fn proto_current_is_major_two_and_rejects_v1() {
-        assert_eq!(ProtoVersion::CURRENT.major, 2);
+    fn proto_current_is_major_three_and_rejects_older_wire() {
+        assert_eq!(ProtoVersion::CURRENT.major, 3);
         assert_eq!(ProtoVersion::CURRENT.minor, 0);
+        assert_eq!(ProtoVersion::CURRENT, ProtoVersion::V3_0);
+        assert_eq!(ProtoVersion::V2_0, ProtoVersion { major: 2, minor: 0 });
+
+        let err = negotiate(
+            ProtoVersion::CURRENT,
+            ProtoVersion::V2_0,
+            Caps::REQUIRED,
+            Caps::REQUIRED,
+        )
+        .expect_err("the v2 wire format is not compatible with v3");
+        assert_eq!(
+            err,
+            VersionError::MajorMismatch {
+                local: 3,
+                remote: 2
+            }
+        );
+
         let err = negotiate(
             ProtoVersion::CURRENT,
             ProtoVersion::V1_0,
             Caps::REQUIRED,
             Caps::REQUIRED,
         )
-        .expect_err("v1 is not compatible with v2");
+        .expect_err("v1 is not compatible with v3");
         assert_eq!(
             err,
             VersionError::MajorMismatch {
-                local: 2,
+                local: 3,
                 remote: 1
             }
         );

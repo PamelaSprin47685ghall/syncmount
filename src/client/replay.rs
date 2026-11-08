@@ -1,9 +1,11 @@
 //! Applying the server's event stream to the client's SQLite tree.
 //!
-//! One event is one `BEGIN IMMEDIATE` transaction. The transaction updates
+//! One batch of up to 64 events (or 4 MiB of payload) is one
+//! `BEGIN IMMEDIATE` transaction. The transaction updates
 //! `objects`/`names`/`chunks`/`object_chunks`, acknowledges the matching
-//! outbox row, and advances `meta.applied_seq`. A crash therefore leaves the
-//! database either before or after an event, never half-way.
+//! outbox rows, and advances `meta.applied_seq` once. A crash therefore leaves
+//! the database either before or after the batch, never half-way; an error in
+//! any event rolls the whole batch back.
 //!
 //! # Ordering and idempotence
 //!
@@ -28,7 +30,8 @@ use super::db::{ApplyOutcome, ClientDb, DbError, Ino, OutboxState, now_ns, split
 use super::ops::{bump_nlink, validate_name};
 use crate::store::Errno;
 use crate::store::sqlite::{
-    self, ChunkRef, EventKind, EventPayload, Object, ObjectKind, ROOT_INO, ReadTx, WriteTx, keys,
+    self, ChunkRef, EventKind, EventPayload, Object, ObjectKind, ROOT_INO, ReadTx, RejectState,
+    WriteTx, keys,
 };
 
 /// Report from one seed scan.
@@ -43,6 +46,51 @@ pub struct SeedReport {
 /// applied a later deletion. A growing counter is a divergence signal, not
 /// an error: the server's order stays authoritative.
 const META_REPLAY_SKIPPED: &str = "replay_skipped";
+
+/// Largest number of events one replay transaction carries.
+pub const MAX_BATCH_EVENTS: usize = 64;
+
+/// Largest payload a batch carries before the caller flushes.
+pub const MAX_BATCH_BYTES: usize = 4 * 1024 * 1024;
+
+/// One server event, ready to join a replay batch.
+#[derive(Clone, Debug)]
+pub struct RemoteEvent {
+    pub seq: i64,
+    pub epoch: i64,
+    pub op_id: Option<[u8; 16]>,
+    /// `"ok"` or a rejection verdict.
+    pub result: String,
+    pub payload: EventPayload,
+    pub path: Option<String>,
+    pub path2: Option<String>,
+    pub data: Option<Vec<u8>>,
+}
+
+impl RemoteEvent {
+    /// Approximate memory the event occupies in a batch.
+    pub fn batch_bytes(&self) -> usize {
+        self.payload
+            .encode()
+            .map(|encoded| encoded.len())
+            .unwrap_or(0)
+            + self.data.as_ref().map_or(0, Vec::len)
+            + self.path.as_ref().map_or(0, String::len)
+            + self.path2.as_ref().map_or(0, String::len)
+    }
+}
+
+/// What one batch transaction did.
+#[derive(Clone, Debug)]
+pub struct BatchReport {
+    /// One outcome per event the transaction reached. A rejection truncates
+    /// this list; the caller must resync before applying later events.
+    pub outcomes: Vec<ApplyOutcome>,
+    /// The durable watermark after the commit.
+    pub applied_seq: i64,
+    /// True when the batch stopped at a rejection.
+    pub rejected: bool,
+}
 
 impl ClientDb {
     /// Apply one server event.
@@ -62,47 +110,170 @@ impl ClientDb {
         path2: Option<&str>,
         data: Option<&[u8]>,
     ) -> Result<ApplyOutcome, DbError> {
-        let mut db = self.lock_writer();
-        let snapshot = db.read()?;
-        let applied = snapshot.meta_i64(keys::APPLIED_SEQ)?;
-        let current_epoch = snapshot.meta_i64(keys::EPOCH)?;
-        if seq <= applied {
-            return Ok(ApplyOutcome::Duplicate);
-        }
-        if seq != applied + 1 {
-            return Err(DbError::Corrupt("event sequence gap"));
-        }
-        if epoch != current_epoch {
-            return Err(DbError::Corrupt("event epoch does not match the database"));
-        }
-
-        let tx = db.write()?;
-        if result != "ok" {
-            if let Some(op_id) = op_id {
-                // A verdict records the attempt the send path made, even
-                // when the verdict crosses that path's own update.
-                tx.conn().execute(
-                    "UPDATE outbox SET state = 'failed', attempts = MAX(attempts, 1)
-                     WHERE op_id = ?1",
-                    [op_id.as_slice()],
-                )?;
-            }
-            tx.set_meta_i64(keys::APPLIED_SEQ, seq)?;
-            tx.commit()?;
-            return Ok(ApplyOutcome::Rejected);
-        }
-
-        let acknowledged = match op_id {
-            Some(op_id) => Self::ack_outbox(&tx, op_id)?,
-            None => Vec::new(),
+        let event = RemoteEvent {
+            seq,
+            epoch,
+            op_id,
+            result: result.to_owned(),
+            payload: payload.clone(),
+            path: path.map(str::to_owned),
+            path2: path2.map(str::to_owned),
+            data: data.map(<[u8]>::to_vec),
         };
+        let report = self.apply_remote_batch(&[event])?;
+        Ok(report
+            .outcomes
+            .into_iter()
+            .next()
+            .unwrap_or(ApplyOutcome::Duplicate))
+    }
 
-        match payload {
+    /// Apply a contiguous run of server events in one transaction.
+    ///
+    /// The caller decides the cut (at most [`MAX_BATCH_EVENTS`] events or
+    /// [`MAX_BATCH_BYTES`] of payload); this method never splits a batch. One
+    /// `BEGIN IMMEDIATE` covers the whole run, so a crash leaves the database
+    /// before the batch or after it, never between two events. Every event
+    /// still follows the per-event rules: a duplicate is skipped, a gap or an
+    /// epoch mismatch fails the transaction, and a rejection records its
+    /// verdict and stops the batch.
+    ///
+    /// `applied_seq` is written once, after the last event, and becomes
+    /// durable with the commit. The own-echo ack, the own rename/link
+    /// application and the rejection verdict all see the tree as of the
+    /// preceding event because they read through the write transaction.
+    pub fn apply_remote_batch(&self, events: &[RemoteEvent]) -> Result<BatchReport, DbError> {
+        if events.len() > MAX_BATCH_EVENTS {
+            return Err(DbError::Corrupt("replay batch is too large"));
+        }
+        let mut db = self.lock_writer();
+        let tx = db.write()?;
+        let mut applied = tx.meta_i64(keys::APPLIED_SEQ)?;
+        let current_epoch = tx.meta_i64(keys::EPOCH)?;
+        let mut outcomes = Vec::with_capacity(events.len());
+        let mut acknowledged = Vec::new();
+        let mut rejected = false;
+
+        for event in events {
+            if event.seq <= applied {
+                outcomes.push(ApplyOutcome::Duplicate);
+                continue;
+            }
+            if event.seq != applied + 1 {
+                return Err(DbError::Corrupt("event sequence gap"));
+            }
+            if event.epoch != current_epoch {
+                return Err(DbError::Corrupt("event epoch does not match the database"));
+            }
+
+            if event.result != "ok" {
+                // A verdict records the attempt the send path made, even when
+                // the verdict crosses that path's own update. A rejection
+                // ends the batch: the caller must resync before applying
+                // anything newer.
+                if let Some(op_id) = event.op_id {
+                    tx.conn().execute(
+                        "UPDATE outbox SET state = 'failed', attempts = MAX(attempts, 1)
+                         WHERE op_id = ?1",
+                        [op_id.as_slice()],
+                    )?;
+                }
+                tx.set_meta_i64(super::db::KEY_NEEDS_RESYNC, 1)?;
+                applied = event.seq;
+                outcomes.push(ApplyOutcome::Rejected);
+                rejected = true;
+                break;
+            }
+
+            let acknowledged_op = match event.op_id {
+                Some(op_id) => Self::ack_outbox(&tx, op_id)?,
+                None => None,
+            };
+            if let Some(hashes) = &acknowledged_op {
+                acknowledged.extend_from_slice(hashes);
+            }
+            // During the post-reset replay the local tree starts empty, so an
+            // own event is the only thing that can rebuild it. Apply it like
+            // any other event and acknowledge the row; the older-echo hazard
+            // does not exist on an empty tree.
+            let replaying_local = tx
+                .meta_i64(super::db::KEY_REPLAY_LOCAL)
+                .unwrap_or(0)
+                != 0;
+            // Our own echo acknowledges the outbox row. Data operations stay
+            // ack-only: the local effect was committed in the same transaction
+            // that created that row, and the local state may have advanced past
+            // this event (the write buffer can commit several operations before
+            // the echo arrives), so applying the older payload would shrink the
+            // object and zero-fill chunks that a newer local commit already
+            // wrote.
+            //
+            // Namespace echoes are different. The server resolves paths, so a
+            // rename or link may have moved a different inode than the one our
+            // optimistic local operation touched. Skipping the echo would leave
+            // this replica permanently split from the server, so apply the
+            // server's effect to the local tree.
+            if acknowledged_op.is_some() && !replaying_local {
+                match &event.payload {
+                    EventPayload::Rename { ino } => {
+                        let old_path = event
+                            .path
+                            .as_deref()
+                            .ok_or(DbError::Corrupt("rename event without a path"))?;
+                        let new_path = event
+                            .path2
+                            .as_deref()
+                            .ok_or(DbError::Corrupt("rename event without a destination"))?;
+                        Self::apply_own_rename(&tx, event.seq, *ino, old_path, new_path)?;
+                    }
+                    EventPayload::Link { ino } => {
+                        let path = event
+                            .path2
+                            .as_deref()
+                            .or(event.path.as_deref())
+                            .ok_or(DbError::Corrupt("link event without a path"))?;
+                        Self::apply_own_link(&tx, event.seq, *ino, path)?;
+                    }
+                    _ => {}
+                }
+            } else {
+                Self::apply_payload(&tx, event)?;
+            }
+            applied = event.seq;
+            outcomes.push(ApplyOutcome::Applied);
+        }
+
+        tx.set_meta_i64(keys::APPLIED_SEQ, applied)?;
+        tx.set_meta_i64(keys::EPOCH, current_epoch)?;
+        let pending: i64 = tx.conn().query_row(
+            "SELECT COUNT(*) FROM outbox WHERE state IN ('pending', 'sent')",
+            [],
+            |row| row.get(0),
+        )?;
+        tx.set_meta_i64(keys::DIRTY, i64::from(pending != 0))?;
+        if !acknowledged.is_empty() {
+            Self::refresh_refcounts(&tx, &acknowledged)?;
+        }
+        tx.commit()?;
+        Ok(BatchReport {
+            outcomes,
+            applied_seq: applied,
+            rejected,
+        })
+    }
+
+    /// Apply one event's payload inside an open batch transaction.
+    fn apply_payload(tx: &WriteTx<'_>, event: &RemoteEvent) -> Result<(), DbError> {
+        let seq = event.seq;
+        let path = event.path.as_deref();
+        let path2 = event.path2.as_deref();
+        let data = event.data.as_deref();
+        match &event.payload {
             EventPayload::CreateFile { .. }
             | EventPayload::CreateDir { .. }
             | EventPayload::Symlink { .. } => {
                 let path = path.ok_or(DbError::Corrupt("create event without a path"))?;
-                Self::apply_create(&snapshot, &tx, seq, payload, path)?;
+                Self::apply_create(tx, seq, &event.payload, path)?;
             }
             EventPayload::Write {
                 ino,
@@ -114,8 +285,7 @@ impl ClientDb {
                 ..
             } => {
                 Self::apply_write(
-                    &snapshot, &tx, seq, *ino, *offset, *size, *file_root, *mtime_ns, chunks,
-                    data, path,
+                    tx, seq, *ino, *offset, *size, *file_root, *mtime_ns, chunks, data, path,
                 )?;
             }
             EventPayload::Truncate {
@@ -124,9 +294,7 @@ impl ClientDb {
                 file_root,
                 mtime_ns,
             } => {
-                Self::apply_truncate(
-                    &snapshot, &tx, seq, *ino, *size, *file_root, *mtime_ns, path,
-                )?;
+                Self::apply_truncate(tx, seq, *ino, *size, *file_root, *mtime_ns, path)?;
             }
             EventPayload::Setattr {
                 ino,
@@ -134,44 +302,40 @@ impl ClientDb {
                 uid,
                 gid,
                 mtime_ns,
+                size,
             } => {
-                match Self::object_in(&tx, *ino)? {
-                    Some(mut object) if !object.deleted => {
-                        if let Some(mode) = mode {
-                            object.mode = *mode;
-                        }
-                        if let Some(uid) = uid {
-                            object.uid = *uid;
-                        }
-                        if let Some(gid) = gid {
-                            object.gid = *gid;
-                        }
-                        if let Some(mtime_ns) = mtime_ns {
-                            object.mtime_ns = *mtime_ns;
-                        }
-                        object.updated_seq = seq;
-                        tx.put_object(&object)?;
-                    }
-                    _ => {
-                        Self::note_skip(&tx, seq, "setattr", *ino, path, "object is gone")?;
-                    }
+                if let Some(size) = size {
+                    Self::apply_truncate(
+                        tx,
+                        seq,
+                        *ino,
+                        *size,
+                        [0u8; 32],
+                        mtime_ns.unwrap_or(0),
+                        path,
+                    )?;
+                }
+                if !Self::apply_setattr_attrs(tx, seq, *ino, mode, uid, gid, mtime_ns)?
+                    && size.is_none()
+                {
+                    Self::note_skip(tx, seq, "setattr", *ino, path, "object is gone")?;
                 }
             }
             EventPayload::Rename { ino } => {
                 let old_path = path.ok_or(DbError::Corrupt("rename event without a path"))?;
                 let new_path =
                     path2.ok_or(DbError::Corrupt("rename event without a destination"))?;
-                Self::apply_rename(&snapshot, &tx, seq, *ino, old_path, new_path)?;
+                Self::apply_rename(tx, seq, *ino, old_path, new_path)?;
             }
             EventPayload::Unlink { ino } | EventPayload::Rmdir { ino } => {
                 let path = path.ok_or(DbError::Corrupt("unlink event without a path"))?;
-                Self::apply_remove(&snapshot, &tx, seq, *ino, path)?;
+                Self::apply_remove(tx, seq, *ino, path)?;
             }
             EventPayload::Link { ino } => {
                 let path = path2
                     .or(path)
                     .ok_or(DbError::Corrupt("link event without a path"))?;
-                Self::apply_link(&snapshot, &tx, seq, *ino, path)?;
+                Self::apply_link(tx, seq, *ino, path)?;
             }
             EventPayload::Lock { .. }
             | EventPayload::Unlock { .. }
@@ -181,25 +345,23 @@ impl ClientDb {
                 // effect in this client.
             }
         }
-
-        tx.set_meta_i64(keys::APPLIED_SEQ, seq)?;
-        tx.set_meta_i64(keys::EPOCH, epoch)?;
-        let pending: i64 = tx.conn().query_row(
-            "SELECT COUNT(*) FROM outbox WHERE state IN ('pending', 'sent')",
-            [],
-            |row| row.get(0),
-        )?;
-        tx.set_meta_i64(keys::DIRTY, i64::from(pending != 0))?;
-        if !acknowledged.is_empty() {
-            Self::refresh_refcounts(&tx, &acknowledged)?;
-        }
-        tx.commit()?;
-        Ok(ApplyOutcome::Applied)
+        Ok(())
     }
 
     /// Delete an outbox row (and any coalesced members stored in `undo`).
     /// Returns the chunk hashes whose refcount must be refreshed.
-    fn ack_outbox(tx: &WriteTx<'_>, op_id: [u8; 16]) -> Result<Vec<[u8; 32]>, DbError> {
+    fn ack_outbox(
+        tx: &WriteTx<'_>,
+        op_id: [u8; 16],
+    ) -> Result<Option<Vec<[u8; 32]>>, DbError> {
+        let exists: bool = tx.conn().query_row(
+            "SELECT EXISTS(SELECT 1 FROM outbox WHERE op_id = ?1)",
+            [op_id.as_slice()],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            return Ok(None);
+        }
         let undo: Option<Vec<u8>> = tx
             .conn()
             .query_row("SELECT undo FROM outbox WHERE op_id = ?1", [op_id.as_slice()], |row| {
@@ -233,11 +395,10 @@ impl ClientDb {
             tx.conn()
                 .execute("DELETE FROM outbox WHERE op_id = ?1", [member.as_slice()])?;
         }
-        Ok(hashes)
+        Ok(Some(hashes))
     }
 
     fn apply_create(
-        snapshot: &ReadTx,
         tx: &WriteTx<'_>,
         seq: i64,
         payload: &EventPayload,
@@ -326,12 +487,12 @@ impl ClientDb {
             return Ok(());
         };
 
-        let existing = Self::name_in_read(snapshot, parent, name)?;
+        let existing = Self::name_in_read(tx, parent, name)?;
         if let Some(existing_ino) = existing {
             if existing_ino != ino {
                 // The server's order is authoritative: detach the losing
                 // local entry, then link the winner.
-                Self::detach_name(snapshot, tx, parent, name, existing_ino, seq)?;
+                Self::detach_name(tx, parent, name, existing_ino, seq)?;
             }
         }
 
@@ -387,7 +548,6 @@ impl ClientDb {
 
     #[allow(clippy::too_many_arguments)]
     fn apply_write(
-        snapshot: &ReadTx,
         tx: &WriteTx<'_>,
         seq: i64,
         ino: Ino,
@@ -459,15 +619,20 @@ impl ClientDb {
                     }
                 }
                 None => {
+                    // The stream did not arrive and the chunk is not in the
+                    // local store. Advancing `applied_seq` here would make
+                    // the file permanently unreadable: a reconnect resumes
+                    // after this event and never asks for its content again.
+                    // Fail the transaction instead; the reconnect replays
+                    // this sequence with the server's content.
                     if Self::chunk_data_in(tx, chunk.hash)?.is_none() {
-                        Self::put_chunk_ref_lazy(tx, chunk.chunk_no, chunk.hash, chunk.len)?
-                    } else {
-                        ChunkRef {
-                            chunk_no: chunk.chunk_no,
-                            hash: chunk.hash,
-                            offset: chunk.offset,
-                            len: chunk.len,
-                        }
+                        return Err(DbError::MissingChunk(chunk.hash));
+                    }
+                    ChunkRef {
+                        chunk_no: chunk.chunk_no,
+                        hash: chunk.hash,
+                        offset: chunk.offset,
+                        len: chunk.len,
                     }
                 }
             };
@@ -493,13 +658,11 @@ impl ClientDb {
         object.updated_seq = seq;
         tx.put_object(&object)?;
         tx.set_object_chunks(ino, &refs)?;
-        let _ = snapshot;
         Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
     fn apply_truncate(
-        snapshot: &ReadTx,
         tx: &WriteTx<'_>,
         seq: i64,
         ino: Ino,
@@ -523,7 +686,7 @@ impl ClientDb {
         } else if size % u64::from(sqlite::CHUNK_BYTES) != 0 {
             let chunk_no = (size / u64::from(sqlite::CHUNK_BYTES)) as u32;
             if let Some(existing) = by_no.get(&chunk_no).cloned() {
-                let chunk = snapshot
+                let chunk = tx
                     .chunk(existing.hash)?
                     .ok_or(DbError::MissingChunk(existing.hash))?;
                 let mut bytes = chunk
@@ -552,8 +715,40 @@ impl ClientDb {
         Ok(())
     }
 
+    /// Apply the metadata half of a `setattr` event.
+    ///
+    /// Returns `false` when the object is gone; the caller decides whether
+    /// that is a normal echo or a skip worth recording.
+    fn apply_setattr_attrs(
+        tx: &WriteTx<'_>,
+        seq: i64,
+        ino: Ino,
+        mode: &Option<u32>,
+        uid: &Option<u32>,
+        gid: &Option<u32>,
+        mtime_ns: &Option<i64>,
+    ) -> Result<bool, DbError> {
+        let Some(mut object) = Self::object_in(tx, ino)?.filter(|object| !object.deleted) else {
+            return Ok(false);
+        };
+        if let Some(mode) = mode {
+            object.mode = *mode;
+        }
+        if let Some(uid) = uid {
+            object.uid = *uid;
+        }
+        if let Some(gid) = gid {
+            object.gid = *gid;
+        }
+        if let Some(mtime_ns) = mtime_ns {
+            object.mtime_ns = *mtime_ns;
+        }
+        object.updated_seq = seq;
+        tx.put_object(&object)?;
+        Ok(true)
+    }
+
     fn apply_rename(
-        snapshot: &ReadTx,
         tx: &WriteTx<'_>,
         seq: i64,
         ino: Ino,
@@ -599,7 +794,7 @@ impl ClientDb {
         }
         if let Some(target) = new_entry {
             if target != ino {
-                Self::detach_name(snapshot, tx, new_parent, new_name, target, seq)?;
+                Self::detach_name(tx, new_parent, new_name, target, seq)?;
             }
         }
         tx.delete_name(old_parent, old_name)?;
@@ -617,8 +812,134 @@ impl ClientDb {
         Ok(())
     }
 
+    /// Apply the server's effect of our own rename echo.
+    ///
+    /// The local rename was optimistic. The server resolves both paths, so
+    /// its event can name a different inode than the one this client moved
+    /// (another client created the source name first). The event is the
+    /// authority: the destination must name the event inode, and a stale
+    /// local winner must lose the name.
+    fn apply_own_rename(
+        tx: &WriteTx<'_>,
+        seq: i64,
+        ino: Ino,
+        old_path: &str,
+        new_path: &str,
+    ) -> Result<(), DbError> {
+        if old_path == new_path {
+            return Ok(());
+        }
+        let (old_parent_path, old_name) =
+            split_path(old_path).ok_or(DbError::Corrupt("rename of the root"))?;
+        let (new_parent_path, new_name) =
+            split_path(new_path).ok_or(DbError::Corrupt("rename to the root"))?;
+        let Some(object) = Self::object_in(tx, ino)?.filter(|object| !object.deleted) else {
+            Self::note_skip(tx, seq, "rename", ino, Some(old_path), "object is gone")?;
+            return Ok(());
+        };
+        let Some(new_parent) = Self::live_dir_in(tx, new_parent_path)? else {
+            Self::note_skip(
+                tx,
+                seq,
+                "rename",
+                ino,
+                Some(old_path),
+                "destination parent is gone",
+            )?;
+            return Ok(());
+        };
+
+        // Drop the source name when it still names the event inode. The
+        // optimistic local rename usually removed it already.
+        let old_parent = Self::live_dir_in(tx, old_parent_path)?;
+        let source_present = match old_parent {
+            Some(parent) => Self::name_in_tx(tx, parent, old_name)? == Some(ino),
+            None => false,
+        };
+        if source_present {
+            let parent = old_parent.ok_or(DbError::Corrupt("source parent vanished"))?;
+            tx.delete_name(parent, old_name)?;
+            if !object.kind.is_dir() {
+                bump_nlink(tx, ino, -1)?;
+            } else if parent != new_parent {
+                bump_nlink(tx, parent, -1)?;
+            }
+        }
+
+        // Make the destination name the event inode.
+        match Self::name_in_tx(tx, new_parent, new_name)? {
+            Some(existing) if existing == ino => {}
+            Some(existing) => {
+                Self::detach_name(tx, new_parent, new_name, existing, seq)?;
+                tx.put_name(new_parent, new_name, ino, new_path)?;
+                if !object.kind.is_dir() {
+                    bump_nlink(tx, ino, 1)?;
+                } else {
+                    bump_nlink(tx, new_parent, 1)?;
+                }
+            }
+            None => {
+                tx.put_name(new_parent, new_name, ino, new_path)?;
+                if !object.kind.is_dir() {
+                    bump_nlink(tx, ino, 1)?;
+                } else {
+                    bump_nlink(tx, new_parent, 1)?;
+                }
+            }
+        }
+
+        if object.kind.is_dir() && source_present {
+            Self::rewrite_subtree_paths(tx, old_path, new_path)?;
+        }
+        Self::next_fuse_ino(tx, ino)?;
+        Ok(())
+    }
+
+    /// Apply the server's effect of our own link echo.
+    ///
+    /// The local link already created the name when the inode matches. When
+    /// the server resolved the target to another inode, replace the local
+    /// winner so both replicas name the same object.
+    fn apply_own_link(
+        tx: &WriteTx<'_>,
+        seq: i64,
+        ino: Ino,
+        path: &str,
+    ) -> Result<(), DbError> {
+        let (parent_path, name) =
+            split_path(path).ok_or(DbError::Corrupt("link at the root"))?;
+        let Some(parent) = Self::live_dir_in(tx, parent_path)? else {
+            Self::note_skip(tx, seq, "link", ino, Some(path), "parent directory is gone")?;
+            return Ok(());
+        };
+        let Some(object) = Self::object_in(tx, ino)?.filter(|object| !object.deleted) else {
+            Self::note_skip(tx, seq, "link", ino, Some(path), "object is gone")?;
+            return Ok(());
+        };
+        match Self::name_in_tx(tx, parent, name)? {
+            Some(existing) if existing == ino => {
+                Self::note_echo(seq, "link", ino, Some(path), "name already exists");
+            }
+            Some(existing) => {
+                Self::detach_name(tx, parent, name, existing, seq)?;
+                tx.put_name(parent, name, ino, path)?;
+                if !object.kind.is_dir() {
+                    bump_nlink(tx, ino, 1)?;
+                }
+                Self::next_fuse_ino(tx, ino)?;
+            }
+            None => {
+                tx.put_name(parent, name, ino, path)?;
+                if !object.kind.is_dir() {
+                    bump_nlink(tx, ino, 1)?;
+                }
+                Self::next_fuse_ino(tx, ino)?;
+            }
+        }
+        Ok(())
+    }
+
     fn apply_remove(
-        snapshot: &ReadTx,
         tx: &WriteTx<'_>,
         seq: i64,
         ino: Ino,
@@ -630,7 +951,7 @@ impl ClientDb {
             // The client applied a later deletion of the parent first. Drop a
             // name row left behind by an earlier directory conflict so the
             // path cannot resurrect, then skip.
-            Self::drop_unreachable_name(snapshot, tx, seq, path)?;
+            Self::drop_unreachable_name(tx, seq, path)?;
             Self::note_skip(tx, seq, "remove", ino, Some(path), "parent directory is gone")?;
             return Ok(());
         };
@@ -644,7 +965,7 @@ impl ClientDb {
                 // A later local create or rename owns the name now. Server
                 // order wins: the local winner loses the name and its pending
                 // outbox rows recreate it afterwards.
-                Self::detach_name(snapshot, tx, parent, name, existing, seq)?;
+                Self::detach_name(tx, parent, name, existing, seq)?;
                 Self::note_skip(
                     tx,
                     seq,
@@ -678,7 +999,6 @@ impl ClientDb {
     }
 
     fn apply_link(
-        snapshot: &ReadTx,
         tx: &WriteTx<'_>,
         seq: i64,
         ino: Ino,
@@ -704,13 +1024,11 @@ impl ClientDb {
         tx.put_object(&object)?;
         tx.put_name(parent, name, ino, path)?;
         Self::next_fuse_ino(tx, ino)?;
-        let _ = snapshot;
         Ok(())
     }
 
     /// Detach a losing name and tombstone its object when the last link goes.
     fn detach_name(
-        snapshot: &ReadTx,
         tx: &WriteTx<'_>,
         parent: Ino,
         name: &str,
@@ -732,7 +1050,6 @@ impl ClientDb {
         }
         object.updated_seq = seq;
         tx.put_object(&object)?;
-        let _ = snapshot;
         Ok(())
     }
 
@@ -744,7 +1061,6 @@ impl ClientDb {
     /// `path`, so a later removal of the parent would otherwise leave them
     /// behind for good.
     fn drop_unreachable_name(
-        snapshot: &ReadTx,
         tx: &WriteTx<'_>,
         seq: i64,
         path: &str,
@@ -767,7 +1083,7 @@ impl ClientDb {
         let ino: Ino = ino
             .try_into()
             .map_err(|_| DbError::Corrupt("names.ino is not 16 bytes"))?;
-        Self::detach_name(snapshot, tx, parent, name, ino, seq)
+        Self::detach_name(tx, parent, name, ino, seq)
     }
 
     /// Log and count an event the local tree has already overtaken.
@@ -853,7 +1169,7 @@ impl ClientDb {
             .transpose()
     }
 
-    fn name_in_read(tx: &ReadTx, parent: Ino, name: &str) -> Result<Option<Ino>, DbError> {
+    fn name_in_read(tx: &WriteTx<'_>, parent: Ino, name: &str) -> Result<Option<Ino>, DbError> {
         let bytes: Option<Vec<u8>> = tx
             .conn()
             .query_row(
@@ -888,6 +1204,9 @@ impl ClientDb {
     /// The outbox survives: those are local intentions that will be resent
     /// after the replay. `applied_seq` restarts at zero.
     pub fn reset_epoch(&self, epoch: i64) -> Result<(), DbError> {
+        // Buffered writes are local intent; commit them so they survive the
+        // tree reset in the outbox, exactly like a committed write.
+        self.flush_all()?;
         self.write(|tx| {
             tx.conn().execute("DELETE FROM object_chunks", [])?;
             tx.conn().execute("DELETE FROM names", [])?;
@@ -901,7 +1220,11 @@ impl ClientDb {
                 "DELETE FROM fuse_inos WHERE ino <> ?1",
                 [ROOT_INO.as_slice()],
             )?;
-            tx.conn().execute("UPDATE outbox SET state = 'pending'", [])?;
+            // A `failed` row is a tombstone: the server never applied it and
+            // must not receive it again. Only an in-flight row is retried.
+            tx.conn()
+                .execute("UPDATE outbox SET state = 'pending' WHERE state = 'sent'", [])?;
+            tx.set_meta_i64(super::db::KEY_REPLAY_LOCAL, 1)?;
             let root = Object {
                 ino: ROOT_INO,
                 kind: ObjectKind::Dir,
@@ -936,6 +1259,8 @@ impl ClientDb {
     /// be retried. The local tree is not cleared: the echo of each event
     /// acknowledges the row and leaves the state unchanged.
     pub fn seed(&self, epoch: i64) -> Result<SeedReport, DbError> {
+        // The seed walks SQLite; buffered bytes must be part of the tree.
+        self.flush_all()?;
         let mut db = self.lock_writer();
         let snapshot = db.read()?;
         let live = collect_live(&snapshot)?;
@@ -1365,13 +1690,43 @@ impl ClientDb {
     }
 
     /// Mark one operation failed after a semantic rejection.
-    pub fn reject_op(&self, op_id: [u8; 16], errno: i32) -> Result<(), DbError> {
+    ///
+    /// A caller that received only the resync marker passes `None` and
+    /// records the replay request itself; a marker never names a path to
+    /// replace.
+    pub fn reject_op(
+        &self,
+        op_id: [u8; 16],
+        errno: i32,
+        state: Option<RejectState>,
+    ) -> Result<(), DbError> {
         let updated = self.write(|tx| {
-            Ok(tx.conn().execute(
+            let updated = tx.conn().execute(
                 "UPDATE outbox SET state = 'failed', attempts = MAX(attempts, 1), undo = ?2
                  WHERE op_id = ?1",
                 params![op_id.as_slice(), errno.to_le_bytes().to_vec()],
-            )?)
+            )?;
+            if updated != 0 {
+                // A later local operation on the same inode depends on the
+                // rejected effect. It must not reach the server and recreate
+                // the lost race; the whole chain stays a tombstone.
+                tx.conn().execute(
+                    "UPDATE outbox
+                        SET state = 'failed', attempts = MAX(attempts, 1)
+                      WHERE state IN ('pending', 'sent')
+                        AND ino IS NOT NULL
+                        AND ino = (SELECT ino FROM outbox WHERE op_id = ?1)
+                        AND created_at > (SELECT created_at FROM outbox WHERE op_id = ?1)",
+                    [op_id.as_slice()],
+                )?;
+                // The rejection carries the server's authoritative state for
+                // the affected path. Replace that path locally; unrelated
+                // local work is untouched.
+                if let Some(state) = &state {
+                    Self::replace_path_in(tx, state)?;
+                }
+            }
+            Ok(updated)
         })?;
         if updated == 0 {
             tracing::warn!(
@@ -1390,6 +1745,208 @@ impl ClientDb {
         }
         Ok(())
     }
+
+    /// Replace one path with the server's authoritative snapshot.
+    ///
+    /// Only the named path is touched. A missing server object removes the
+    /// local name; a present one installs its object, chunk list and name.
+    fn replace_path_in(tx: &WriteTx<'_>, state: &RejectState) -> Result<(), DbError> {
+        let Some((parent_path, name)) = state.path.rsplit_once('/') else {
+            return Ok(());
+        };
+        let parent_path = if parent_path.is_empty() { "/" } else { parent_path };
+        let local_parent: Option<Ino> = if parent_path == "/" {
+            Some(ROOT_INO)
+        } else {
+            tx.conn()
+                .query_row(
+                    "SELECT ino FROM names WHERE path = ?1",
+                    [parent_path],
+                    |row| row.get::<_, Vec<u8>>(0),
+                )
+                .optional()?
+                .and_then(|bytes| bytes.try_into().ok())
+        };
+        let Some(parent) = local_parent else {
+            return Ok(());
+        };
+        if let Some(existing) = Self::name_in(tx, parent, name)? {
+            tx.delete_name(parent, name)?;
+            if let Some(mut object) = Self::object_in(tx, existing)? {
+                object.nlink = object.nlink.saturating_sub(1);
+                if object.nlink == 0 {
+                    tx.set_object_chunks(existing, &[])?;
+                    object.deleted = true;
+                }
+                tx.put_object(&object)?;
+            }
+        }
+        if let Some(object) = &state.object {
+            for (chunk, bytes) in state.chunks.iter().zip(state.data.iter()) {
+                if !bytes.is_empty() {
+                    tx.put_chunk(chunk.hash, chunk.len, Some(bytes.as_slice()))?;
+                }
+            }
+            tx.put_object(object)?;
+            tx.set_object_chunks(object.ino, &state.chunks)?;
+            tx.put_name(parent, name, object.ino, &state.path)?;
+            Self::next_fuse_ino(tx, object.ino)?;
+        }
+        Ok(())
+    }
+
+    /// Re-apply the pending outbox effects to the freshly replayed tree.
+    ///
+    /// A replica reset (epoch change or rejection resync) clears the local
+    /// tree and replays the server log. The pending outbox rows are local
+    /// intent that the server has not accepted yet; applying them again keeps
+    /// unrelated local work visible while the uplink resends it. The rows are
+    /// not acknowledged and `applied_seq` does not move.
+    pub fn replay_local_outbox(&self) -> Result<usize, DbError> {
+        if !self.take_replay_local()? {
+            return Ok(0);
+        }
+        let mut db = self.lock_writer();
+        let tx = db.write()?;
+        let rows = {
+            let mut statement = tx.conn().prepare(
+                "SELECT op_id, kind, path, path2, payload, created_at FROM outbox
+                  WHERE state IN ('pending', 'sent')
+                  ORDER BY created_at",
+            )?;
+            let rows = statement.query_map([], |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Vec<u8>>(4)?,
+                    row.get::<_, i64>(5)?,
+                ))
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        let mut applied = 0usize;
+        for (op_id, kind, path, path2, payload, seq) in rows {
+            let op_id: [u8; 16] = op_id
+                .try_into()
+                .map_err(|_| DbError::Corrupt("outbox op_id is not 16 bytes"))?;
+            let kind = EventKind::parse(&kind)
+                .ok_or(DbError::Corrupt("unknown outbox kind"))?;
+            let payload = EventPayload::decode(kind, &payload)?;
+            let data = Self::outbox_data_in(&tx, &op_id)?;
+            Self::apply_local_outbox_payload(
+                &tx,
+                seq,
+                &payload,
+                path.as_deref(),
+                path2.as_deref(),
+                data.as_deref(),
+            )?;
+            applied += 1;
+        }
+        tx.commit()?;
+        Ok(applied)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn apply_local_outbox_payload(
+        tx: &WriteTx<'_>,
+        seq: i64,
+        payload: &EventPayload,
+        path: Option<&str>,
+        path2: Option<&str>,
+        data: Option<&[u8]>,
+    ) -> Result<(), DbError> {
+        match payload {
+            EventPayload::CreateFile { .. }
+            | EventPayload::CreateDir { .. }
+            | EventPayload::Symlink { .. } => {
+                let path = path.ok_or(DbError::Corrupt("create event without a path"))?;
+                Self::apply_create(tx, seq, payload, path)?;
+            }
+            EventPayload::Write {
+                ino,
+                offset,
+                size,
+                file_root,
+                mtime_ns,
+                chunks,
+                ..
+            } => {
+                Self::apply_write(
+                    tx, seq, *ino, *offset, *size, *file_root, *mtime_ns, chunks, data, path,
+                )?;
+            }
+            EventPayload::Truncate {
+                ino,
+                size,
+                file_root,
+                mtime_ns,
+            } => {
+                Self::apply_truncate(tx, seq, *ino, *size, *file_root, *mtime_ns, path)?;
+            }
+            EventPayload::Setattr {
+                ino,
+                mode,
+                uid,
+                gid,
+                mtime_ns,
+                size,
+            } => {
+                if let Some(size) = size {
+                    Self::apply_truncate(
+                        tx, seq, *ino, *size, [0u8; 32], mtime_ns.unwrap_or(0), path,
+                    )?;
+                }
+                Self::apply_setattr_attrs(tx, seq, *ino, mode, uid, gid, mtime_ns)?;
+            }
+            EventPayload::Rename { ino } => {
+                let old_path = path.ok_or(DbError::Corrupt("rename event without a path"))?;
+                let new_path =
+                    path2.ok_or(DbError::Corrupt("rename event without a destination"))?;
+                Self::apply_rename(tx, seq, *ino, old_path, new_path)?;
+            }
+            EventPayload::Unlink { ino } | EventPayload::Rmdir { ino } => {
+                let path = path.ok_or(DbError::Corrupt("remove event without a path"))?;
+                Self::apply_remove(tx, seq, *ino, path)?;
+            }
+            EventPayload::Link { ino } => {
+                let path = path2
+                    .or(path)
+                    .ok_or(DbError::Corrupt("link event without a path"))?;
+                Self::apply_link(tx, seq, *ino, path)?;
+            }
+            EventPayload::Lock { .. }
+            | EventPayload::Unlock { .. }
+            | EventPayload::Leave
+            | EventPayload::SyncCtrl { .. } => {}
+        }
+        Ok(())
+    }
+
+    /// Concatenate the outbox chunk bytes in chunk order, or `None` when a
+    /// chunk is not cached.
+    fn outbox_data_in(tx: &WriteTx<'_>, op_id: &[u8; 16]) -> Result<Option<Vec<u8>>, DbError> {
+        let mut statement = tx.conn().prepare(
+            "SELECT c.data FROM outbox_chunks oc
+               LEFT JOIN chunks c ON c.hash = oc.chunk_hash
+              WHERE oc.op_id = ?1 ORDER BY oc.chunk_no",
+        )?;
+        let rows = statement.query_map([op_id.as_slice()], |row| {
+            row.get::<_, Option<Vec<u8>>>(0)
+        })?;
+        let mut data = Vec::new();
+        let mut any = false;
+        for row in rows {
+            let Some(bytes) = row? else {
+                return Ok(None);
+            };
+            data.extend_from_slice(&bytes);
+            any = true;
+        }
+        Ok(if any { Some(data) } else { None })
+    }
 }
 
 #[cfg(test)]
@@ -1399,7 +1956,9 @@ mod tests {
     use super::*;
     use crate::client::db::{ClientDb, DbError};
     use crate::client::ops::CreateAttrs;
-    use crate::store::sqlite::{ChunkRef, EventPayload, ObjectKind, ROOT_INO};
+    use crate::store::sqlite::{
+        ChunkRef, EventPayload, ObjectKind, ROOT_INO, V1_SETATTR_BYTES,
+    };
     use std::ffi::OsStr;
 
     fn open() -> (tempfile::TempDir, ClientDb) {
@@ -1469,6 +2028,178 @@ mod tests {
             .unwrap();
         assert_eq!(duplicate, super::super::db::ApplyOutcome::Duplicate);
         assert_eq!(db.applied_seq().unwrap(), 2);
+    }
+
+    #[test]
+    fn replay_applies_version_1_and_version_2_setattrs_in_one_sequence() {
+        let (_dir, db) = open();
+        let ino = [0x11u8; 16];
+        let create = EventPayload::CreateFile {
+            ino,
+            mode: 0o600,
+            uid: 1,
+            gid: 2,
+            mtime_ns: 1,
+            file_root: crate::store::sqlite::file_root(ObjectKind::File, None, &[]),
+        };
+        db.apply_remote(1, 1, Some([0xc1; 16]), "ok", &create, Some("/a"), None, None)
+            .unwrap();
+        let (write, _) = write_payload(ino, b"hello");
+        db.apply_remote(
+            2,
+            1,
+            Some([0xc2; 16]),
+            "ok",
+            &write,
+            Some("/a"),
+            None,
+            Some(b"hello"),
+        )
+        .unwrap();
+
+        // A pre-upgrade row changes attributes only: the size must not move.
+        let legacy = EventPayload::decode(EventKind::Setattr, &V1_SETATTR_BYTES).unwrap();
+        let outcome = db
+            .apply_remote(3, 1, Some([0xc3; 16]), "ok", &legacy, Some("/a"), None, None)
+            .unwrap();
+        assert_eq!(outcome, super::super::db::ApplyOutcome::Applied);
+        let object = db.lookup_by_path("/a").unwrap();
+        assert_eq!(object.mode, 0o644);
+        assert_eq!(object.size, 5, "a version-1 setattr is attribute-only");
+        assert_eq!(db.read_at(ino, 0, 5).unwrap(), b"hello");
+
+        // A current row carries the size and the attributes in one event.
+        let current = EventPayload::Setattr {
+            ino,
+            mode: Some(0o600),
+            uid: None,
+            gid: None,
+            mtime_ns: Some(9),
+            size: Some(3),
+        };
+        db.apply_remote(4, 1, Some([0xc4; 16]), "ok", &current, Some("/a"), None, None)
+            .unwrap();
+        let object = db.lookup_by_path("/a").unwrap();
+        assert_eq!(object.mode, 0o600);
+        assert_eq!(object.size, 3);
+        assert_eq!(db.read_at(ino, 0, 3).unwrap(), b"hel");
+        assert_eq!(db.applied_seq().unwrap(), 4);
+    }
+
+    #[test]
+    fn a_write_without_its_stream_does_not_advance_applied_seq() {
+        let (_dir, db) = open();
+        let ino = [0x71; 16];
+        let create = EventPayload::CreateFile {
+            ino,
+            mode: 0o644,
+            uid: 1,
+            gid: 2,
+            mtime_ns: 1,
+            file_root: crate::store::sqlite::file_root(ObjectKind::File, None, &[]),
+        };
+        db.apply_remote(1, 1, Some([0xb1; 16]), "ok", &create, Some("/a"), None, None)
+            .unwrap();
+        let (write, _) = write_payload(ino, b"hello");
+
+        // The STREAM_DATA fragment was lost: `data` is None and the chunk is
+        // not cached locally. The event must not advance the watermark.
+        let error = db
+            .apply_remote(
+                2,
+                1,
+                Some([0xb2; 16]),
+                "ok",
+                &write,
+                Some("/a"),
+                None,
+                None,
+            )
+            .unwrap_err();
+        assert!(matches!(error, DbError::MissingChunk(_)));
+        assert_eq!(db.applied_seq().unwrap(), 1);
+
+        // A reconnect replays the same sequence with the server's content.
+        db.apply_remote(
+            2,
+            1,
+            Some([0xb2; 16]),
+            "ok",
+            &write,
+            Some("/a"),
+            None,
+            Some(b"hello"),
+        )
+        .unwrap();
+        assert_eq!(db.applied_seq().unwrap(), 2);
+        assert_eq!(db.read_at(ino, 0, 5).unwrap(), b"hello");
+    }
+
+    #[test]
+    fn an_own_rename_echo_replaces_the_local_winner() {
+        let (_dir, db) = open();
+        let local = db
+            .create_file(ROOT_INO, OsStr::new("x"), CreateAttrs::new(0o644, 0, 0))
+            .unwrap();
+        db.rename(
+            ROOT_INO,
+            OsStr::new("x"),
+            ROOT_INO,
+            OsStr::new("y"),
+            Default::default(),
+        )
+        .unwrap();
+        let rename_op_id: Vec<u8> = db
+            .read()
+            .unwrap()
+            .conn()
+            .query_row(
+                "SELECT op_id FROM outbox WHERE kind = 'rename'
+                  ORDER BY created_at DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let rename_op_id: [u8; 16] = rename_op_id.try_into().unwrap();
+
+        // The server resolves /x to another client's inode and renames that.
+        let other = [0xbb; 16];
+        let create_other = EventPayload::CreateFile {
+            ino: other,
+            mode: 0o644,
+            uid: 1,
+            gid: 2,
+            mtime_ns: 1,
+            file_root: crate::store::sqlite::file_root(ObjectKind::File, None, &[]),
+        };
+        db.apply_remote(
+            1,
+            1,
+            Some([0xc1; 16]),
+            "ok",
+            &create_other,
+            Some("/z"),
+            None,
+            None,
+        )
+        .unwrap();
+        db.apply_remote(
+            2,
+            1,
+            Some(rename_op_id),
+            "ok",
+            &EventPayload::Rename { ino: other },
+            Some("/x"),
+            Some("/y"),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(db.lookup_by_path("/y").unwrap().ino, other);
+        assert_eq!(db.lookup_by_path("/z").unwrap().ino, other);
+        assert!(db.lookup_by_path("/x").is_err());
+        // The optimistic local winner lost its only name.
+        assert!(db.getattr(local.ino).is_err());
     }
 
     #[test]
@@ -1753,5 +2484,144 @@ mod tests {
         assert!(db.lookup_by_path("/e").is_err());
         assert!(db.lookup_by_path("/x/f").is_err());
         assert_eq!(db.replay_skipped().unwrap(), 4);
+    }
+
+    fn event(
+        seq: i64,
+        payload: &EventPayload,
+        path: Option<&str>,
+        path2: Option<&str>,
+        data: Option<&[u8]>,
+    ) -> RemoteEvent {
+        RemoteEvent {
+            seq,
+            epoch: 1,
+            op_id: Some([seq as u8; 16]),
+            result: "ok".to_owned(),
+            payload: payload.clone(),
+            path: path.map(str::to_owned),
+            path2: path2.map(str::to_owned),
+            data: data.map(<[u8]>::to_vec),
+        }
+    }
+
+    #[test]
+    fn a_batch_commits_many_events_in_one_transaction() {
+        let (_dir, db) = open();
+        let ino = [0x31u8; 16];
+        let create = file_payload(ino);
+        let (write, _) = write_payload(ino, b"batched");
+        let events = [
+            event(1, &create, Some("/a"), None, None),
+            event(2, &write, Some("/a"), None, Some(b"batched")),
+            event(
+                3,
+                &EventPayload::Setattr {
+                    ino,
+                    mode: Some(0o600),
+                    uid: None,
+                    gid: None,
+                    mtime_ns: None,
+                    size: None,
+                },
+                Some("/a"),
+                None,
+                None,
+            ),
+        ];
+        let report = db.apply_remote_batch(&events).unwrap();
+        assert_eq!(
+            report.outcomes,
+            vec![
+                ApplyOutcome::Applied,
+                ApplyOutcome::Applied,
+                ApplyOutcome::Applied
+            ]
+        );
+        assert_eq!(report.applied_seq, 3);
+        assert!(!report.rejected);
+        assert_eq!(db.applied_seq().unwrap(), 3);
+        assert_eq!(db.read_at(ino, 0, 7).unwrap(), b"batched");
+        assert_eq!(db.lookup_by_path("/a").unwrap().mode, 0o600);
+    }
+
+    #[test]
+    fn a_gap_rolls_the_whole_batch_back() {
+        let (_dir, db) = open();
+        let first = file_payload([0x32u8; 16]);
+        let second = file_payload([0x33u8; 16]);
+        let events = [
+            event(1, &first, Some("/a"), None, None),
+            event(3, &second, Some("/b"), None, None),
+        ];
+        let error = db.apply_remote_batch(&events).unwrap_err();
+        assert!(matches!(error, DbError::Corrupt("event sequence gap")));
+        assert_eq!(db.applied_seq().unwrap(), 0);
+        assert!(db.lookup_by_path("/a").is_err());
+        assert!(db.lookup_by_path("/b").is_err());
+    }
+
+    #[test]
+    fn a_duplicate_inside_a_batch_is_skipped() {
+        let (_dir, db) = open();
+        let first = file_payload([0x34u8; 16]);
+        let second = file_payload([0x35u8; 16]);
+        let events = [
+            event(1, &first, Some("/a"), None, None),
+            event(2, &second, Some("/b"), None, None),
+        ];
+        db.apply_remote_batch(&events[..1]).unwrap();
+        let report = db.apply_remote_batch(&events).unwrap();
+        assert_eq!(
+            report.outcomes,
+            vec![ApplyOutcome::Duplicate, ApplyOutcome::Applied]
+        );
+        assert_eq!(report.applied_seq, 2);
+        assert!(db.lookup_by_path("/a").is_ok());
+        assert!(db.lookup_by_path("/b").is_ok());
+    }
+
+    #[test]
+    fn a_rejection_stops_the_batch_and_keeps_the_prefix() {
+        let (_dir, db) = open();
+        let first = file_payload([0x36u8; 16]);
+        let second = file_payload([0x37u8; 16]);
+        let mut rejected = event(2, &second, Some("/b"), None, None);
+        rejected.result = "rejected".to_owned();
+        let events = [
+            event(1, &first, Some("/a"), None, None),
+            rejected,
+            event(3, &second, Some("/c"), None, None),
+        ];
+        let report = db.apply_remote_batch(&events).unwrap();
+        assert!(report.rejected);
+        assert_eq!(
+            report.outcomes,
+            vec![ApplyOutcome::Applied, ApplyOutcome::Rejected]
+        );
+        assert_eq!(db.applied_seq().unwrap(), 2);
+        assert!(db.lookup_by_path("/a").is_ok());
+        assert!(db.lookup_by_path("/c").is_err());
+        assert!(db.needs_resync().unwrap());
+    }
+
+    #[test]
+    fn a_committed_batch_survives_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("client.db");
+        let ino = [0x38u8; 16];
+        {
+            let db = ClientDb::open(&path, [9u8; 16]).unwrap();
+            let (write, _) = write_payload(ino, b"durable batch");
+            let events = [
+                event(1, &file_payload(ino), Some("/a"), None, None),
+                event(2, &write, Some("/a"), None, Some(b"durable batch")),
+            ];
+            let report = db.apply_remote_batch(&events).unwrap();
+            assert_eq!(report.applied_seq, 2);
+        }
+        let again = ClientDb::open(&path, [9u8; 16]).unwrap();
+        assert_eq!(again.applied_seq().unwrap(), 2);
+        assert_eq!(again.read_at(ino, 0, 13).unwrap(), b"durable batch");
     }
 }

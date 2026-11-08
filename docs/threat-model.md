@@ -1,6 +1,6 @@
 # Threat model
 
-Status: normative security boundary for syncmount v2 (protocol 2.0). This
+Status: normative security boundary for syncmount v2 (protocol 3.0). This
 document states what the design protects, against whom, and what it explicitly
 does not protect. It describes the design, not a particular build. The
 semantic limits are in [`known-limitations.md`](known-limitations.md); the
@@ -90,24 +90,26 @@ server's trust status.
 
 ### 4.2 Link authentication
 
-The handshake is:
+The handshake is one round trip:
 
 ```
-client  HELLO(plain) ───────────────▶ server
-        ◀──────────── WELCOME(plain body + server proof)
-        AUTH(sealed) ───────────────▶ server
-        ◀──────────── ACCEPT(sealed)
+client  HELLO(plain body + sealed AUTH) ─────▶ server
+        ◀──── WELCOME(plain body + server proof + sealed ACCEPT)
         STEADY (sealed)
 ```
 
-Both sides derive handshake keys from the PSK and both nonces. The
-`WELCOME` proof covers the canonical body; a wrong PSK and a tampered body
-both fail as an authentication error. The client never sends `AUTH` after a
-failed proof, and the server closes a failed `AUTH` silently so that "wrong
-password" and "tampered transcript" are not distinguishable oracles.
+Both sides derive the `AUTH` key from the PSK and the client nonce, and the
+`WELCOME` proof and `ACCEPT` key from the PSK and both nonces. The `WELCOME`
+proof covers the canonical body including the sealed `ACCEPT`; a wrong PSK and
+a tampered body both fail as an authentication error. The sealed `AUTH` also
+authenticates the `HELLO` control prefix (`applied_seq`, `epoch_seen`), so a
+relay cannot move the replay point. The server closes a failed sealed `AUTH`
+silently so that "wrong password" and "tampered transcript" are not
+distinguishable oracles.
 
-After `ACCEPT`, the steady-state key is used. AEAD tags reject modified
-ciphertext. A replayed client nonce is rejected by the server's nonce window.
+After the sealed `ACCEPT` verifies, the steady-state key is used. AEAD tags
+reject modified ciphertext. A replayed client nonce is rejected by the server's
+nonce window.
 
 ### 4.3 Server authority and ordering
 
@@ -240,8 +242,10 @@ master password
 namespace id = BLAKE3("sm/v2/namespace" || master key)[..16]
 
 per connection
-  └─ handshake keys = KDF(PSK, client nonce, server nonce)
-       └─ ACCEPT → steady-state session key
+  ├─ AUTH key = KDF(PSK, client nonce)
+  └─ handshake key = KDF(PSK, client nonce, server nonce)
+       ├─ WELCOME proof
+       └─ sealed ACCEPT verified → steady-state session key
 ```
 
 - The server and every client use the same master password. There is no

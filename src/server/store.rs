@@ -6,25 +6,44 @@
 //! StoreHandle (async) --mpsc--> store thread: Db + State mirror + replay_wire
 //! ```
 //!
-//! The async actor never runs SQL. It sends one [`CommitRequest`] and awaits
-//! one [`CommitOutcome`]. The thread is the only writer of the server database,
-//! so every commit is serial and the in-memory [`State`] is never shared.
+//! The async actor never runs SQL. It sends one batch of [`CommitRequest`]
+//! values and awaits one [`CommitOutcome`] per request. The thread is the only
+//! writer of the server database, so every batch is serial and the in-memory
+//! [`State`] is never shared.
 //!
-//! # Commit order
+//! # Group commit
+//!
+//! A batch is planned completely before SQLite sees a write:
 //!
 //! 1. Refuse a duplicate `op_id` before anything else. A retry must receive the
 //!    original sequence number even when the operation would no longer plan.
-//! 2. Prepare the complete file bytes for `WRITE`, `PWRITE` and `TRUNCATE`.
-//! 3. Plan against the in-memory state. A rejection consumes no sequence.
-//! 4. Store the original wire frame in `replay_wire` at `seq + 1`.
-//! 5. Run one SQLite transaction: bump the sequence, write the rows, append the
-//!    event and record the `op_id`.
-//! 6. Replace the in-memory state with the planned result.
+//!    A duplicate against an earlier operation of the same batch is answered
+//!    with that operation's freshly assigned sequence.
+//! 2. Prepare the complete file bytes for `WRITE`, `PWRITE` and `TRUNCATE`
+//!    against a staged [`State`] and an overlay of chunks that earlier
+//!    operations of the same batch produced. A later `PWRITE` therefore sees
+//!    an earlier `WRITE` even though neither is in SQLite yet.
+//! 3. Plan each operation against the staged state. A rejection consumes no
+//!    sequence and contributes no row.
+//! 4. Run **one** SQLite transaction for every accepted operation: bump the
+//!    sequence once per operation, write `replay_wire`, the chunks, the
+//!    object/name rows, the event and the `op_id`. One `COMMIT` is one
+//!    `synchronous=FULL` flush for the whole batch.
+//! 5. Replace the in-memory state with the staged result.
 //!
-//! A crash between step 4 and step 5 leaves an orphan wire row. Replay asks
-//! only for sequences that have an event, so an orphan is harmless. A stale
-//! row at a sequence that is written again is replaced with `INSERT OR
-//! REPLACE`.
+//! The whole batch commits or rolls back together. A failed transaction is
+//! retried as a whole (not operation by operation) up to [`BATCH_ATTEMPTS`]
+//! times: the plan is deterministic against the unchanged database, so a retry
+//! preserves the sequence order the caller will broadcast. After the last
+//! attempt every accepted operation reports [`CommitOutcome::Failed`] and the
+//! caller may resend it; `op_id` idempotency makes that safe.
+//!
+//! # Crash recovery
+//!
+//! The event rows, `op_ids`, state rows and `replay_wire` frame of one batch
+//! share one transaction. A crash before `COMMIT` loses the whole batch, so no
+//! client could have observed an acknowledgement. A crash after `COMMIT`
+//! keeps every event, so replay reproduces exactly what a live receiver saw.
 //!
 //! # Sidecar table
 //!
@@ -44,7 +63,8 @@
 //! [`State::commit`] still applies the lock changes, so a `LOCK` operation and
 //! a `leave` event both keep the mirror correct.
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::borrow::Cow;
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fmt::Display;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -57,7 +77,7 @@ use crate::protocol::messages::OpClass;
 use crate::server::wire::{self, WireOp};
 use crate::state::{self, Change, Chunk, Errno, Ino, Kind, ObjectPatch, Reject, State, Verdict};
 use crate::store::sqlite::{
-    self, ChunkRef, Db, EventDraft, EventRow, ObjectKind, ReadTx, Role, WriteTx, keys,
+    self, ChunkRef, Db, EventDraft, EventRow, ObjectKind, ReadTx, RejectState, Role, WriteTx, keys,
 };
 
 pub use crate::store::sqlite::CompactReport;
@@ -72,6 +92,13 @@ const COMMAND_CAPACITY: usize = 64;
 /// is 4 GiB per file; a larger result is refused instead of risking an
 /// allocation failure.
 const MAX_FILE_BYTES: u64 = 4 << 30;
+
+/// Whole-batch attempts before every accepted operation reports failure.
+///
+/// A group commit is retried as a unit, never operation by operation: the
+/// staged plan is deterministic and the failed transaction rolled back, so the
+/// retry keeps the sequence numbers the caller will broadcast in order.
+const BATCH_ATTEMPTS: u32 = 3;
 
 const _: () = assert!(state::CHUNK_BYTES == sqlite::CHUNK_BYTES as u64);
 
@@ -89,12 +116,21 @@ pub struct StoreMeta {
 }
 
 /// The result of one commit attempt.
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// Equality compares the outcome and its sequence only. The committed event
+/// and its content are carried for the broadcast path; tests assert the
+/// sequence without rebuilding either.
+#[derive(Clone, Debug)]
 pub enum CommitOutcome {
     /// The operation was written at this sequence number.
     Applied {
         /// Assigned event sequence.
         seq: i64,
+        /// The committed event, as the replay path reads it back.
+        event: EventRow,
+        /// Complete post-operation file bytes for `WRITE`, `PWRITE` and
+        /// `TRUNCATE`; the live broadcast rebuilds its frame from these.
+        content: Option<Vec<u8>>,
     },
     /// The state machine refused the operation; nothing was written.
     Rejected {
@@ -112,6 +148,20 @@ pub enum CommitOutcome {
         message: String,
     },
 }
+
+impl PartialEq for CommitOutcome {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Applied { seq: left, .. }, Self::Applied { seq: right, .. }) => left == right,
+            (Self::Rejected { reject: left }, Self::Rejected { reject: right }) => left == right,
+            (Self::Duplicate { seq: left }, Self::Duplicate { seq: right }) => left == right,
+            (Self::Failed { message: left }, Self::Failed { message: right }) => left == right,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for CommitOutcome {}
 
 /// One operation submitted to the store thread.
 #[derive(Clone, Debug)]
@@ -147,9 +197,9 @@ impl std::fmt::Debug for StoreHandle {
 
 /// One command for the store thread.
 enum StoreCmd {
-    Commit {
-        request: Box<CommitRequest>,
-        reply: oneshot::Sender<CommitOutcome>,
+    CommitBatch {
+        requests: Vec<CommitRequest>,
+        reply: oneshot::Sender<Vec<CommitOutcome>>,
     },
     Leave {
         session: [u8; 16],
@@ -169,6 +219,10 @@ enum StoreCmd {
     ChunkData {
         hash: [u8; 32],
         reply: oneshot::Sender<Result<Option<Vec<u8>>, String>>,
+    },
+    PathState {
+        path: String,
+        reply: oneshot::Sender<Result<Option<RejectState>, String>>,
     },
     StateHash {
         reply: oneshot::Sender<Result<[u8; 32], String>>,
@@ -226,25 +280,43 @@ impl StoreHandle {
 
     /// Plan, persist and apply one operation.
     pub async fn commit(&self, request: CommitRequest) -> CommitOutcome {
+        let mut outcomes = self.commit_batch(vec![request]).await;
+        outcomes.pop().unwrap_or_else(|| CommitOutcome::Failed {
+            message: "store thread dropped the reply".to_owned(),
+        })
+    }
+
+    /// Plan, persist and apply one group commit.
+    ///
+    /// Every request produces exactly one outcome in the same order. Accepted
+    /// operations share one SQLite transaction and therefore one
+    /// `synchronous=FULL` flush; a rejection, duplicate or per-operation
+    /// preparation failure consumes no sequence and does not join the
+    /// transaction.
+    pub async fn commit_batch(&self, requests: Vec<CommitRequest>) -> Vec<CommitOutcome> {
+        let count = requests.len();
+        if count == 0 {
+            return Vec::new();
+        }
         let (reply, response) = oneshot::channel();
         if self
             .tx
-            .send(StoreCmd::Commit {
-                request: Box::new(request),
-                reply,
-            })
+            .send(StoreCmd::CommitBatch { requests, reply })
             .await
             .is_err()
         {
-            return CommitOutcome::Failed {
-                message: "store thread is gone".to_owned(),
-            };
+            return failed_batch(count, "store thread is gone");
         }
         match response.await {
-            Ok(outcome) => outcome,
-            Err(_) => CommitOutcome::Failed {
-                message: "store thread dropped the reply".to_owned(),
-            },
+            Ok(outcomes) if outcomes.len() == count => outcomes,
+            Ok(outcomes) => failed_batch(
+                count,
+                &format!(
+                    "store thread returned {} outcomes for {count} requests",
+                    outcomes.len()
+                ),
+            ),
+            Err(_) => failed_batch(count, "store thread dropped the reply"),
         }
     }
 
@@ -312,6 +384,22 @@ impl StoreHandle {
         let (reply, response) = oneshot::channel();
         self.tx
             .send(StoreCmd::Wire { seq, reply })
+            .await
+            .map_err(|_| "store thread is gone".to_owned())?;
+        response
+            .await
+            .map_err(|_| "store thread dropped the reply".to_owned())?
+    }
+
+    /// Read the authoritative state of one path for a point-to-point
+    /// rejection. A missing object is reported as `object: None`.
+    pub async fn path_state(&self, path: &str) -> Result<Option<RejectState>, String> {
+        let (reply, response) = oneshot::channel();
+        self.tx
+            .send(StoreCmd::PathState {
+                path: path.to_owned(),
+                reply,
+            })
             .await
             .map_err(|_| "store thread is gone".to_owned())?;
         response
@@ -415,8 +503,8 @@ impl StoreThread {
     fn run(mut self, mut rx: mpsc::Receiver<StoreCmd>) {
         while let Some(command) = rx.blocking_recv() {
             match command {
-                StoreCmd::Commit { request, reply } => {
-                    let _ = reply.send(self.commit(*request));
+                StoreCmd::CommitBatch { requests, reply } => {
+                    let _ = reply.send(self.commit_batch(requests));
                 }
                 StoreCmd::Leave {
                     session,
@@ -439,6 +527,9 @@ impl StoreThread {
                 StoreCmd::ChunkData { hash, reply } => {
                     let _ = reply.send(self.chunk_data(hash));
                 }
+                StoreCmd::PathState { path, reply } => {
+                    let _ = reply.send(self.path_state(&path));
+                }
                 StoreCmd::StateHash { reply } => {
                     let _ = reply.send(self.state_hash());
                 }
@@ -453,85 +544,248 @@ impl StoreThread {
         }
     }
 
-    /// Plan, persist and apply one operation.
-    fn commit(&mut self, request: CommitRequest) -> CommitOutcome {
-        let CommitRequest {
-            session,
-            op,
-            content,
-            wire,
-            created_at,
-        } = request;
-
-        // A retry must return the original sequence even when the operation
-        // would now be rejected (for example, a repeated create).
-        match self.lookup_op_id(op.op_id) {
-            Ok(Some(seq)) => return CommitOutcome::Duplicate { seq },
-            Ok(None) => {}
-            Err(message) => return CommitOutcome::Failed { message },
+    /// Plan, persist and apply one group commit.
+    ///
+    /// Planning runs against a staged state; SQLite sees only the accepted
+    /// operations and only after the whole batch has a sequence number. A
+    /// rejection, duplicate or per-operation preparation failure never joins
+    /// the transaction and never consumes a sequence.
+    fn commit_batch(&mut self, requests: Vec<CommitRequest>) -> Vec<CommitOutcome> {
+        let count = requests.len();
+        if count == 0 {
+            return Vec::new();
         }
-
-        let content = match self.prepare_content(&op, content) {
-            Ok(content) => content,
-            Err(PrepareError::Reject(reject)) => return CommitOutcome::Rejected { reject },
-            Err(PrepareError::Failed(message)) => return CommitOutcome::Failed { message },
+        let read = match self.db.read() {
+            Ok(read) => read,
+            Err(err) => {
+                return failed_batch(count, &format!("open batch read: {err}"));
+            }
         };
 
-        let planned = match wire::to_op(&op, content.as_deref(), &self.state, session) {
-            Ok(planned) => planned,
-            Err(reject) => return CommitOutcome::Rejected { reject },
-        };
+        let mut outcomes: Vec<Option<CommitOutcome>> = (0..count).map(|_| None).collect();
+        let mut accepted: Vec<AcceptedOp> = Vec::new();
+        let mut staged = self.state.clone();
+        let mut overlay: HashMap<[u8; 32], ChunkSource> = HashMap::new();
+        let mut seen: HashMap<[u8; 16], i64> = HashMap::new();
 
-        let (changes, draft) = match &planned {
-            Some(planned_op) => match state::plan(planned_op, &self.state) {
-                Verdict::Apply(changes) => {
-                    let draft = wire::event_for(&op, planned_op, &self.state, session)
-                        .with_created_at(created_at);
-                    (changes, draft)
+        for (index, request) in requests.into_iter().enumerate() {
+            let CommitRequest {
+                session,
+                op,
+                content,
+                wire,
+                created_at,
+            } = request;
+
+            // A retry must return the original sequence even when the
+            // operation would now be rejected (for example, a repeated
+            // create). The same rule covers a retry inside one batch.
+            if let Some(seq) = seen.get(&op.op_id) {
+                outcomes[index] = Some(CommitOutcome::Duplicate { seq: *seq });
+                continue;
+            }
+            match self.lookup_op_id(&read, op.op_id) {
+                Ok(Some(seq)) => {
+                    outcomes[index] = Some(CommitOutcome::Duplicate { seq });
+                    continue;
                 }
-                Verdict::Reject(reject) => return CommitOutcome::Rejected { reject },
-            },
-            None => (
-                Vec::new(),
-                EventDraft::sync_ctrl(op.op_id, 0).with_created_at(created_at),
-            ),
-        };
+                Ok(None) => {}
+                Err(message) => {
+                    outcomes[index] = Some(CommitOutcome::Failed { message });
+                    continue;
+                }
+            }
 
-        // Build the post-commit state off to the side. The live mirror changes
-        // only after SQLite accepts the transaction.
-        let mut after = self.state.clone();
-        after.commit(changes.clone());
-
-        let seq = match self.meta.seq.checked_add(1) {
-            Some(seq) => seq,
-            None => {
-                return CommitOutcome::Failed {
-                    message: "event sequence overflow".to_owned(),
+            let content =
+                match self.prepare_content(&read, &staged, &overlay, &accepted, &op, content) {
+                    Ok(content) => content,
+                    Err(PrepareError::Reject(reject)) => {
+                        outcomes[index] = Some(CommitOutcome::Rejected { reject });
+                        continue;
+                    }
+                    Err(PrepareError::Failed(message)) => {
+                        outcomes[index] = Some(CommitOutcome::Failed { message });
+                        continue;
+                    }
                 };
+
+            let planned = match wire::to_op(&op, content.as_deref(), &staged, session) {
+                Ok(planned) => planned,
+                Err(reject) => {
+                    outcomes[index] = Some(CommitOutcome::Rejected { reject });
+                    continue;
+                }
+            };
+
+            let (changes, draft) = match &planned {
+                Some(planned_op) => match state::plan(planned_op, &staged) {
+                    Verdict::Apply(changes) => {
+                        let draft = wire::event_for(&op, planned_op, &staged, session)
+                            .with_created_at(created_at);
+                        (changes, draft)
+                    }
+                    Verdict::Reject(reject) => {
+                        outcomes[index] = Some(CommitOutcome::Rejected { reject });
+                        continue;
+                    }
+                },
+                None => (
+                    Vec::new(),
+                    EventDraft::sync_ctrl(op.op_id, 0).with_created_at(created_at),
+                ),
+            };
+
+            let seq = match self
+                .meta
+                .seq
+                .checked_add(i64::try_from(accepted.len()).unwrap_or(i64::MAX))
+                .and_then(|seq| seq.checked_add(1))
+            {
+                Some(seq) => seq,
+                None => {
+                    outcomes[index] = Some(CommitOutcome::Failed {
+                        message: "event sequence overflow".to_owned(),
+                    });
+                    continue;
+                }
+            };
+
+            // Record where this operation's chunks live so a later PWRITE or
+            // TRUNCATE in the same batch can read them before they reach
+            // SQLite.
+            if let Some(bytes) = content.as_deref() {
+                record_chunk_sources(&mut overlay, accepted.len(), bytes, &changes);
             }
-        };
-        if let Err(message) = self.write_wire(seq, &wire) {
-            return CommitOutcome::Failed { message };
+            staged.commit(changes.clone());
+            seen.insert(op.op_id, seq);
+            accepted.push(AcceptedOp {
+                index,
+                seq,
+                op,
+                created_at,
+                draft,
+                changes,
+                content,
+                wire,
+            });
+        }
+        drop(read);
+
+        if accepted.is_empty() {
+            return finish_outcomes(outcomes);
         }
 
-        let plan = CommitPlan {
-            seq,
-            op,
-            created_at,
-            draft,
-            changes,
-            after,
-            content,
-        };
-        match self.apply(plan) {
-            Ok(after) => {
-                self.state = after;
-                self.meta.seq = seq;
-                CommitOutcome::Applied { seq }
+        let first_seq = self.meta.seq;
+        match self.write_batch(&accepted) {
+            Ok(events) => {
+                let mut last = first_seq;
+                for (op, event) in accepted.into_iter().zip(events) {
+                    last = op.seq;
+                    outcomes[op.index] = Some(CommitOutcome::Applied {
+                        seq: op.seq,
+                        event,
+                        content: op.content,
+                    });
+                }
+                self.meta.seq = last;
             }
-            Err(ApplyError::Duplicate(seq)) => CommitOutcome::Duplicate { seq },
-            Err(ApplyError::Failed(message)) => CommitOutcome::Failed { message },
+            Err(message) => {
+                // The transaction rolled back as a unit. Every accepted
+                // operation failed; a duplicate that pointed into this batch
+                // is no longer true because its target never committed.
+                let message = format!("group commit failed after retries: {message}");
+                for op in &accepted {
+                    outcomes[op.index] = Some(CommitOutcome::Failed {
+                        message: message.clone(),
+                    });
+                }
+                for outcome in &mut outcomes {
+                    if let Some(CommitOutcome::Duplicate { seq }) = outcome {
+                        if *seq > first_seq {
+                            *outcome = Some(CommitOutcome::Failed {
+                                message: message.clone(),
+                            });
+                        }
+                    }
+                }
+            }
         }
+        finish_outcomes(outcomes)
+    }
+
+    /// Write one accepted batch in one SQLite transaction.
+    ///
+    /// Retried as a unit. A failed attempt rolls back and leaves `self.state`
+    /// and `meta.seq` untouched, so the next attempt writes the same plan.
+    fn write_batch(&mut self, accepted: &[AcceptedOp]) -> Result<Vec<EventRow>, String> {
+        let mut last = String::new();
+        for attempt in 0..BATCH_ATTEMPTS {
+            match self.write_batch_once(accepted) {
+                Ok(events) => return Ok(events),
+                Err(message) => {
+                    last = message;
+                    if attempt + 1 < BATCH_ATTEMPTS {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                }
+            }
+        }
+        Err(last)
+    }
+
+    /// One transaction attempt for the whole batch.
+    fn write_batch_once(&mut self, accepted: &[AcceptedOp]) -> Result<Vec<EventRow>, String> {
+        let tx = self
+            .db
+            .write()
+            .map_err(|err| format!("begin batch: {err}"))?;
+        let mut running = self.state.clone();
+        let mut events = Vec::with_capacity(accepted.len());
+        for op in accepted {
+            let seq = tx.bump_seq().map_err(|err| format!("bump seq: {err}"))?;
+            if seq != op.seq {
+                return Err(format!(
+                    "event sequence moved: expected {}, found {seq}",
+                    op.seq
+                ));
+            }
+
+            // The frame shares the batch transaction, so a replay reader can
+            // never see an event whose original frame is missing.
+            tx.conn()
+                .execute(
+                    "INSERT OR REPLACE INTO replay_wire (seq, frame) VALUES (?1, ?2)",
+                    params![seq, op.wire.as_slice()],
+                )
+                .map_err(|err| format!("replay_wire write: {err}"))?;
+
+            if let Some(bytes) = op.content.as_deref() {
+                put_content_chunks(&tx, bytes, &op.changes)?;
+            }
+
+            let mut after = running.clone();
+            after.commit(op.changes.clone());
+            apply_rows(&tx, &running, &after, &op.changes, seq)?;
+
+            let event = event_row(&op.draft, seq, self.meta.epoch)?;
+            let inserted = match tx.insert_event(seq, op.draft.clone()) {
+                Ok(inserted) => inserted,
+                Err(sqlite::StoreError::DuplicateOp { existing, .. }) => {
+                    return Err(format!(
+                        "op_id {} was committed at {existing} during the batch",
+                        hex::encode(op.op.op_id)
+                    ));
+                }
+                Err(err) => return Err(format!("insert event: {err}")),
+            };
+            tx.record_op_id(op.op.op_id, inserted.payload_hash, seq, op.created_at)
+                .map_err(|err| format!("record op_id: {err}"))?;
+            events.push(event);
+            running = after;
+        }
+        tx.commit().map_err(|err| format!("commit batch: {err}"))?;
+        self.state = running;
+        Ok(events)
     }
 
     /// Append a `leave` event. The caller supplies the encoded frame.
@@ -544,11 +798,12 @@ impl StoreThread {
                 };
             }
         };
-        if let Err(message) = self.write_wire(seq, &wire) {
-            return CommitOutcome::Failed { message };
-        }
 
         let draft = EventDraft::leave(session);
+        let event = match event_row(&draft, seq, self.meta.epoch) {
+            Ok(event) => event,
+            Err(message) => return CommitOutcome::Failed { message },
+        };
         let tx = match self.db.write() {
             Ok(tx) => tx,
             Err(err) => {
@@ -570,6 +825,14 @@ impl StoreThread {
                 message: format!("event sequence moved: expected {seq}, found {bumped}"),
             };
         }
+        if let Err(err) = tx.conn().execute(
+            "INSERT OR REPLACE INTO replay_wire (seq, frame) VALUES (?1, ?2)",
+            params![seq, wire.as_slice()],
+        ) {
+            return CommitOutcome::Failed {
+                message: format!("replay_wire write: {err}"),
+            };
+        }
         if let Err(err) = tx.insert_event(seq, draft) {
             return CommitOutcome::Failed {
                 message: format!("insert leave event: {err}"),
@@ -584,22 +847,30 @@ impl StoreThread {
         self.state
             .commit(vec![Change::RemoveSessionLocks { session }]);
         self.meta.seq = seq;
-        CommitOutcome::Applied { seq }
+        CommitOutcome::Applied {
+            seq,
+            event,
+            content: None,
+        }
     }
 
     /// Read the server's `op_ids` row for one operation.
-    fn lookup_op_id(&self, op_id: [u8; 16]) -> Result<Option<i64>, String> {
-        let read = self.db.read().map_err(err_str)?;
+    fn lookup_op_id(&self, read: &ReadTx, op_id: [u8; 16]) -> Result<Option<i64>, String> {
         Ok(read.op_id(op_id).map_err(err_str)?.map(|row| row.first_seq))
     }
 
     /// Build the complete post-operation file bytes.
     ///
     /// `WRITE` takes the supplied bytes as the whole file. `PWRITE` reads the
-    /// old file, zero-fills any gap and patches the range. `TRUNCATE` reads the
-    /// old file and resizes it with zeros. Other classes need no content.
+    /// old file, zero-fills any gap and patches the range. `TRUNCATE` and a
+    /// size-changing `SETATTR` read the old file and resize it with zeros.
+    /// Other classes need no content.
     fn prepare_content(
         &self,
+        read: &ReadTx,
+        state: &State,
+        overlay: &HashMap<[u8; 32], ChunkSource>,
+        accepted: &[AcceptedOp],
         op: &WireOp,
         content: Option<Vec<u8>>,
     ) -> Result<Option<Vec<u8>>, PrepareError> {
@@ -616,7 +887,7 @@ impl StoreThread {
                 .ok_or_else(|| PrepareError::Failed("PWRITE carries no offset".to_owned()))?;
             let patch = content
                 .ok_or_else(|| PrepareError::Failed("PWRITE carries no content".to_owned()))?;
-            let mut bytes = self.read_file_bytes(&op.path, None)?;
+            let mut bytes = self.read_file_bytes(read, state, overlay, accepted, &op.path, None)?;
             // A zero-length write changes nothing; in particular it must not
             // extend the file to `offset`.
             if patch.is_empty() {
@@ -642,15 +913,22 @@ impl StoreThread {
             return Ok(Some(bytes));
         }
 
-        if op.class == OpClass::TRUNCATE {
-            let length = op
-                .length
-                .ok_or_else(|| PrepareError::Failed("TRUNCATE carries no length".to_owned()))?;
+        if op.class == OpClass::TRUNCATE || op.class == OpClass::SETATTR {
+            let length = match op.length {
+                Some(length) => length,
+                None if op.class == OpClass::SETATTR => return Ok(None),
+                None => {
+                    return Err(PrepareError::Failed(
+                        "TRUNCATE carries no length".to_owned(),
+                    ));
+                }
+            };
             check_size(length)?;
             if length == 0 {
                 return Ok(Some(Vec::new()));
             }
-            let mut bytes = self.read_file_bytes(&op.path, Some(length))?;
+            let mut bytes =
+                self.read_file_bytes(read, state, overlay, accepted, &op.path, Some(length))?;
             let length = usize::try_from(length).map_err(|_| {
                 PrepareError::Reject(overflow_reject("truncate length exceeds usize"))
             })?;
@@ -673,21 +951,22 @@ impl StoreThread {
     ///
     /// `limit` caps the number of bytes read. A shrinking `TRUNCATE` needs
     /// only the surviving prefix, so a large tail is never buffered.
-    fn read_file_bytes(&self, path: &str, limit: Option<u64>) -> Result<Vec<u8>, PrepareError> {
-        let ino = self
-            .state
+    fn read_file_bytes(
+        &self,
+        read: &ReadTx,
+        state: &State,
+        overlay: &HashMap<[u8; 32], ChunkSource>,
+        accepted: &[AcceptedOp],
+        path: &str,
+        limit: Option<u64>,
+    ) -> Result<Vec<u8>, PrepareError> {
+        let ino = state
             .resolve(path.as_bytes())
             .map_err(PrepareError::Reject)?;
-        let read = self
-            .db
-            .read()
-            .map_err(|err| PrepareError::Failed(format!("read content: {err}")))?;
-        let refs = read
-            .object_chunks(ino_bytes(ino))
-            .map_err(|err| PrepareError::Failed(format!("read object chunks: {err}")))?;
+        let refs = state.chunks(ino);
 
         let mut total = 0u64;
-        for chunk in &refs {
+        for chunk in refs {
             total = total
                 .checked_add(u64::from(chunk.len))
                 .ok_or_else(|| PrepareError::Reject(overflow_reject("file size overflows u64")))?;
@@ -700,19 +979,37 @@ impl StoreThread {
         bytes.try_reserve_exact(wanted).map_err(|_| {
             PrepareError::Failed(format!("cannot buffer {wanted} bytes of file content"))
         })?;
-        for chunk in &refs {
+        for chunk in refs {
             if bytes.len() >= wanted {
                 break;
             }
-            let row = read
-                .chunk(chunk.hash)
-                .map_err(|err| PrepareError::Failed(format!("read chunk: {err}")))?
-                .ok_or_else(|| {
-                    PrepareError::Failed(format!("chunk {} is missing", hex::encode(chunk.hash)))
+            // A chunk produced by an earlier operation of this batch is not
+            // in SQLite yet; its bytes live in that operation's content.
+            let data: Cow<'_, [u8]> = if let Some(source) = overlay.get(&chunk.hash) {
+                let source_op = &accepted[source.op];
+                let content = source_op.content.as_deref().ok_or_else(|| {
+                    PrepareError::Failed("batch chunk source has no buffered content".to_owned())
                 })?;
-            let data = row.data.ok_or_else(|| {
-                PrepareError::Failed(format!("chunk {} has no data", hex::encode(chunk.hash)))
-            })?;
+                let end = source.offset.checked_add(source.len).ok_or_else(|| {
+                    PrepareError::Failed("batch chunk range overflows".to_owned())
+                })?;
+                Cow::Borrowed(content.get(source.offset..end).ok_or_else(|| {
+                    PrepareError::Failed("batch chunk range exceeds content".to_owned())
+                })?)
+            } else {
+                let row = read
+                    .chunk(chunk.hash)
+                    .map_err(|err| PrepareError::Failed(format!("read chunk: {err}")))?
+                    .ok_or_else(|| {
+                        PrepareError::Failed(format!(
+                            "chunk {} is missing",
+                            hex::encode(chunk.hash)
+                        ))
+                    })?;
+                Cow::Owned(row.data.ok_or_else(|| {
+                    PrepareError::Failed(format!("chunk {} has no data", hex::encode(chunk.hash)))
+                })?)
+            };
             if data.len() != chunk.len as usize {
                 return Err(PrepareError::Failed(format!(
                     "chunk {} is {} bytes, the list says {}",
@@ -726,71 +1023,6 @@ impl StoreThread {
             bytes.extend_from_slice(&data[..take]);
         }
         Ok(bytes)
-    }
-
-    /// Write the replay frame before the main transaction.
-    fn write_wire(&self, seq: i64, frame: &[u8]) -> Result<(), String> {
-        self.sidecar
-            .execute(
-                "INSERT OR REPLACE INTO replay_wire (seq, frame) VALUES (?1, ?2)",
-                params![seq, frame],
-            )
-            .map_err(|err| format!("replay_wire write: {err}"))?;
-        Ok(())
-    }
-
-    /// Run the one write transaction for an accepted operation.
-    fn apply(&mut self, plan: CommitPlan) -> Result<State, ApplyError> {
-        let CommitPlan {
-            seq,
-            op,
-            created_at,
-            draft,
-            changes,
-            after,
-            content,
-        } = plan;
-        let tx = self
-            .db
-            .write()
-            .map_err(|err| ApplyError::Failed(format!("begin write: {err}")))?;
-        let bumped = tx
-            .bump_seq()
-            .map_err(|err| ApplyError::Failed(format!("bump seq: {err}")))?;
-        if bumped != seq {
-            return Err(ApplyError::Failed(format!(
-                "event sequence moved: expected {seq}, found {bumped}"
-            )));
-        }
-
-        if let Some(bytes) = content.as_deref() {
-            for (chunk, data) in wire::split_chunks(bytes) {
-                tx.put_chunk(chunk.hash, chunk.len, Some(data.as_slice()))
-                    .map_err(|err| {
-                        ApplyError::Failed(format!("put chunk {}: {err}", hex::encode(chunk.hash)))
-                    })?;
-            }
-        }
-
-        apply_rows(&tx, &self.state, &after, &changes, seq).map_err(ApplyError::Failed)?;
-
-        let inserted = match tx.insert_event(seq, draft) {
-            Ok(inserted) => inserted,
-            Err(sqlite::StoreError::DuplicateOp { existing, .. }) => {
-                return Err(ApplyError::Duplicate(existing));
-            }
-            Err(err) => return Err(ApplyError::Failed(format!("insert event: {err}"))),
-        };
-        match tx.record_op_id(op.op_id, inserted.payload_hash, seq, created_at) {
-            Ok(()) => {}
-            Err(sqlite::StoreError::DuplicateOp { existing, .. }) => {
-                return Err(ApplyError::Duplicate(existing));
-            }
-            Err(err) => return Err(ApplyError::Failed(format!("record op_id: {err}"))),
-        }
-        tx.commit()
-            .map_err(|err| ApplyError::Failed(format!("commit: {err}")))?;
-        Ok(after)
     }
 
     /// Read one page of events.
@@ -809,6 +1041,54 @@ impl StoreThread {
             )
             .optional()
             .map_err(err_str)
+    }
+
+    /// Read the authoritative state of one path.
+    fn path_state(&self, path: &str) -> Result<Option<RejectState>, String> {
+        let read = self.db.read().map_err(err_str)?;
+        let object = read.object_by_path(path).map_err(err_str)?;
+        let Some((parent_path, name)) = path.rsplit_once('/') else {
+            return Ok(None);
+        };
+        let parent_path = if parent_path.is_empty() {
+            "/"
+        } else {
+            parent_path
+        };
+        let parent = if parent_path == "/" {
+            Some(sqlite::ROOT_INO)
+        } else {
+            read.object_by_path(parent_path)
+                .map_err(err_str)?
+                .map(|object| object.ino)
+        };
+        let chunks = match &object {
+            Some(object) => read.object_chunks(object.ino).map_err(err_str)?,
+            None => Vec::new(),
+        };
+        let mut data = Vec::with_capacity(chunks.len());
+        for chunk in &chunks {
+            let bytes = read
+                .conn()
+                .query_row(
+                    "SELECT data FROM chunks WHERE hash = ?1",
+                    [chunk.hash.as_slice()],
+                    |row| row.get::<_, Option<Vec<u8>>>(0),
+                )
+                .optional()
+                .map_err(err_str)?
+                .flatten()
+                .unwrap_or_default();
+            data.push(bytes);
+        }
+        Ok(Some(RejectState {
+            path: path.to_owned(),
+            object,
+            chunks,
+            data,
+            parent,
+            name: Some(name.to_owned()),
+        }))
     }
 
     /// Read one chunk's bytes.
@@ -866,23 +1146,128 @@ enum PrepareError {
     Failed(String),
 }
 
-/// A transaction failure.
-enum ApplyError {
-    /// The `op_id` was already committed at this sequence.
-    Duplicate(i64),
-    /// The transaction rolled back.
-    Failed(String),
+/// One accepted operation inside a group commit.
+struct AcceptedOp {
+    /// Position in the caller's request list, for the reply.
+    index: usize,
+    /// Event sequence assigned by this batch.
+    seq: i64,
+    /// Decoded operation.
+    op: WireOp,
+    /// Client-supplied creation timestamp.
+    created_at: i64,
+    /// Event to append.
+    draft: EventDraft,
+    /// State-machine changes for this operation.
+    changes: Vec<Change>,
+    /// Complete post-operation file bytes, if any.
+    content: Option<Vec<u8>>,
+    /// Original frame, stored in `replay_wire` inside the batch transaction.
+    wire: Vec<u8>,
 }
 
-/// Everything one accepted operation needs at write time.
-struct CommitPlan {
-    seq: i64,
-    op: WireOp,
-    created_at: i64,
-    draft: EventDraft,
-    changes: Vec<Change>,
-    after: State,
-    content: Option<Vec<u8>>,
+/// Where a chunk produced by an earlier operation of the same batch lives.
+struct ChunkSource {
+    /// Index into the batch's accepted list.
+    op: usize,
+    /// Byte offset inside that operation's content.
+    offset: usize,
+    /// Plaintext length.
+    len: usize,
+}
+
+/// Build the outcome vector for an empty or fully resolved batch.
+fn finish_outcomes(outcomes: Vec<Option<CommitOutcome>>) -> Vec<CommitOutcome> {
+    outcomes
+        .into_iter()
+        .map(|outcome| {
+            outcome.unwrap_or_else(|| CommitOutcome::Failed {
+                message: "store did not resolve the operation".to_owned(),
+            })
+        })
+        .collect()
+}
+
+/// One failure message for every request in a batch.
+fn failed_batch(count: usize, message: &str) -> Vec<CommitOutcome> {
+    (0..count)
+        .map(|_| CommitOutcome::Failed {
+            message: message.to_owned(),
+        })
+        .collect()
+}
+
+/// Record the byte ranges of one accepted operation's content chunks.
+///
+/// The overlay never copies: a later operation reads the earlier operation's
+/// `content` buffer directly. The first writer of a hash wins because equal
+/// chunk hashes name equal plaintext.
+fn record_chunk_sources(
+    overlay: &mut HashMap<[u8; 32], ChunkSource>,
+    op: usize,
+    content: &[u8],
+    changes: &[Change],
+) {
+    // The planned `UpdateChunks` list is the authoritative chunk list; it
+    // already carries the hashes. Reusing it avoids hashing the content a
+    // third time. An unexpected list falls back to splitting the bytes.
+    let planned = planned_chunks(changes);
+    let total: usize = planned.iter().map(|chunk| chunk.len as usize).sum();
+    if total == content.len() {
+        let mut offset = 0usize;
+        for chunk in planned {
+            overlay.entry(chunk.hash).or_insert(ChunkSource {
+                op,
+                offset,
+                len: chunk.len as usize,
+            });
+            offset += chunk.len as usize;
+        }
+        return;
+    }
+    let chunk_bytes = state::CHUNK_BYTES as usize;
+    let mut offset = 0usize;
+    for piece in content.chunks(chunk_bytes) {
+        let hash = *blake3::hash(piece).as_bytes();
+        overlay.entry(hash).or_insert(ChunkSource {
+            op,
+            offset,
+            len: piece.len(),
+        });
+        offset += piece.len();
+    }
+}
+
+/// The chunk list one operation's changes install, if any.
+fn planned_chunks(changes: &[Change]) -> &[Chunk] {
+    changes
+        .iter()
+        .find_map(|change| match change {
+            Change::UpdateChunks { chunks, .. } => Some(chunks.as_slice()),
+            _ => None,
+        })
+        .unwrap_or(&[])
+}
+
+/// Build the stored event row of one draft.
+fn event_row(draft: &EventDraft, seq: i64, epoch: i64) -> Result<EventRow, String> {
+    Ok(EventRow {
+        seq,
+        epoch: draft.epoch.unwrap_or(epoch),
+        op_id: draft.op_id,
+        session_id: draft.session_id,
+        kind: draft.payload.kind(),
+        path: draft.path.clone(),
+        path2: draft.path2.clone(),
+        ino: draft.payload.ino(),
+        payload: draft
+            .payload
+            .encode()
+            .map_err(|err| format!("encode event payload: {err}"))?,
+        result: draft.result.clone(),
+        applied: true,
+        created_at: draft.created_at,
+    })
 }
 
 /// Open the sidecar connection and create the replay table.
@@ -1070,6 +1455,32 @@ fn load_state(db: &Db) -> Result<State, String> {
 }
 
 /// Apply the planned changes to SQLite.
+/// Store the chunk rows of one operation's complete content.
+///
+/// The planned chunk list already names the hashes in order, so the common
+/// path slices the content buffer and never re-hashes it. A list that does not
+/// describe the buffer falls back to [`wire::split_chunks`], which recomputes
+/// the hashes and therefore cannot write a mismatched chunk.
+fn put_content_chunks(tx: &WriteTx<'_>, content: &[u8], changes: &[Change]) -> Result<(), String> {
+    let planned = planned_chunks(changes);
+    let total: usize = planned.iter().map(|chunk| chunk.len as usize).sum();
+    if total == content.len() {
+        let mut offset = 0usize;
+        for chunk in planned {
+            let end = offset + chunk.len as usize;
+            tx.put_chunk(chunk.hash, chunk.len, Some(&content[offset..end]))
+                .map_err(|err| format!("put chunk {}: {err}", hex::encode(chunk.hash)))?;
+            offset = end;
+        }
+        return Ok(());
+    }
+    for (chunk, data) in wire::split_chunks(content) {
+        tx.put_chunk(chunk.hash, chunk.len, Some(data.as_slice()))
+            .map_err(|err| format!("put chunk {}: {err}", hex::encode(chunk.hash)))?;
+    }
+    Ok(())
+}
+
 fn apply_rows(
     tx: &WriteTx<'_>,
     before: &State,
@@ -1449,6 +1860,28 @@ mod tests {
         id
     }
 
+    /// A successful outcome for `seq`, compared by sequence only.
+    fn applied(seq: i64) -> CommitOutcome {
+        CommitOutcome::Applied {
+            seq,
+            event: EventRow {
+                seq,
+                epoch: 1,
+                op_id: None,
+                session_id: None,
+                kind: EventKind::SyncCtrl,
+                path: None,
+                path2: None,
+                ino: None,
+                payload: EventPayload::SyncCtrl { code: 0 }.encode().unwrap(),
+                result: "ok".to_owned(),
+                applied: true,
+                created_at: 0,
+            },
+            content: None,
+        }
+    }
+
     fn base(class: OpClass, path: &str) -> WireOp {
         WireOp {
             op_id: [0u8; 16],
@@ -1537,9 +1970,9 @@ mod tests {
         assert_eq!(meta.state_hash.len(), 32);
 
         let first = store.commit(request(create_file(1, "/a"), None)).await;
-        assert_eq!(first, CommitOutcome::Applied { seq: 1 });
+        assert_eq!(first, applied(1));
         let second = store.commit(request(create_file(2, "/b"), None)).await;
-        assert_eq!(second, CommitOutcome::Applied { seq: 2 });
+        assert_eq!(second, applied(2));
 
         let rows = store.events(1, 0, 10).await.unwrap();
         let seqs: Vec<i64> = rows.iter().map(|row| row.seq).collect();
@@ -1556,13 +1989,10 @@ mod tests {
             path = db_path;
             assert_eq!(
                 store.commit(request(create_file(1, "/f"), None)).await,
-                CommitOutcome::Applied { seq: 1 }
+                applied(1)
             );
             let (op, content) = write_op(2, "/f", b"abc");
-            assert_eq!(
-                store.commit(request(op, content)).await,
-                CommitOutcome::Applied { seq: 2 }
-            );
+            assert_eq!(store.commit(request(op, content)).await, applied(2));
             store.shutdown().await.unwrap();
         }
 
@@ -1574,10 +2004,7 @@ mod tests {
         truncate.op_id = ino_id(3);
         truncate.length = Some(1);
         truncate.mtime_ns = 2_000;
-        assert_eq!(
-            store.commit(request(truncate, None)).await,
-            CommitOutcome::Applied { seq: 3 }
-        );
+        assert_eq!(store.commit(request(truncate, None)).await, applied(3));
         let hash = *blake3::hash(b"a").as_bytes();
         assert_eq!(store.chunk_data(hash).await.unwrap(), Some(b"a".to_vec()));
         store.shutdown().await.unwrap();
@@ -1590,7 +2017,7 @@ mod tests {
 
         assert_eq!(
             store.commit(request(create_file(1, "/a"), None)).await,
-            CommitOutcome::Applied { seq: 1 }
+            applied(1)
         );
         assert_eq!(
             store.commit(request(create_file(1, "/a"), None)).await,
@@ -1598,7 +2025,7 @@ mod tests {
         );
         assert_eq!(
             store.commit(request(create_file(2, "/b"), None)).await,
-            CommitOutcome::Applied { seq: 2 }
+            applied(2)
         );
         store.shutdown().await.unwrap();
     }
@@ -1620,7 +2047,7 @@ mod tests {
 
         assert_eq!(
             store.commit(request(create_file(2, "/f"), None)).await,
-            CommitOutcome::Applied { seq: 1 }
+            applied(1)
         );
         store.shutdown().await.unwrap();
     }
@@ -1631,13 +2058,10 @@ mod tests {
         let (store, _, path) = start(&dir);
         assert_eq!(
             store.commit(request(create_file(1, "/f"), None)).await,
-            CommitOutcome::Applied { seq: 1 }
+            applied(1)
         );
         let (op, content) = write_op(2, "/f", b"x");
-        assert_eq!(
-            store.commit(request(op, content)).await,
-            CommitOutcome::Applied { seq: 2 }
-        );
+        assert_eq!(store.commit(request(op, content)).await, applied(2));
 
         let report = store.compact().await.unwrap();
         assert_eq!(report.epoch, 2);
@@ -1675,7 +2099,7 @@ mod tests {
         assert_eq!(meta.seq, 0);
         assert_eq!(
             store.commit(request(create_file(1, "/f"), None)).await,
-            CommitOutcome::Applied { seq: 1 }
+            applied(1)
         );
         assert_eq!(store.wire(99).await.unwrap(), Some(vec![7u8; 4]));
         assert_eq!(store.wire(1).await.unwrap(), Some(vec![0xAA, 0xBB]));
@@ -1688,19 +2112,13 @@ mod tests {
         let (store, meta, _) = start(&dir);
         assert_eq!(
             store.commit(request(create_file(1, "/f"), None)).await,
-            CommitOutcome::Applied { seq: 1 }
+            applied(1)
         );
         let (op, content) = write_op(2, "/f", b"hello world");
-        assert_eq!(
-            store.commit(request(op, content)).await,
-            CommitOutcome::Applied { seq: 2 }
-        );
+        assert_eq!(store.commit(request(op, content)).await, applied(2));
 
         let (op, patch) = pwrite_op(3, "/f", 6, b"there");
-        assert_eq!(
-            store.commit(request(op, patch)).await,
-            CommitOutcome::Applied { seq: 3 }
-        );
+        assert_eq!(store.commit(request(op, patch)).await, applied(3));
         let rows = store.events(meta.epoch, 2, 10).await.unwrap();
         let row = rows.iter().find(|row| row.seq == 3).unwrap();
         match row.decode().unwrap() {
@@ -1714,10 +2132,7 @@ mod tests {
         }
 
         let (op, patch) = pwrite_op(4, "/f", 11, b"!");
-        assert_eq!(
-            store.commit(request(op, patch)).await,
-            CommitOutcome::Applied { seq: 4 }
-        );
+        assert_eq!(store.commit(request(op, patch)).await, applied(4));
         for (chunk, data) in wire::split_chunks(b"hello there!") {
             assert_eq!(store.chunk_data(chunk.hash).await.unwrap(), Some(data));
         }
@@ -1730,26 +2145,20 @@ mod tests {
         let (store, _, path) = start(&dir);
         assert_eq!(
             store.commit(request(make_dir(1, "/a"), None)).await,
-            CommitOutcome::Applied { seq: 1 }
+            applied(1)
         );
         assert_eq!(
             store.commit(request(create_file(2, "/a/f"), None)).await,
-            CommitOutcome::Applied { seq: 2 }
+            applied(2)
         );
         let (op, content) = write_op(3, "/a/f", b"x");
-        assert_eq!(
-            store.commit(request(op, content)).await,
-            CommitOutcome::Applied { seq: 3 }
-        );
+        assert_eq!(store.commit(request(op, content)).await, applied(3));
 
         let mut rename = base(OpClass::RENAME, "/a");
         rename.op_id = ino_id(4);
         rename.path2 = Some("/b".to_owned());
         rename.mtime_ns = 2_000;
-        assert_eq!(
-            store.commit(request(rename, None)).await,
-            CommitOutcome::Applied { seq: 4 }
-        );
+        assert_eq!(store.commit(request(rename, None)).await, applied(4));
         store.shutdown().await.unwrap();
 
         let db = Db::open(&path, Role::Server).unwrap();
@@ -1775,22 +2184,16 @@ mod tests {
         let (store, meta, _) = start(&dir);
         assert_eq!(
             store.commit(request(create_file(1, "/f"), None)).await,
-            CommitOutcome::Applied { seq: 1 }
+            applied(1)
         );
         let (op, content) = write_op(2, "/f", b"ab");
-        assert_eq!(
-            store.commit(request(op, content)).await,
-            CommitOutcome::Applied { seq: 2 }
-        );
+        assert_eq!(store.commit(request(op, content)).await, applied(2));
 
         let mut truncate = base(OpClass::TRUNCATE, "/f");
         truncate.op_id = ino_id(3);
         truncate.length = Some(5);
         truncate.mtime_ns = 2_000;
-        assert_eq!(
-            store.commit(request(truncate, None)).await,
-            CommitOutcome::Applied { seq: 3 }
-        );
+        assert_eq!(store.commit(request(truncate, None)).await, applied(3));
 
         let rows = store.events(meta.epoch, 2, 10).await.unwrap();
         match rows[0].decode().unwrap() {
@@ -1804,6 +2207,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn setattr_size_and_mode_commit_one_event() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, meta, _) = start(&dir);
+        assert_eq!(
+            store.commit(request(create_file(1, "/f"), None)).await,
+            applied(1)
+        );
+        let (op, content) = write_op(2, "/f", b"abcdef");
+        assert_eq!(store.commit(request(op, content)).await, applied(2));
+
+        let mut setattr = base(OpClass::SETATTR, "/f");
+        setattr.op_id = ino_id(3);
+        setattr.mode = Some(0o600);
+        setattr.length = Some(4);
+        setattr.mtime_ns = 2_000;
+        assert_eq!(store.commit(request(setattr, None)).await, applied(3));
+
+        let rows = store.events(meta.epoch, 2, 10).await.unwrap();
+        assert_eq!(rows.len(), 1, "size and mode are one event");
+        match rows[0].decode().unwrap() {
+            EventPayload::Setattr {
+                size,
+                mode,
+                mtime_ns,
+                ..
+            } => {
+                assert_eq!(size, Some(4));
+                assert_eq!(mode, Some(0o600));
+                assert_eq!(mtime_ns, Some(2_000));
+            }
+            other => panic!("expected a setattr payload, got {other:?}"),
+        }
+        let state = store.path_state("/f").await.unwrap().unwrap();
+        let object = state.object.expect("server object");
+        assert_eq!(object.size, 4);
+        assert_eq!(object.mode, 0o600);
+        for (chunk, data) in wire::split_chunks(b"abcd") {
+            assert_eq!(store.chunk_data(chunk.hash).await.unwrap(), Some(data));
+        }
+        store.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn leave_appends_an_event_and_drops_locks() {
         let dir = tempfile::tempdir().unwrap();
         let (store, meta, _) = start(&dir);
@@ -1811,7 +2257,7 @@ mod tests {
         let other = [8u8; 16];
         assert_eq!(
             store.commit(request(create_file(1, "/f"), None)).await,
-            CommitOutcome::Applied { seq: 1 }
+            applied(1)
         );
 
         let mut lock = base(OpClass::FCNTL_LOCK, "/f");
@@ -1821,10 +2267,7 @@ mod tests {
         lock.lock_start = Some(0);
         lock.lock_len = Some(0);
         lock.mtime_ns = 1_000;
-        assert_eq!(
-            store.commit(request(lock, None)).await,
-            CommitOutcome::Applied { seq: 2 }
-        );
+        assert_eq!(store.commit(request(lock, None)).await, applied(2));
 
         let mut conflict = base(OpClass::FCNTL_LOCK, "/f");
         conflict.op_id = ino_id(3);
@@ -1840,10 +2283,7 @@ mod tests {
             CommitOutcome::Rejected { reject } if reject.errno == Errno::EAGAIN
         ));
 
-        assert_eq!(
-            store.leave(holder, vec![0xCC]).await,
-            CommitOutcome::Applied { seq: 3 }
-        );
+        assert_eq!(store.leave(holder, vec![0xCC]).await, applied(3));
         let rows = store.events(meta.epoch, 2, 10).await.unwrap();
         assert_eq!(rows[0].kind, EventKind::Leave);
         assert_eq!(rows[0].session_id, Some(holder));
@@ -1858,10 +2298,208 @@ mod tests {
         retry.mtime_ns = 1_000;
         let mut retry_request = request(retry, None);
         retry_request.session = other;
+        assert_eq!(store.commit(retry_request).await, applied(4));
+        store.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn group_commit_assigns_consecutive_sequences_and_survives_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path;
+        {
+            let (store, _, db_path) = start(&dir);
+            path = db_path;
+            let outcomes = store
+                .commit_batch(vec![
+                    request(create_file(1, "/a"), None),
+                    request(create_file(2, "/b"), None),
+                    request(create_file(3, "/c"), None),
+                ])
+                .await;
+            assert_eq!(outcomes.len(), 3);
+            for (index, outcome) in outcomes.iter().enumerate() {
+                assert_eq!(*outcome, applied(index as i64 + 1));
+            }
+            let rows = store.events(1, 0, 10).await.unwrap();
+            assert_eq!(
+                rows.iter().map(|row| row.seq).collect::<Vec<_>>(),
+                vec![1, 2, 3]
+            );
+            // The replay frame shares the batch transaction.
+            assert_eq!(store.wire(3).await.unwrap(), Some(vec![0xAA, 0xBB]));
+            store.shutdown().await.unwrap();
+        }
+
+        let (store, meta) = StoreHandle::start(path).unwrap();
+        assert_eq!(meta.seq, 3);
+        for path in ["/a", "/b", "/c"] {
+            assert!(
+                store
+                    .path_state(path)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .object
+                    .is_some(),
+                "{path} must survive the committed batch"
+            );
+        }
+        store.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn group_commit_rejects_without_consuming_a_sequence() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, _, _) = start(&dir);
+        let outcomes = store
+            .commit_batch(vec![
+                request(create_file(1, "/a"), None),
+                // A different op_id for an existing path: a plan rejection,
+                // not a duplicate.
+                request(create_file(2, "/a"), None),
+                request(create_file(3, "/b"), None),
+            ])
+            .await;
+        assert_eq!(outcomes[0], applied(1));
+        assert!(matches!(
+            &outcomes[1],
+            CommitOutcome::Rejected { reject } if reject.errno == Errno::EEXIST
+        ));
+        assert_eq!(outcomes[2], applied(2));
+        let rows = store.events(1, 0, 10).await.unwrap();
         assert_eq!(
-            store.commit(retry_request).await,
-            CommitOutcome::Applied { seq: 4 }
+            rows.iter().map(|row| row.seq).collect::<Vec<_>>(),
+            vec![1, 2]
         );
+        store.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn group_commit_stages_content_for_later_operations() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, _, _) = start(&dir);
+        let (write, content) = write_op(2, "/f", b"abc");
+        let (patch, patch_content) = pwrite_op(3, "/f", 1, b"XY");
+        let outcomes = store
+            .commit_batch(vec![
+                request(create_file(1, "/f"), None),
+                request(write, content),
+                request(patch, patch_content),
+            ])
+            .await;
+        assert_eq!(outcomes[0], applied(1));
+        assert_eq!(outcomes[1], applied(2));
+        assert_eq!(outcomes[2], applied(3));
+
+        let state = store.path_state("/f").await.unwrap().unwrap();
+        assert_eq!(state.object.expect("file object").size, 3);
+        let hash = *blake3::hash(b"aXY").as_bytes();
+        assert_eq!(store.chunk_data(hash).await.unwrap(), Some(b"aXY".to_vec()));
+        store.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn group_commit_answers_an_in_batch_duplicate_with_the_first_sequence() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, _, _) = start(&dir);
+        let outcomes = store
+            .commit_batch(vec![
+                request(create_file(1, "/a"), None),
+                request(create_file(1, "/a"), None),
+            ])
+            .await;
+        assert_eq!(outcomes[0], applied(1));
+        assert_eq!(outcomes[1], CommitOutcome::Duplicate { seq: 1 });
+        assert_eq!(store.events(1, 0, 10).await.unwrap().len(), 1);
+        store.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn group_commit_failure_rolls_back_every_operation() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, meta, path) = start(&dir);
+
+        // A trigger that aborts the second event makes the whole transaction
+        // fail after the first operation has written its rows. The store must
+        // roll the batch back and report every accepted operation as failed.
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TRIGGER fail_second BEFORE INSERT ON events
+                 WHEN NEW.seq = 2
+                 BEGIN SELECT RAISE(ABORT, 'injected batch failure'); END;",
+            )
+            .unwrap();
+        }
+        let outcomes = store
+            .commit_batch(vec![
+                request(create_file(1, "/a"), None),
+                request(create_file(2, "/b"), None),
+            ])
+            .await;
+        assert!(matches!(&outcomes[0], CommitOutcome::Failed { .. }));
+        assert!(matches!(&outcomes[1], CommitOutcome::Failed { .. }));
+
+        // Nothing from the failed transaction may survive: no event, no
+        // op_id, no replay frame and no sequence.
+        assert_eq!(store.events(meta.epoch, 0, 10).await.unwrap().len(), 0);
+        assert_eq!(store.wire(1).await.unwrap(), None);
+        assert!(
+            store
+                .path_state("/a")
+                .await
+                .unwrap()
+                .unwrap()
+                .object
+                .is_none()
+        );
+        assert!(
+            store
+                .path_state("/b")
+                .await
+                .unwrap()
+                .unwrap()
+                .object
+                .is_none()
+        );
+        {
+            let db = Db::open(&path, Role::Server).unwrap();
+            assert_eq!(db.read().unwrap().meta_i64(keys::SEQ).unwrap(), 0);
+        }
+
+        // Removing the fault lets the same operations commit with the same
+        // sequence numbers, proving the retry did not consume one.
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch("DROP TRIGGER fail_second").unwrap();
+        }
+        let outcomes = store
+            .commit_batch(vec![
+                request(create_file(1, "/a"), None),
+                request(create_file(2, "/b"), None),
+            ])
+            .await;
+        assert_eq!(outcomes[0], applied(1));
+        assert_eq!(outcomes[1], applied(2));
+        store.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn group_commit_answers_a_committed_duplicate_and_continues() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, _, _) = start(&dir);
+        assert_eq!(
+            store.commit(request(create_file(1, "/a"), None)).await,
+            applied(1)
+        );
+        let outcomes = store
+            .commit_batch(vec![
+                request(create_file(1, "/a"), None),
+                request(create_file(2, "/b"), None),
+            ])
+            .await;
+        assert_eq!(outcomes[0], CommitOutcome::Duplicate { seq: 1 });
+        assert_eq!(outcomes[1], applied(2));
         store.shutdown().await.unwrap();
     }
 }

@@ -681,6 +681,7 @@ fn u_store_sqlite_payload_roundtrips_every_kind() {
             uid: None,
             gid: Some(4),
             mtime_ns: Some(8),
+            size: None,
         },
         EventPayload::Rename { ino: ino(7) },
         EventPayload::Unlink { ino: ino(8) },
@@ -714,14 +715,131 @@ fn u_store_sqlite_payload_roundtrips_every_kind() {
 }
 
 #[test]
+fn u_store_sqlite_decodes_a_version_1_setattr_without_size() {
+    let expected = EventPayload::Setattr {
+        ino: ino(0x11),
+        mode: Some(0o644),
+        uid: Some(1000),
+        gid: Some(1001),
+        mtime_ns: Some(1_700_000_000_000_000_000),
+        size: None,
+    };
+    assert_eq!(
+        EventPayload::decode(EventKind::Setattr, &V1_SETATTR_BYTES).unwrap(),
+        expected
+    );
+
+    // The fixed bytes are the current encoding of the same payload without
+    // the appended size tag: version 2 stores the identical body.
+    let mut current = expected.encode().unwrap();
+    assert_eq!(current[0], PAYLOAD_VERSION);
+    assert_eq!(current.pop(), Some(0), "size: None is one tag byte");
+    current[0] = PAYLOAD_VERSION_V1;
+    assert_eq!(current, V1_SETATTR_BYTES);
+}
+
+#[test]
+fn u_store_sqlite_decodes_version_1_payloads_of_every_other_kind() {
+    let payloads = vec![
+        EventPayload::CreateFile {
+            ino: ino(1),
+            mode: 0o644,
+            uid: 1,
+            gid: 2,
+            mtime_ns: 3,
+            file_root: [2; 32],
+        },
+        EventPayload::CreateDir {
+            ino: ino(2),
+            mode: 0o755,
+            uid: 1,
+            gid: 2,
+            mtime_ns: 3,
+            file_root: [3; 32],
+        },
+        EventPayload::Write {
+            ino: ino(4),
+            offset: 5,
+            len: 10,
+            size: 15,
+            file_root: [5; 32],
+            mtime_ns: 6,
+            chunks: vec![ChunkRef {
+                chunk_no: 0,
+                hash: [7; 32],
+                offset: 0,
+                len: 10,
+            }],
+        },
+        EventPayload::Truncate {
+            ino: ino(5),
+            size: 12,
+            file_root: [6; 32],
+            mtime_ns: 7,
+        },
+        EventPayload::Rename { ino: ino(7) },
+        EventPayload::Unlink { ino: ino(8) },
+        EventPayload::Rmdir { ino: ino(9) },
+        EventPayload::Link { ino: ino(10) },
+        EventPayload::Lock {
+            ino: ino(11),
+            start: 0,
+            len: 10,
+            exclusive: true,
+        },
+        EventPayload::Unlock {
+            ino: ino(12),
+            start: 0,
+            len: 10,
+        },
+        EventPayload::Leave,
+        EventPayload::SyncCtrl { code: 42 },
+    ];
+    for payload in payloads {
+        let mut bytes = payload.encode().unwrap();
+        assert_eq!(bytes[0], PAYLOAD_VERSION);
+        bytes[0] = PAYLOAD_VERSION_V1;
+        assert_eq!(
+            EventPayload::decode(payload.kind(), &bytes).unwrap(),
+            payload,
+            "{:?} keeps its version-1 layout",
+            payload.kind()
+        );
+        assert!(matches!(
+            EventPayload::decode(other_kind(payload.kind()), &bytes),
+            Err(StoreError::PayloadKindMismatch { .. })
+        ));
+    }
+}
+
+#[test]
+fn u_store_sqlite_setattr_size_roundtrips() {
+    let payload = EventPayload::Setattr {
+        ino: ino(6),
+        mode: Some(0o600),
+        uid: None,
+        gid: Some(4),
+        mtime_ns: Some(8),
+        size: Some(4096),
+    };
+    let bytes = payload.encode().unwrap();
+    assert_eq!(bytes[0], PAYLOAD_VERSION);
+    assert_eq!(bytes[1], 5, "setattr keeps its frozen bincode tag");
+    assert_eq!(
+        EventPayload::decode(EventKind::Setattr, &bytes).unwrap(),
+        payload
+    );
+}
+
+#[test]
 fn u_store_sqlite_payload_rejects_corrupt_bytes() {
     assert!(matches!(
         EventPayload::decode(EventKind::Leave, &[]),
         Err(StoreError::Codec(_))
     ));
     assert!(matches!(
-        EventPayload::decode(EventKind::Leave, &[2, 0]),
-        Err(StoreError::PayloadVersion { found: 2, .. })
+        EventPayload::decode(EventKind::Leave, &[3, 0]),
+        Err(StoreError::PayloadVersion { found: 3, .. })
     ));
 
     let bytes = EventPayload::SyncCtrl { code: 1 }.encode().unwrap();

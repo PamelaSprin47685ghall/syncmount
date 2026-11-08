@@ -24,12 +24,13 @@ pub mod ops;
 pub mod replay;
 pub mod session;
 pub mod status;
+pub mod writeback;
 pub mod writer;
 
 use std::env;
-use std::path::PathBuf;
 #[cfg(feature = "fuse")]
 use std::path::Path;
+use std::path::PathBuf;
 #[cfg(feature = "fuse")]
 use std::process::Command;
 use std::sync::Arc;
@@ -44,6 +45,7 @@ pub use import::{ImportError, ImportOptions, ImportReport, import_into, import_t
 pub use lifecycle::{State, WriteGate};
 pub use session::SessionOptions;
 pub use status::{Conntrace, Counters, StatusSnapshot, StatusWriter};
+pub use writeback::{WritebackConfig, WritebackStats};
 
 /// Environment variable holding an explicit database path.
 pub const ENV_DB: &str = "SYNCMOUNT_DB";
@@ -127,10 +129,13 @@ impl Client {
             "opening the client database"
         );
         let store = Arc::new(ClientDb::open(&db_path, cluster)?);
+        store.start_writeback();
+        store.start_checkpoint();
         self.gate.set(State::Mounting);
         cleanup_stale(&self.config.mountpoint)?;
 
-        let filesystem = crate::fuse::sqlite::SqliteFs::new(Arc::clone(&store), Arc::clone(&self.gate));
+        let filesystem =
+            crate::fuse::sqlite::SqliteFs::new(Arc::clone(&store), Arc::clone(&self.gate));
         let mount_config = crate::fuse::mount_config_with(self.allow_other);
         let session = fuser::spawn_mount(filesystem, &self.config.mountpoint, &mount_config)
             .map_err(|error| ClientError::Mount(error.to_string()))?;
@@ -139,27 +144,53 @@ impl Client {
         let status = self.start_status(&store);
         let (shutdown_tx, shutdown_rx) = tokio::sync::mpsc::channel(1);
         spawn_signal_task(shutdown_tx);
-        let exit = session::run(
-            Arc::clone(&store),
-            SessionOptions {
-                endpoint: transport_endpoint(&self.config)?,
-                ring,
-                mount_id: self.config.mount_id.clone(),
-            },
-            Arc::clone(&self.gate),
-            Arc::clone(&self.counters),
-            Arc::clone(&self.conntrace),
-            shutdown_rx,
-        )
-        .await;
+        let mut shutdown_rx = shutdown_rx;
+        let exit = loop {
+            let exit = session::run(
+                Arc::clone(&store),
+                SessionOptions {
+                    endpoint: transport_endpoint(&self.config)?,
+                    ring: ring.clone(),
+                    mount_id: self.config.mount_id.clone(),
+                },
+                Arc::clone(&self.gate),
+                Arc::clone(&self.counters),
+                Arc::clone(&self.conntrace),
+                &mut shutdown_rx,
+            )
+            .await;
+            // A rejection asked for the server's authoritative tree. The next
+            // handshake resets the replica and replays from sequence zero;
+            // the mount stays up and the hot path never waited.
+            if exit.reason == "resync" {
+                tracing::warn!(event = "resync", "reconnecting to replay the server log");
+                continue;
+            }
+            break exit;
+        };
 
         self.gate.set(State::Unmounting);
         if let Some(task) = status {
             task.abort();
         }
         unmount(session, &self.config.mountpoint);
+        store.stop_checkpoint();
+        store.stop_writeback();
         let _ = store.fsync();
+        let _ = store.checkpoint_truncate();
         let _ = store.gc_chunks();
+        let writeback = store.writeback_stats();
+        tracing::info!(
+            event = "writeback",
+            buffered = writeback.buffered_bytes,
+            peak = writeback.peak_bytes,
+            commits = writeback.commits,
+            flushes = writeback.flushes,
+            cap_hits = writeback.cap_hits,
+            dropped = writeback.dropped_bytes,
+            errors = writeback.commit_errors,
+            "write-back buffer summary"
+        );
         self.gate.set(State::Exited);
         tracing::info!(
             event = "exit",
@@ -256,8 +287,7 @@ pub fn database_path(config: &Config) -> PathBuf {
     let base = env::var_os(ENV_STATE_DIR)
         .map(PathBuf::from)
         .or_else(|| {
-            env::var_os("XDG_DATA_HOME")
-                .map(|value| PathBuf::from(value).join("syncmount"))
+            env::var_os("XDG_DATA_HOME").map(|value| PathBuf::from(value).join("syncmount"))
         })
         .or_else(|| {
             env::var_os("HOME").map(|value| PathBuf::from(value).join(".local/share/syncmount"))
