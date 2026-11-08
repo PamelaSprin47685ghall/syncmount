@@ -65,18 +65,42 @@ wire protocol is 3.0 and events use payload v3.
 Replace every client binary first, then the server, but keep the clients
 stopped until the server is upgraded. These steps assume the old server already
 speaks protocol 3.0; from an older protocol major, stop the cluster and rebuild
-or re-import under 1.0.0.
+or re-import under 1.0.0. The authoritative runbook is `docs/operations.md`
+§3.2 and §4.2.
 
-1. Stop each client and let it unmount cleanly.
-2. Back up `client.db` together with `client.db-wal` for every mount, and
-   `server.db` with `server.db-wal`.
-3. Replace every client binary and keep the clients stopped. A 1.0.0 client
+1. Freeze writes and confirm every client has `applied_seq == server.seq` and
+   an empty outbox. Generate the tree manifests while the mounts are online.
+   If a rollback to the old binary must remain possible, take a hot
+   `sqlite3 .backup` of `server.db` now, before SIGTERM: the cold copy taken
+   after step 2 is already compacted and cannot be read by an old binary.
+2. **Keep the clients running.** Send SIGTERM to the old server. Drain waits
+   until every online client has applied `current_seq`; compaction then bumps
+   the epoch and writes the minimal replay log. Each online client receives an
+   `EpochMismatch` KICK, which does not inject a LEAVE event.
+3. Stop each client (it may already have exited 10 after the KICK), and back up
+   `client.db` with `client.db-wal` plus the stopped server's `server.db` with
+   `server.db-wal`.
+4. Replace every client binary and keep the clients stopped. A 1.0.0 client
    sends payload v3 in its operations, which the old server cannot decode.
-4. Stop the old server gracefully, replace its binary, and start the 1.0.0
-   server. New operations write payload v3 immediately, and the first graceful
-   shutdown compacts the log into v3 records.
-5. Start the clients. A 1.0.0 client decodes v1 and v2 payloads, so it can
-   replay an event log written by the old server.
+5. Replace the server binary and start the 1.0.0 server. It starts in the
+   compacted epoch; new operations write payload v3 immediately.
+6. Start the clients. A client that was online at compaction and applied
+   exactly `compacted_from_seq` fast-forwards: it keeps its tree, adopts the
+   new epoch, and sets `applied_seq = compacted_seq`. Its journal shows
+   `compaction_fast_forward` and no `epoch_reset`.
+
+**Do not stop the clients first.** A normal client stop makes the server
+commit a LEAVE event. `compacted_from_seq` then includes that LEAVE, the
+client's `applied_seq` sits one event behind the compaction point, and
+`CompactionState::admits` fails: the client replays the whole tree
+(`epoch_reset`) instead of fast-forwarding. A client that was offline during
+compaction, or whose watermark is below the compaction point, also replays
+from zero.
+
+Verify per client: `compaction_fast_forward` in the journal, zero
+`epoch_reset` lines, and `meta.applied_seq` equal to the server's
+`meta.compacted_seq` with matching `epoch`. An `epoch_reset` means the client
+was not drained to the compaction point.
 
 Do not run an old client against a 1.0.0 server. The server writes every new
 event as payload v3, which an old binary cannot decode; the client exits 10 at
@@ -87,10 +111,10 @@ the new server has written one fails unless the backups above are restored.
 Existing databases are readable: payload v1 and v2 decode, and the schema is
 unchanged. A clean rebuild or re-import is still the safer path across this
 boundary, because it also removes replicas that were already divergent. After
-a graceful compaction, a client that was drained at the compaction point
-(`epoch = compacted_epoch - 1`, `applied_seq = compacted_from_seq`, non-empty
-tree, fast-forward capability negotiated) adopts the new epoch without
-replaying; every other client replays from zero.
+a graceful compaction, a client that was online and drained at the compaction
+point (`epoch = compacted_epoch - 1`, `applied_seq = compacted_from_seq`,
+non-empty tree, fast-forward capability negotiated) adopts the new epoch
+without replaying; every other client replays from zero.
 
 Keep the service alive with the systemd settings below: `Restart=always`,
 `RestartPreventExitStatus=2 4`, and `StartLimitIntervalSec=0`.

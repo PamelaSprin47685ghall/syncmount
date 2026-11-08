@@ -184,7 +184,10 @@ dig sync.example.com AAAA
 
 ### 3.2 冷备步骤
 
-在维护窗口内执行。先让业务停止写入，确认 outbox 为空、`applied_seq` 已追平，再生成树清单；然后停客户端，最后停服务端。
+在维护窗口内执行。先让业务停止写入，确认 outbox 为空、`applied_seq` 已追平，再生成树清单。之后的停服顺序取决于目的：
+
+- **仅备份**：可以先停客户端，再停服务端。代价是服务端会为断开的客户端补一条 LEAVE，`seq` 前进一格，客户端副本的 `applied_seq` 落后于压缩点；从该副本恢复只能全量 replay。若要后续仍能 fast-forward，备份后先重启客户端追平，再 SIGTERM 服务端；或者接受全量 replay。
+- **升级**：不要先停客户端。保持客户端在线，先 SIGTERM 服务端，让 drain 等到 `applied_seq == current_seq` 并完成 compaction；客户端收到 `EpochMismatch` KICK 后再停。完整顺序见 4.2。
 
 ```sh
 TS=$(date -u +%Y%m%dT%H%M%SZ)
@@ -204,13 +207,49 @@ manifest() {
 
 manifest /home/user/private "$BK/tree-private"
 manifest /home/user/public  "$BK/tree-public"
+```
 
+仅备份（接受全量 replay）：
+
+```sh
 # 先停客户端：让 FUSE flush、unmount，outbox 落盘
 systemctl stop syncmount-client@private.service syncmount-client@public.service
 
 # 再停服务端：SIGTERM 触发 drain + compaction
 systemctl stop syncmount-sequencer@private.service syncmount-sequencer@public.service
 ```
+
+仅备份，但要求后续 fast-forward：
+
+```sh
+# 1) 先停客户端做第一次冷备，复制 client.db 三件套
+systemctl stop syncmount-client@private.service syncmount-client@public.service
+# （复制 client.db、client.db-wal、client.db-shm）
+
+# 2) 重启客户端，等 status 显示 STEADY 且 applied_seq 追平 healthz.seq
+systemctl start syncmount-client@private.service syncmount-client@public.service
+
+# 3) 保持客户端在线，SIGTERM 服务端：drain 到 applied==current 后 compaction
+systemctl stop syncmount-sequencer@private.service syncmount-sequencer@public.service
+
+# 4) 客户端已收到 EpochMismatch KICK；停客户端，重新复制 client.db 三件套
+#    覆盖第一次的客户端副本
+systemctl stop syncmount-client@private.service syncmount-client@public.service
+```
+
+第二次复制的客户端副本 `applied_seq == compacted_from_seq`，才能对压缩后的服务端备份 fast-forward；第一次副本落后一格，只能全量 replay。
+
+升级（4.2 使用这一条）：
+
+```sh
+# 1) 保持客户端在线，先 SIGTERM 服务端：drain 等 applied==current，然后 compaction
+systemctl stop syncmount-sequencer@private.service syncmount-sequencer@public.service
+
+# 2) 在线客户端已收到 EpochMismatch KICK；立即停客户端，避免 systemd 重启
+systemctl stop syncmount-client@private.service syncmount-client@public.service
+```
+
+升级路径的冷备发生在 compaction 之后：复制到的 `server.db` 已是新 epoch，日志已重写为 v3，只能作为升级后的备份点，旧二进制读不了。回滚到旧二进制所需的升级前 `server.db` 必须在 SIGTERM 之前按 3.3 用 `.backup` 热备；没有这份热备就没有回滚路径（见 3.7）。
 
 停服后确认：
 
@@ -276,7 +315,7 @@ sqlite3 "$BK/server-private/server.db" 'PRAGMA integrity_check;'
 
 ### 3.4 恢复步骤
 
-先停所有客户端，再停服务端。把现有数据库移到一边，不要删除。
+先停所有客户端，再停服务端。把现有数据库移到一边，不要删除。恢复不是升级：这里先停客户端是为了让它们停止重连故障服务端，停机产生的 LEAVE 随被替换的旧 `server.db` 一起移走，不影响 4.2 的升级顺序。
 
 ```sh
 systemctl stop syncmount-client@private.service syncmount-client@public.service
@@ -351,6 +390,20 @@ sqlite3 /var/lib/syncmount/private/server.db \
 - 压缩不重写 object/name 表，活树的 `state_hash` 不应变化。若压缩前后 `state_hash` 不同且期间没有写入，停止升级，保留现场并恢复备份。
 - 压缩后日志应出现 `event log compacted`，字段包含 `epoch`、`events`、`objects`。压缩失败会记录 `compaction failed`；不要继续升级。
 - 被 drain 到压缩点的客户端在重连时执行 fast-forward：保留本地树，采用新 epoch，`applied_seq` 设为 `compacted_seq`，日志出现 `compaction_fast_forward`。低于压缩点或没有该能力的客户端会清空副本并从 0 重放。
+- 能否 fast-forward 取决于压缩那一刻 `applied_seq` 是否正好等于 `compacted_from_seq`。客户端先停止会让服务端补一条 LEAVE，`seq` 前进一格；compaction 的 `compacted_from_seq` 包含这条 LEAVE，客户端 `applied_seq` 落后一格，`CompactionState::admits` 不成立，只能全量 replay。升级时必须保持客户端在线，先停服务端（见 4.2）。
+- compaction 的 KICK 原因是 `EpochMismatch`；该原因不会补 LEAVE，所以被压缩踢下线的客户端不会产生新事件。
+- 验证 fast-forward：
+
+```sh
+journalctl -u syncmount-client@private.service --since '10 min ago' -o cat \
+  | grep -E 'compaction_fast_forward|epoch_reset'
+sqlite3 /home/user/.local/state/syncmount-private/client.db \
+  "SELECT key, value FROM meta WHERE key IN ('epoch','applied_seq');"
+sqlite3 /var/lib/syncmount/private/server.db \
+  "SELECT key, value FROM meta WHERE key IN ('epoch','compacted_seq');"
+```
+
+`compaction_fast_forward` 必须出现，`epoch_reset` 计数必须为 0，客户端 `applied_seq` 等于服务端 `compacted_seq`。出现 `epoch_reset` 说明客户端没有 drain 到压缩点，只能全量 replay。
 
 ### 3.6 RPO / RTO
 
@@ -376,7 +429,7 @@ event payload version 3 is not supported (current is 2)
 因此：
 
 - **不能在 1.0.0 已经写入之后只把二进制换回旧版**。服务端 replay、客户端 replay 都会失败。
-- 回滚必须同时恢复升级前的 `server.db` 和 `client.db`（含 WAL/SHM），再装回旧二进制。
+- 回滚必须同时恢复升级前的 `server.db` 和 `client.db`（含 WAL/SHM），再装回旧二进制。升级前 `server.db` 用 3.3 的 `.backup` 热备取得；SIGTERM 后的冷备已经 compaction 成新 epoch/v3，不能用于回滚。
 - 如果只恢复服务端而保留新客户端数据库，客户端仍可能带着 v3 事件；要么恢复客户端数据库，要么移走客户端数据库让它从旧服务器全量 replay（会丢 outbox）。
 - 协议仍是 3.0；不要用 major 相同来判断兼容性。真正的硬限制是 payload v3，旧二进制在 decode 阶段拒绝。
 - 回滚窗口最好在升级后尚未产生新写入时；一旦有新写入，回滚会丢这些写入，必须先得到业务确认并记录。
@@ -416,31 +469,34 @@ done
 - outbox 没有 `failed` 行；有 `failed` 行时先按 known-limitations 处理，不要带着它升级。
 - journal 中没有未处理的 `replay_stall`、`chunk_gc` 失败、`compaction failed`。
 - 磁盘剩余至少为数据库大小的 2 倍；WAL 没有异常增长。
-- 完成 3.2 的冷备和树清单，校验和与 `integrity_check` 都通过。
+- 生成 3.2 的树清单。冷备在 4.2 停服后按 3.2 复制并校验；如需回滚到旧二进制，还要在 SIGTERM 之前按 3.3 热备 `server.db`（SIGTERM 后的冷备已 compaction，不能回滚）。
 - 记录两个 namespace 的 `epoch`、`seq`、`state_hash` 和树清单路径。
 
 ### 4.2 停服顺序
 
-**停：先客户端，后服务端。启动：先服务端，后客户端。**
+**停：保持客户端在线 → SIGTERM 服务端（drain + compaction）→ 停客户端。启动：先服务端，后客户端。**
 
 ```sh
-# 所有客户端主机，包括 S 自己
-systemctl stop syncmount-client@private.service syncmount-client@public.service
-
-# S
+# S：先停服务端。drain 等到每个在线客户端 applied_seq == current_seq，
+# 然后 compaction、epoch 加一、退出。
 systemctl stop syncmount-sequencer@private.service
 systemctl stop syncmount-sequencer@public.service
+
+# 服务端退出后，在线客户端已收到 EpochMismatch KICK。
+# 立即停客户端，避免 systemd 在服务端停机期间反复重启。
+systemctl stop syncmount-client@private.service syncmount-client@public.service
 ```
 
-- 客户端收到 SIGTERM 后会 flush、unmount、正常退出 0；`TimeoutStopSec=30s` 足够覆盖 quiesce/flush 预算。
-- 如果客户端 30 s 内没有退出，先看 `journalctl -u ...`；必要时 `fusermount3 -uz /home/user/private` 清理残留挂载，再继续。
+- 不要先停客户端。客户端正常停止会让服务端补一条 LEAVE，`seq` 前进一格；随后 compaction 的 `compacted_from_seq` 包含这条 LEAVE，客户端 `applied_seq` 落后一格，重连时 `CompactionState::admits` 不成立，只能全量 replay（`epoch_reset`），不是 fast-forward。
 - 服务端收到 SIGTERM 后 drain 最多 30 s，然后 compaction、退出。不要在 drain 期间 `kill -9`；崩溃会跳过 compaction，下次启动仍可恢复，但会留下更大的事件日志和更慢的 replay。
-- 如果日志出现 `drain timed out; compacting anyway`，记录 lagging 会话；升级后重点检查对应客户端。
-- 不要先停服务端再停客户端：那会让客户端被 epoch kick，增加 exit 10 和未完成 flush 的风险。
+- compaction 前服务端会对每个在线会话发 `EpochMismatch` KICK；该原因不注入 LEAVE，所以已 drain 到 `applied_seq == current_seq` 的客户端保持 `applied_seq == compacted_from_seq`，重连时才能 fast-forward。
+- 如果日志出现 `drain timed out; compacting anyway`，记录 lagging 会话；升级后重点检查对应客户端（它们只能全量 replay）。
+- 客户端在 KICK 后以 exit 10 退出是预期行为，不是故障；`Restart=always` 会让它在服务端停机期间重试，所以要在 KICK 后尽快 stop。
+- 仍在运行的客户端收到 SIGTERM 后会 flush、unmount、正常退出 0；`TimeoutStopSec=30s` 足够覆盖 quiesce/flush 预算。如果 30 s 内没有退出，先看 `journalctl -u ...`；必要时 `fusermount3 -uz /home/user/private` 清理残留挂载，再继续。
 
 ### 4.3 客户端二进制：先换，不启动
 
-按“先客户端、后服务器”的顺序替换二进制，但**所有客户端保持停止**，直到服务端升级完成。原因是 1.0.0 客户端会写 payload v3，旧服务端读不了。
+二进制替换仍按“先客户端、后服务器”的顺序；此时客户端已被 KICK 并停止。**所有客户端保持停止**，直到服务端升级完成。原因是 1.0.0 客户端会写 payload v3，旧服务端读不了。
 
 每台客户端：
 
@@ -511,15 +567,31 @@ systemctl start syncmount-client@public.service
 
 ```sh
 journalctl -u syncmount-client@private.service --since '10 min ago' -o cat \
-  | grep -E 'compaction_fast_forward|replay_stall|reconnect|resync|state_hash'
+  | grep -E 'compaction_fast_forward|epoch_reset|replay_stall|reconnect|resync|state_hash'
+
+# epoch_reset 的计数必须为 0
+journalctl -u syncmount-client@private.service --since '10 min ago' -o cat \
+  | grep -c 'epoch_reset'
 ```
 
 期望：
 
-- 升级前已追平并在压缩点的客户端出现 `compaction_fast_forward`，`applied_seq` 直接跳到新的 `compacted_seq`，不重放整棵树。
+- 升级前已追平、且在服务端 compaction 时仍在线的客户端出现 `compaction_fast_forward`，`applied_seq` 直接跳到新的 `compacted_seq`，不重放整棵树。
+- 这些客户端的 `epoch_reset` 计数为 0；出现 `epoch_reset` 说明它没有 drain 到压缩点（最常见原因：先停了客户端，LEAVE 让 `applied_seq` 落后一格），只能全量 replay，不是 fast-forward。
 - 低于压缩点的客户端会清空副本并从 0 replay；日志出现 `resync` / `replay_progress`，没有 `replay_stall`。
 - 全量 replay 会清空副本，但 outbox 的 `pending`/`sent` 行保留；replay 追上后按原顺序重发。
 - `replay_stall` 表示 10 s 没有进展，客户端会从 durable cursor 重连；连续出现时检查服务端、网络和磁盘，不要盲目重启。
+
+启动瞬间还要核对 fast-forward 水位：客户端 `applied_seq` 应等于服务端 `compacted_seq`，两侧 `epoch` 一致。
+
+```sh
+sqlite3 /home/user/.local/state/syncmount-private/client.db \
+  "SELECT key, value FROM meta WHERE key IN ('epoch','applied_seq');"
+sqlite3 /var/lib/syncmount/private/server.db \
+  "SELECT key, value FROM meta WHERE key IN ('epoch','compacted_seq');"
+```
+
+服务端启动后若已有新写入，`seq` 会超过 `compacted_seq`；`compacted_seq` 仍是压缩点，fast-forward 从该水位起步。
 
 全量验证：
 
