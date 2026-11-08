@@ -58,6 +58,17 @@ const PING_INTERVAL: Duration = Duration::from_secs(1);
 /// aggregate window and bounds how long an isolated event stays unapplied.
 const REPLAY_BATCH_WINDOW: Duration = Duration::from_millis(2);
 
+/// How long a replay may make no progress before the session resyncs.
+///
+/// The server owes every event between the durable `applied_seq` and the
+/// `WELCOME` watermark. A quiet downlink in that state is a stall, not a
+/// slow replay: the durable cursor is the only safe way out, because a
+/// reconnect makes the server replay the missing events again.
+const REPLAY_STALL_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How often the session checks replay progress.
+const REPLAY_STALL_CHECK: Duration = Duration::from_secs(1);
+
 /// Largest number of outbox rows one uplink page holds.
 const OUTBOX_PAGE: usize = 64;
 
@@ -116,6 +127,45 @@ enum Signal {
     Resync,
     Kicked(crate::protocol::KickReason),
     Fatal(String),
+}
+
+/// How far one replay has advanced since the session attached.
+///
+/// The session samples the applied watermark and the received-frame count.
+/// Either one moving is progress: a large file spends a long time in
+/// `STREAM_DATA` before its `ORDERED` can advance the watermark, and that is
+/// not a stall. A downlink that delivers nothing at all is.
+#[derive(Debug)]
+struct ReplayProgress {
+    last_applied: u64,
+    last_frames: u64,
+    last_advance: Instant,
+}
+
+impl ReplayProgress {
+    fn new(applied: u64, frames: u64) -> Self {
+        Self {
+            last_applied: applied,
+            last_frames: frames,
+            last_advance: Instant::now(),
+        }
+    }
+
+    /// Record the current watermark and frame count; true when either moved.
+    fn advanced(&mut self, applied: u64, frames: u64) -> bool {
+        if applied <= self.last_applied && frames <= self.last_frames {
+            return false;
+        }
+        self.last_applied = applied.max(self.last_applied);
+        self.last_frames = frames.max(self.last_frames);
+        self.last_advance = Instant::now();
+        true
+    }
+
+    /// Time since the last observed progress.
+    fn idle(&self) -> Duration {
+        self.last_advance.elapsed()
+    }
 }
 
 /// Run one session until it disconnects or `shutdown` resolves.
@@ -256,7 +306,12 @@ pub async fn run(
     let (rpc, events) = transport.split();
     let (signal_tx, mut signal_rx) = mpsc::channel::<Signal>(8);
     let (control_tx, control_rx) = mpsc::channel::<Vec<u8>>(32);
-    let watermark = Arc::new(AtomicI64::new(local_applied.min(current_seq as i64)));
+    // `local_applied` was read before the epoch reset above, so it may name
+    // the previous history. The reset cleared the replica; the durable
+    // watermark after the reset is the only value this session may use to
+    // decide whether it is caught up.
+    let applied = store.applied_seq().unwrap_or(0).max(0) as u64;
+    let watermark = Arc::new(AtomicI64::new(applied.min(current_seq) as i64));
 
     let downlink_task = tokio::spawn(downlink(
         events,
@@ -283,10 +338,30 @@ pub async fn run(
         signal_tx,
     ));
 
-    let mut caught_up = current_seq == 0 || local_applied >= current_seq as i64;
+    let mut caught_up = current_seq == 0 || applied >= current_seq;
+    tracing::info!(
+        event = "replay_start",
+        applied,
+        current = current_seq,
+        epoch,
+        local_applied,
+        local_epoch,
+        caught_up,
+        "session attached"
+    );
     if caught_up {
         gate.set(State::Steady);
+        let _ = store.mark_checkpoint();
+        tracing::info!(
+            event = "steady",
+            applied,
+            current = current_seq,
+            "replica is current at attach"
+        );
     }
+    let mut progress = ReplayProgress::new(applied, counters.frames_in.load(Ordering::Relaxed));
+    let mut stall_check = tokio::time::interval(REPLAY_STALL_CHECK);
+    stall_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut exit = SessionExit::ok();
     loop {
         tokio::select! {
@@ -297,7 +372,12 @@ pub async fn run(
                             caught_up = true;
                             gate.set(State::Steady);
                             let _ = store.mark_checkpoint();
-                            tracing::info!(event = "steady", applied = store.applied_seq().unwrap_or(0), "replay caught up");
+                            tracing::info!(
+                                event = "steady",
+                                applied = store.applied_seq().unwrap_or(0),
+                                current = current_seq,
+                                "replay caught up"
+                            );
                         }
                     }
                     Some(Signal::Kicked(reason)) => {
@@ -328,6 +408,36 @@ pub async fn run(
                     }
                 }
             }
+            _ = stall_check.tick() => {
+                // A replay that stops advancing cannot be told apart from a
+                // slow one by waiting longer: the server's log is the truth.
+                // Reconnect from the durable cursor instead of staying
+                // silently half-applied with the write gate open.
+                if !caught_up {
+                    let applied_now = watermark.load(Ordering::Acquire).max(0) as u64;
+                    let frames_now = counters.frames_in.load(Ordering::Relaxed);
+                    if progress.advanced(applied_now, frames_now) {
+                        tracing::debug!(
+                            event = "replay_progress",
+                            applied = applied_now,
+                            frames_in = frames_now,
+                            current = current_seq,
+                            "replay advanced"
+                        );
+                    } else if progress.idle() >= REPLAY_STALL_TIMEOUT {
+                        tracing::error!(
+                            event = "replay_stall",
+                            applied = applied_now,
+                            current = current_seq,
+                            idle_ms = progress.idle().as_millis() as u64,
+                            frames_in = frames_now,
+                            "replay made no progress; reconnecting from applied_seq"
+                        );
+                        exit = SessionExit::resync();
+                        break;
+                    }
+                }
+            }
             _ = shutdown.recv() => {
                 tracing::info!(event = "shutdown", "stopping the session");
                 break;
@@ -338,6 +448,7 @@ pub async fn run(
     // A resync exit keeps the mount alive: writes wait as EROFS while the
     // driver reconnects. A terminal exit unmounts.
     if exit.reason == "resync" {
+        Counters::bump(&counters.resyncs);
         gate.set(State::Joining);
     } else {
         gate.set(State::Unmounting);
@@ -725,11 +836,17 @@ async fn downlink(
                 MsgType::KICK => {
                     if let Ok(opened) = opener.open(&frame.header, &frame.prefix, &frame.body) {
                         if let Ok(kick) = Kick::decode(opened.as_slice(), &limits) {
-                            // The server ends a session whose downlink queue
-                            // overflowed instead of leaving a sequence hole.
-                            // Reconnecting replays the missing events from
-                            // the durable applied_seq.
-                            if kick.reason == crate::protocol::KickReason::QueueOverflow {
+                            // A queue overflow would leave a sequence hole; a
+                            // stalled session has stopped advancing while the
+                            // server still owes events. Both are transport
+                            // conditions, and both recover by reconnecting
+                            // from the durable `applied_seq`. Every other
+                            // reason is terminal for this mount.
+                            if matches!(
+                                kick.reason,
+                                crate::protocol::KickReason::QueueOverflow
+                                    | crate::protocol::KickReason::Stalled
+                            ) {
                                 tracing::warn!(
                                     event = "kick",
                                     reason = ?kick.reason,

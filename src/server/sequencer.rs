@@ -359,6 +359,16 @@ pub enum SeqCmd {
         /// Reply channel.
         reply: oneshot::Sender<ReplayStep>,
     },
+    /// End a session whose replay cannot proceed.
+    Kick {
+        /// Session.
+        session: SessionId,
+        /// Generation assigned at attach; a stale replay must not end its
+        /// successor.
+        generation: u64,
+        /// Why the session ends.
+        reason: KickReason,
+    },
     /// Periodic maintenance.
     Tick {
         /// Tick instant.
@@ -617,6 +627,28 @@ impl Sequencer {
         rx.await.map_err(|_| SequencerError::Stopped)
     }
 
+    /// End one session because its replay cannot proceed.
+    ///
+    /// The generation check keeps a late failure from a replaced connection
+    /// from ending its successor. The client reconnects and replays from its
+    /// durable `applied_seq`, which is the only recovery that keeps the log
+    /// authoritative.
+    pub async fn kick(
+        &self,
+        session: SessionId,
+        generation: u64,
+        reason: KickReason,
+    ) -> Result<(), SequencerError> {
+        self.cmd_tx
+            .send(SeqCmd::Kick {
+                session,
+                generation,
+                reason,
+            })
+            .await
+            .map_err(|_| SequencerError::Stopped)
+    }
+
     /// Run one maintenance tick.
     pub async fn tick(&self, now: Instant) -> Result<(), SequencerError> {
         self.cmd_tx
@@ -831,6 +863,11 @@ impl SequencerCore {
                     } => {
                         let _ = reply.send(self.on_replay_done(session, generation, upto));
                     }
+                    SeqCmd::Kick {
+                        session,
+                        generation,
+                        reason,
+                    } => self.on_kick(session, generation, reason),
                     SeqCmd::Tick { now } => self.on_tick(now),
                     SeqCmd::Snapshot { reply } => {
                         let _ = reply.send(self.snapshot());
@@ -1237,6 +1274,18 @@ impl SequencerCore {
         }
     }
 
+    /// End one session whose replay task failed.
+    fn on_kick(&mut self, session_id: SessionId, generation: u64, reason: KickReason) {
+        let Some(session) = self.online.get_mut(&session_id) else {
+            return;
+        };
+        if session.generation != generation {
+            return;
+        }
+        session.state = SessionState::Kicking;
+        self.pending_kicks.push((session_id, reason));
+    }
+
     fn on_relay(&mut self, from: SessionId, frame: FrameBuf, now: Instant) {
         if !self.online.contains(&from) {
             return;
@@ -1472,6 +1521,7 @@ impl SequencerCore {
         }
         let mut max_lag_ms = 0_u64;
         let mut max_pending = 0_u64;
+        let mut stalled = Vec::new();
         for (session_id, session) in self.online.iter_mut() {
             let Some(diagnosis) = self.health.diagnose(session, work, now) else {
                 continue;
@@ -1479,6 +1529,25 @@ impl SequencerCore {
             max_lag_ms =
                 max_lag_ms.max(u64::try_from(diagnosis.lag.as_millis()).unwrap_or(u64::MAX));
             max_pending = max_pending.max(diagnosis.pending_ops);
+            // The threshold above is a diagnosis. This limit is a verdict:
+            // no watermark movement *and* no downlink drain while events are
+            // outstanding means the session is wedged. A large file moving
+            // through a slow link drains continuously, so it never trips
+            // this. Removing the session makes the client reconnect and
+            // replay from its durable cursor instead of holding a sequence
+            // gap open forever.
+            let draining = session.outbox.queued.since_drain_at(now) < super::health::STALL_KICK;
+            if diagnosis.lag >= super::health::STALL_KICK && !draining {
+                tracing::error!(
+                    session = ?session_id,
+                    lag_ms = u64::try_from(diagnosis.lag.as_millis()).unwrap_or(u64::MAX),
+                    pending_ops = diagnosis.pending_ops,
+                    backlog_bytes = diagnosis.backlog_bytes,
+                    "watermark and downlink made no progress; ending the session so the client replays from its cursor"
+                );
+                session.state = SessionState::Kicking;
+                stalled.push((*session_id, KickReason::Stalled));
+            }
             if self.health.should_report(*session_id, now) {
                 tracing::warn!(
                     session = ?session_id,
@@ -1490,6 +1559,7 @@ impl SequencerCore {
                 );
             }
         }
+        self.pending_kicks.extend(stalled);
         self.metrics
             .watermark_lag_ms
             .store(max_lag_ms, Ordering::Relaxed);

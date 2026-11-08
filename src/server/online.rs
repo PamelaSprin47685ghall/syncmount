@@ -123,6 +123,16 @@ impl QueueStats {
             now_millis().saturating_sub(self.last_drain_ms.load(Ordering::Relaxed)),
         )
     }
+
+    /// Time since the writer last took a frame off this queue, at `now`.
+    ///
+    /// The actor's tick carries its own clock; tests drive that clock forward
+    /// instead of waiting in real time.
+    pub fn since_drain_at(&self, now: Instant) -> Duration {
+        let now_ms = u64::try_from(now.saturating_duration_since(queue_origin()).as_millis())
+            .unwrap_or(u64::MAX);
+        Duration::from_millis(now_ms.saturating_sub(self.last_drain_ms.load(Ordering::Relaxed)))
+    }
 }
 
 impl Default for QueueStats {
@@ -131,10 +141,15 @@ impl Default for QueueStats {
     }
 }
 
+/// Monotonic origin shared by every queue clock.
+fn queue_origin() -> Instant {
+    static ORIGIN: std::sync::LazyLock<Instant> = std::sync::LazyLock::new(Instant::now);
+    *ORIGIN
+}
+
 /// Monotonic millis since the first queue was built.
 fn now_millis() -> u64 {
-    static ORIGIN: std::sync::LazyLock<Instant> = std::sync::LazyLock::new(Instant::now);
-    u64::try_from(ORIGIN.elapsed().as_millis()).unwrap_or(u64::MAX)
+    u64::try_from(queue_origin().elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
 /// What happened when the actor tried to enqueue one frame.

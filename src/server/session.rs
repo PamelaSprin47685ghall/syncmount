@@ -17,7 +17,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use hyper::body::Incoming;
@@ -26,12 +26,10 @@ use tokio::sync::{mpsc, oneshot};
 use crate::crypto::secret::MasterKey;
 use crate::protocol::crypto::{NonceMinter, Opener, PskSalt, Sealer};
 use crate::protocol::handshake::{HelloInput, NonceReplayGuard, ServerHandshake};
-use crate::protocol::messages::{
-    Message, Pong, WcpWriter, WelcomeLimits, decode_plain, decode_sealed,
-};
+use crate::protocol::messages::{Message, Pong, WelcomeLimits, decode_plain, decode_sealed};
 use crate::protocol::{
-    ErrorMessage, Flags, FrameBuf, FrameDecoder, FrameHeader, FrameRef, MsgType, Prefix,
-    PrefixKind, RoutePrefix, Seq, SessionId, StreamId, TrnReason, encode_frame,
+    ErrorMessage, Flags, FrameBuf, FrameDecoder, FrameHeader, FrameRef, KickReason, MsgType,
+    Prefix, PrefixKind, RoutePrefix, Seq, SessionId, StreamId, TrnReason, encode_frame,
 };
 use crate::store::sqlite::EventPayload;
 use crate::transport::{AcceptedHttp, BodyStream, MpscSender, PeerId};
@@ -393,6 +391,7 @@ async fn start_hello(
             reply.replay_from,
             reply.current_seq,
             reply.replay_tx.clone(),
+            Arc::clone(&reply.queued),
         ));
     }
     *writer_closed = Some(closed_rx);
@@ -766,22 +765,58 @@ fn is_kick(frame: &Bytes) -> bool {
 /// event.
 const REPLAY_CHUNK_BYTES: usize = 64 * 1024;
 
+/// How long one replay chunk may wait for downlink capacity.
+///
+/// A replay that cannot hand one bounded chunk to the writer for this long is
+/// not socket backpressure: the writer is wedged (a body nobody reads, a
+/// receiver that stopped polling). Ending the session is the only recovery
+/// that keeps the event log authoritative, because the client then reconnects
+/// and replays from its durable cursor.
+const REPLAY_SEND_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Why a replay stopped before it reached the live stream.
+#[derive(Debug, thiserror::Error)]
+enum ReplayError {
+    /// The store could not read the event log or its chunks.
+    #[error("store: {0}")]
+    Store(String),
+    /// A stored write event cannot produce a complete content stream.
+    #[error("content: {0}")]
+    Content(String),
+    /// A frame could not be synthesized from the stored event.
+    #[error("frame: {0}")]
+    Frame(String),
+    /// The writer or its body is gone.
+    #[error("downlink queue closed")]
+    Closed,
+    /// The writer did not take a chunk within [`REPLAY_SEND_TIMEOUT`].
+    #[error("downlink made no progress for {0:?}")]
+    Stalled(Duration),
+}
+
 /// Accumulates replay frames into bounded byte runs.
 struct ReplayChunk {
     tx: mpsc::Sender<Bytes>,
+    /// Downlink accounting shared with the writer.
+    ///
+    /// Replay traffic is charged here for the same reason live traffic is:
+    /// `healthz` and the stall verdict must see how much replay data is
+    /// queued, and the writer marks every chunk it drains.
+    queued: Arc<QueueStats>,
     buf: Vec<u8>,
 }
 
 impl ReplayChunk {
-    fn new(tx: mpsc::Sender<Bytes>) -> Self {
+    fn new(tx: mpsc::Sender<Bytes>, queued: Arc<QueueStats>) -> Self {
         Self {
             tx,
+            queued,
             buf: Vec::with_capacity(REPLAY_CHUNK_BYTES),
         }
     }
 
     /// Add one frame, sending the buffer when it is full.
-    async fn push(&mut self, frame: &[u8]) -> Result<(), ()> {
+    async fn push(&mut self, frame: &[u8]) -> Result<(), ReplayError> {
         if !self.buf.is_empty() && self.buf.len() + frame.len() > REPLAY_CHUNK_BYTES {
             self.flush().await?;
         }
@@ -792,18 +827,27 @@ impl ReplayChunk {
         Ok(())
     }
 
-    /// Send everything buffered. Backpressure is the channel's.
-    async fn flush(&mut self) -> Result<(), ()> {
+    /// Send everything buffered, bounded by [`REPLAY_SEND_TIMEOUT`].
+    async fn flush(&mut self) -> Result<(), ReplayError> {
         if self.buf.is_empty() {
             return Ok(());
         }
         let chunk = Bytes::from(std::mem::take(&mut self.buf));
         self.buf = Vec::with_capacity(REPLAY_CHUNK_BYTES);
-        self.tx.send(chunk).await.map_err(|_| ())
+        self.queued.add(chunk.len());
+        match tokio::time::timeout(REPLAY_SEND_TIMEOUT, self.tx.send(chunk)).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(_)) => Err(ReplayError::Closed),
+            Err(_) => Err(ReplayError::Stalled(REPLAY_SEND_TIMEOUT)),
+        }
     }
 }
 
 /// Replay `(replay_from ..= current)` from SQLite, then switch to live.
+///
+/// A failure ends the session instead of leaving it in `Replaying` forever:
+/// the client's durable cursor is the only state a reconnect needs, and a
+/// stranded session would keep a sequence gap open with no way to close it.
 async fn run_replay(
     context: SessionContext,
     session_id: SessionId,
@@ -811,33 +855,83 @@ async fn run_replay(
     replay_from: Seq,
     current_seq: Seq,
     tx: mpsc::Sender<Bytes>,
+    queued: Arc<QueueStats>,
 ) {
+    match replay_stream(
+        &context,
+        session_id,
+        generation,
+        replay_from,
+        current_seq,
+        tx,
+        queued,
+    )
+    .await
+    {
+        Ok(()) => tracing::debug!(
+            session = ?session_id,
+            generation,
+            from = replay_from.get(),
+            current = current_seq.get(),
+            "replay reached the live stream"
+        ),
+        Err(error) => {
+            tracing::error!(
+                event = "replay_failed",
+                session = ?session_id,
+                generation,
+                from = replay_from.get(),
+                current = current_seq.get(),
+                error = %error,
+                "replay stopped before the live stream; ending the session so the client replays from its cursor"
+            );
+            if context
+                .sequencer
+                .kick(session_id, generation, KickReason::Stalled)
+                .await
+                .is_err()
+            {
+                tracing::warn!(
+                    session = ?session_id,
+                    generation,
+                    "cannot ask the sequencer to end a failed replay"
+                );
+            }
+        }
+    }
+}
+
+/// Read the log from `replay_from` to `current_seq` and hand every event to
+/// the writer in wire order.
+async fn replay_stream(
+    context: &SessionContext,
+    session_id: SessionId,
+    generation: u64,
+    replay_from: Seq,
+    current_seq: Seq,
+    tx: mpsc::Sender<Bytes>,
+    queued: Arc<QueueStats>,
+) -> Result<(), ReplayError> {
     let store = context.sequencer.store();
     let epoch = context.sequencer.epoch().get() as i64;
-    let ring = match context.master.derive_psk_keyring(&PskSalt::DEFAULT) {
-        Ok(ring) => ring,
-        Err(_) => return,
-    };
+    let ring = context
+        .master
+        .derive_psk_keyring(&PskSalt::DEFAULT)
+        .map_err(|error| ReplayError::Frame(error.to_string()))?;
     let nonces = NonceMinter::new(&mut rand::rng());
     let mut next = replay_from.get();
     let mut target = current_seq.get();
-    let mut chunk = ReplayChunk::new(tx);
+    let mut chunk = ReplayChunk::new(tx, queued);
     loop {
         while next <= target {
-            let page = match store
+            let page = store
                 .events(
                     epoch,
                     next.saturating_sub(1) as i64,
                     context.config.replay_batch,
                 )
                 .await
-            {
-                Ok(page) => page,
-                Err(error) => {
-                    tracing::error!(%error, "replay read failed");
-                    return;
-                }
-            };
+                .map_err(ReplayError::Store)?;
             if page.is_empty() {
                 break;
             }
@@ -846,13 +940,17 @@ async fn run_replay(
                 if seq > target {
                     break;
                 }
-                let content = replay_content(&store, &event).await;
-                if let Some((data, replay)) = &content {
-                    if send_replay_content(&mut chunk, &ring, &nonces, replay, data)
-                        .await
-                        .is_err()
-                    {
-                        return;
+                let content = replay_content(&store, &event).await?;
+                if let Some(data) = &content {
+                    // Seal the whole content stream before queueing any of
+                    // it. A `RELAY` that reached the receiver without its
+                    // `STREAM_DATA` leaves the replica waiting for bytes
+                    // that will never come; building every frame first makes
+                    // the open marker and its fragments inseparable.
+                    let frames = super::wire::replay_content_frames(&event, &ring, &nonces, data)
+                        .map_err(|error| ReplayError::Content(error.to_string()))?;
+                    for frame in &frames {
+                        chunk.push(frame).await?;
                     }
                 }
                 // Rebuild every frame from the stored event. The sidecar's
@@ -865,36 +963,30 @@ async fn run_replay(
                     &event,
                     &ring,
                     &nonces,
-                    content.as_ref().map(|(data, _)| data.as_slice()),
+                    content.as_deref(),
                 )
-                .and_then(|bytes| super::wire::with_seq(&bytes, Seq(seq)));
-                match frame {
-                    Ok(bytes) => {
-                        if chunk.push(&bytes).await.is_err() {
-                            return;
-                        }
-                    }
-                    Err(error) => {
-                        tracing::error!(?error, seq, "cannot synthesize replay frame");
-                        return;
-                    }
-                }
+                .and_then(|bytes| super::wire::with_seq(&bytes, Seq(seq)))
+                .map_err(|error| ReplayError::Frame(format!("seq {seq}: {error}")))?;
+                chunk.push(&frame).await?;
+                // Flush on the event boundary. The receiver only observes
+                // whole chunks, so this is the only place where
+                // `RELAY`/`STREAM_DATA`/`ORDERED` can be made to travel
+                // together instead of waiting for a 64 KiB or batch edge.
+                chunk.flush().await?;
                 next = seq.saturating_add(1);
             }
         }
-        if chunk.flush().await.is_err() {
-            return;
-        }
+        chunk.flush().await?;
         match context
             .sequencer
             .replay_done(session_id, generation, Seq(next.saturating_sub(1)))
             .await
         {
-            Ok(ReplayStep::Online) => return,
+            Ok(ReplayStep::Online) => return Ok(()),
             Ok(ReplayStep::Continue { target: new_target }) => {
                 target = new_target.get();
             }
-            Err(_) => return,
+            Err(error) => return Err(ReplayError::Store(error.to_string())),
         }
     }
 }
@@ -902,86 +994,31 @@ async fn run_replay(
 async fn replay_content(
     store: &super::store::StoreHandle,
     event: &crate::store::sqlite::EventRow,
-) -> Option<(Vec<u8>, super::wire::ReplayContent)> {
-    let EventPayload::Write { chunks, size, .. } = event.decode().ok()? else {
-        return None;
+) -> Result<Option<Vec<u8>>, ReplayError> {
+    let payload = event
+        .decode()
+        .map_err(|error| ReplayError::Content(format!("event {} payload: {error}", event.seq)))?;
+    let EventPayload::Write { chunks, size, .. } = payload else {
+        return Ok(None);
     };
     if chunks.is_empty() {
-        return None;
+        return Ok(None);
     }
     let mut data = Vec::with_capacity(usize::try_from(size).unwrap_or(0).min(4 << 20));
     for chunk in chunks {
-        let bytes = store.chunk_data(chunk.hash).await.ok()??;
+        // A missing chunk is not a slow read: replaying the ORDERED without
+        // its bytes would give the receiver a hash mismatch. Stop here and
+        // let the loud error name the event.
+        let bytes = store
+            .chunk_data(chunk.hash)
+            .await
+            .map_err(ReplayError::Store)?
+            .ok_or_else(|| {
+                ReplayError::Content(format!("event {} references a missing chunk", event.seq))
+            })?;
         data.extend_from_slice(&bytes);
     }
-    Some((
-        data.clone(),
-        super::wire::ReplayContent {
-            session: super::wire::replay_data_session(event),
-            total_len: data.len() as u64,
-            data,
-        },
-    ))
-}
-
-async fn send_replay_content(
-    chunk: &mut ReplayChunk,
-    ring: &crate::protocol::crypto::PskKeyRing,
-    nonces: &NonceMinter,
-    content: &super::wire::ReplayContent,
-    data: &[u8],
-) -> Result<(), ()> {
-    let open_body = WcpWriter::new().finish().map_err(|_| ())?;
-    let open_prefix = Prefix::Route(RoutePrefix::new(content.session, StreamId::CTRL, 0, 0));
-    let open = seal_frame(
-        MsgType::RELAY,
-        Flags::ENC.with(Flags::ROUTED),
-        open_prefix,
-        &open_body,
-        ring,
-        nonces,
-    )?;
-    if chunk.push(&open).await.is_err() {
-        return Err(());
-    }
-    let total_chunks = data.len().div_ceil(crate::protocol::CHUNK_PLAIN).max(1) as u32;
-    for index in 0..total_chunks {
-        let start = index as usize * crate::protocol::CHUNK_PLAIN;
-        let end = (start + crate::protocol::CHUNK_PLAIN).min(data.len());
-        let prefix = Prefix::Route(RoutePrefix::new(
-            content.session,
-            StreamId::OP_DATA,
-            index,
-            total_chunks,
-        ));
-        let frame = seal_frame(
-            MsgType::STREAM_DATA,
-            Flags::ENC.with(Flags::ROUTED),
-            prefix,
-            &data[start..end],
-            ring,
-            nonces,
-        )?;
-        if chunk.push(&frame).await.is_err() {
-            return Err(());
-        }
-    }
-    Ok(())
-}
-
-fn seal_frame(
-    msg_type: MsgType,
-    flags: Flags,
-    prefix: Prefix,
-    body: &[u8],
-    ring: &crate::protocol::crypto::PskKeyRing,
-    nonces: &NonceMinter,
-) -> Result<Vec<u8>, ()> {
-    let mut header = FrameHeader::new(msg_type, flags, 0, Seq::UNSEQUENCED);
-    let sealed = Sealer::with_session_key(&ring.session_key(), nonces)
-        .seal(&mut header, &prefix, body)
-        .map_err(|_| ())?;
-    encode_frame(&FrameRef::new(&header, &prefix, sealed.as_bytes())).map_err(|_| ())
+    Ok(Some(data))
 }
 
 fn random_session_id() -> SessionId {

@@ -71,6 +71,14 @@ pub const MAX_THRESHOLD: Duration = Duration::from_secs(24 * 60 * 60);
 /// Minimum spacing between two log lines for the same client.
 pub const DIAGNOSIS_INTERVAL: Duration = Duration::from_secs(30);
 
+/// Zero-progress time after which a behind session is ended.
+///
+/// The threshold above is a diagnosis: a slow client may need more time. This
+/// limit is different. When `applied_seq` has not moved for this long while
+/// the server still owes events, the session is wedged, not slow, and only a
+/// reconnect can move its durable cursor again.
+pub const STALL_KICK: Duration = Duration::from_secs(30);
+
 /// Frozen health constants; tests may shrink timeouts without changing the
 /// formula.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

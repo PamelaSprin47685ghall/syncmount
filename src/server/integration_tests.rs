@@ -3,7 +3,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use tokio::sync::mpsc;
@@ -13,14 +13,14 @@ use crate::protocol::crypto::{NonceMinter, PskKeyRing, PskSalt, Sealer};
 use crate::protocol::handshake::{ClientHandshake, ClientPhase};
 use crate::protocol::messages::{DataRef, Message, WcpWriter, fid};
 use crate::protocol::{
-    Caps, ClientId, CtrlPrefix, Flags, FrameBuf, FrameDecoder, FrameHeader, FrameRef, Limits,
-    MsgType, OpClass, Prefix, ProtoVersion, Seq, SessionId, decode_plain, decode_sealed,
+    Caps, ClientId, CtrlPrefix, Flags, FrameBuf, FrameDecoder, FrameHeader, FrameRef, KickReason,
+    Limits, MsgType, OpClass, Prefix, ProtoVersion, Seq, SessionId, decode_plain, decode_sealed,
     encode_frame,
 };
 use crate::server::Server;
 use crate::server::config::ServeConfig;
 use crate::server::online::Outbox;
-use crate::server::sequencer::{AttachRequest, ReplayStep, Sequencer, now_secs};
+use crate::server::sequencer::{AttachRequest, DetachCause, ReplayStep, Sequencer, now_secs};
 use crate::server::store::{CommitRequest, StoreHandle};
 use crate::server::wire::WireOp;
 use crate::transport::{DialOptions, Endpoint, HttpTransport, PeerId};
@@ -1062,5 +1062,80 @@ async fn group_commit_keeps_rejections_out_of_the_transaction() {
 
     let snapshot = harness.sequencer.snapshot().await.unwrap();
     assert_eq!(snapshot.current_seq, Seq(2));
+    let _ = harness.stop().await;
+}
+
+/// A session whose watermark stops advancing is ended, not kept attached.
+///
+/// The failed deployment logged `pending_ops=16` every 31 s for minutes and
+/// left the session in place. A slow client is allowed to be slow; a client
+/// whose `applied_seq` has not moved at all while the server owes events is
+/// wedged, and a reconnect is the only recovery.
+#[tokio::test]
+async fn a_stalled_watermark_ends_the_session() {
+    let harness = Harness::start().await;
+    let (author, author_generation, mut data, _) = harness.attach(1, Seq::UNSEQUENCED).await;
+    for index in 1..=3u8 {
+        harness
+            .sequencer
+            .ordered(
+                author,
+                request(create_op([index; 16], &format!("/f{index}"))),
+            )
+            .await
+            .unwrap();
+        let _ = recv_seq(&mut data).await;
+    }
+    // The author is caught up; only the replayer may be diagnosed as stalled.
+    harness
+        .sequencer
+        .detach(author, author_generation, DetachCause::WriterClosed)
+        .await
+        .unwrap();
+    let (_replayer, _generation, _data, mut ctrl) = harness.attach(2, Seq(0)).await;
+    assert_eq!(harness.sequencer.snapshot().await.unwrap().clients, 1);
+
+    harness
+        .sequencer
+        .tick(Instant::now() + super::health::STALL_KICK + Duration::from_secs(1))
+        .await
+        .unwrap();
+    let frame = recv_seq(&mut ctrl).await;
+    assert_eq!(
+        frame.header.msg_type,
+        MsgType::KICK,
+        "a stalled session must receive a KICK"
+    );
+    assert_eq!(harness.sequencer.snapshot().await.unwrap().clients, 0);
+
+    let _ = harness.stop().await;
+}
+
+/// A failed replay ends its own generation only.
+#[tokio::test]
+async fn a_replay_failure_kick_checks_the_generation() {
+    let harness = Harness::start().await;
+    let (session, generation, _data, mut ctrl) = harness.attach(1, Seq::UNSEQUENCED).await;
+
+    harness
+        .sequencer
+        .kick(session, generation + 1, KickReason::Stalled)
+        .await
+        .unwrap();
+    assert_eq!(
+        harness.sequencer.snapshot().await.unwrap().clients,
+        1,
+        "a stale generation must not end its successor"
+    );
+
+    harness
+        .sequencer
+        .kick(session, generation, KickReason::Stalled)
+        .await
+        .unwrap();
+    let frame = recv_seq(&mut ctrl).await;
+    assert_eq!(frame.header.msg_type, MsgType::KICK);
+    assert_eq!(harness.sequencer.snapshot().await.unwrap().clients, 0);
+
     let _ = harness.stop().await;
 }
