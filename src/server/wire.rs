@@ -260,7 +260,11 @@ pub fn to_op(
                 path,
                 attrs: Attrs {
                     mode: op.mode,
-                    mtime_ns: size.map(|_| mtime_ns),
+                    // `F_MTIME_NS` is part of every file-class ORDERED. A
+                    // pure attribute change must still carry the requested
+                    // timestamp: `utimensat` is a `setattr` without a size.
+                    // Zero means the client asked to keep the current value.
+                    mtime_ns: (mtime_ns != 0).then_some(mtime_ns),
                     ..Attrs::default()
                 },
                 size,
@@ -423,9 +427,10 @@ pub fn event_for(op: &WireOp, planned: &Op, state_before: &State, session: [u8; 
             },
             None,
         ),
-        Op::Rename { from, to, .. } => (
+        Op::Rename { from, to, mtime_ns } => (
             EventPayload::Rename {
                 ino: ino_bytes(resolve_or(state_before, from, op)),
+                mtime_ns: Some(ns_i64(*mtime_ns)),
             },
             Some(
                 op.path2
@@ -433,21 +438,26 @@ pub fn event_for(op: &WireOp, planned: &Op, state_before: &State, session: [u8; 
                     .unwrap_or_else(|| String::from_utf8_lossy(to).into_owned()),
             ),
         ),
-        Op::Unlink { path, .. } => (
+        Op::Unlink { path, mtime_ns } => (
             EventPayload::Unlink {
                 ino: ino_bytes(resolve_or(state_before, path, op)),
+                mtime_ns: Some(ns_i64(*mtime_ns)),
             },
             None,
         ),
-        Op::Rmdir { path, .. } => (
+        Op::Rmdir { path, mtime_ns } => (
             EventPayload::Rmdir {
                 ino: ino_bytes(resolve_or(state_before, path, op)),
+                mtime_ns: Some(ns_i64(*mtime_ns)),
             },
             None,
         ),
-        Op::Link { target, .. } => (
+        Op::Link {
+            target, mtime_ns, ..
+        } => (
             EventPayload::Link {
                 ino: ino_bytes(resolve_or(state_before, target, op)),
+                mtime_ns: Some(ns_i64(*mtime_ns)),
             },
             Some(String::from_utf8_lossy(target).into_owned()),
         ),
@@ -904,6 +914,10 @@ fn payload_mtime_ns(payload: &EventPayload) -> u64 {
         | EventPayload::Write { mtime_ns, .. }
         | EventPayload::Truncate { mtime_ns, .. } => ns_u64(*mtime_ns),
         EventPayload::Setattr { mtime_ns, .. } => mtime_ns.map_or(0, ns_u64),
+        EventPayload::Rename { mtime_ns, .. }
+        | EventPayload::Unlink { mtime_ns, .. }
+        | EventPayload::Rmdir { mtime_ns, .. }
+        | EventPayload::Link { mtime_ns, .. } => mtime_ns.map_or(0, ns_u64),
         _ => 0,
     }
 }
@@ -1366,11 +1380,29 @@ mod tests {
                 path: b"/f".to_vec(),
                 attrs: Attrs {
                     mode: Some(0o600),
+                    mtime_ns: Some(13),
                     ..Attrs::default()
                 },
                 size: None,
                 chunks: Vec::new(),
             })
+        );
+
+        let mut op = wire_op(OpClass::SETATTR, "/f");
+        op.mode = Some(0o600);
+        op.mtime_ns = 0;
+        assert_eq!(
+            to_op(&op, None, &state, SESSION).unwrap(),
+            Some(Op::SetAttr {
+                path: b"/f".to_vec(),
+                attrs: Attrs {
+                    mode: Some(0o600),
+                    ..Attrs::default()
+                },
+                size: None,
+                chunks: Vec::new(),
+            }),
+            "a zero timestamp means the client asked to keep the current mtime"
         );
     }
 
@@ -1572,10 +1604,73 @@ mod tests {
         assert_eq!(
             draft.payload,
             EventPayload::Rename {
-                ino: 7u128.to_le_bytes()
+                ino: 7u128.to_le_bytes(),
+                mtime_ns: Some(10),
             }
         );
         assert_eq!(draft.validate().unwrap(), EventKind::Rename);
+    }
+
+    #[test]
+    fn event_for_metadata_ops_carry_their_timestamp() {
+        let mut state = state_with_file();
+        state
+            .apply(&Op::CreateDir {
+                path: b"/d".to_vec(),
+                ino: 8,
+                mode: 0o755,
+                uid: 1,
+                gid: 2,
+                mtime_ns: 4,
+            })
+            .unwrap();
+
+        let unlink = Op::Unlink {
+            path: b"/f".to_vec(),
+            mtime_ns: 20,
+        };
+        let draft = event_for(
+            &wire_op(OpClass::UNLINK, "/f"),
+            &unlink,
+            &state,
+            SESSION,
+        );
+        assert_eq!(
+            draft.payload,
+            EventPayload::Unlink {
+                ino: 7u128.to_le_bytes(),
+                mtime_ns: Some(20),
+            }
+        );
+
+        let rmdir = Op::Rmdir {
+            path: b"/d".to_vec(),
+            mtime_ns: 21,
+        };
+        let draft = event_for(&wire_op(OpClass::RMDIR, "/d"), &rmdir, &state, SESSION);
+        assert_eq!(
+            draft.payload,
+            EventPayload::Rmdir {
+                ino: 8u128.to_le_bytes(),
+                mtime_ns: Some(21),
+            }
+        );
+
+        let link = Op::Link {
+            target: b"/f".to_vec(),
+            path: b"/g".to_vec(),
+            mtime_ns: 22,
+        };
+        let mut link_wire = wire_op(OpClass::LINK, "/g");
+        link_wire.target = Some(b"/f".to_vec());
+        let draft = event_for(&link_wire, &link, &state, SESSION);
+        assert_eq!(
+            draft.payload,
+            EventPayload::Link {
+                ino: 7u128.to_le_bytes(),
+                mtime_ns: Some(22),
+            }
+        );
     }
 
     #[test]
@@ -1840,6 +1935,7 @@ mod tests {
             EventKind::Rename,
             EventPayload::Rename {
                 ino: 7u128.to_le_bytes(),
+                mtime_ns: Some(7),
             },
             Some("/a"),
             Some("/b"),
@@ -1856,6 +1952,7 @@ mod tests {
             EventKind::Link,
             EventPayload::Link {
                 ino: 7u128.to_le_bytes(),
+                mtime_ns: Some(7),
             },
             Some("/new"),
             Some("/existing"),

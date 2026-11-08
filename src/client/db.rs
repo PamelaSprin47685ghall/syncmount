@@ -439,6 +439,40 @@ impl ClientDb {
         Ok(())
     }
 
+    /// Refresh `meta.state_hash` when a replay batch left it pending.
+    ///
+    /// The commit hook amortizes the tree walk over a batch budget; this
+    /// drains the last few events on the background checkpoint thread.
+    /// Returns true when a digest was written.
+    pub(crate) fn refresh_state_hash_pending(&self) -> Result<bool, DbError> {
+        // The common case is nothing to do; avoid taking the writer lock for
+        // an empty transaction on every background tick.
+        if self
+            .read()?
+            .meta_i64(keys::STATE_HASH_PENDING)
+            .unwrap_or(0)
+            == 0
+        {
+            return Ok(false);
+        }
+        let mut db = self.lock_writer();
+        let tx = db.write()?;
+        if tx.meta_i64(keys::STATE_HASH_PENDING).unwrap_or(0) == 0 {
+            return Ok(false);
+        }
+        let applied = tx.meta_i64(keys::APPLIED_SEQ)?;
+        let Ok(state) = tx.state_hash() else {
+            // The tree is not consistent yet; the next batch or tick retries.
+            return Ok(false);
+        };
+        tx.set_meta_blob(keys::STATE_HASH, &state)?;
+        tx.set_meta_i64(keys::STATE_HASH_SEQ, applied)?;
+        tx.set_meta_i64(keys::STATE_HASH_AT, sqlite::now_secs())?;
+        tx.set_meta_i64(keys::STATE_HASH_PENDING, 0)?;
+        tx.commit()?;
+        Ok(true)
+    }
+
     /// Move the WAL back into the main database and truncate it.
     ///
     /// Called at unmount, after FUSE and the session have stopped.
@@ -1094,9 +1128,16 @@ impl ClientDb {
 /// `wal_bytes` between ticks is checkpointed early. PASSIVE never blocks the
 /// writer or a reader; when a long read pins the WAL, the checkpoint simply
 /// stops at the oldest snapshot and the next tick retries.
+///
+/// The same thread drains a pending state digest every
+/// [`STATE_HASH_BACKGROUND`], so a small final batch does not leave
+/// `meta.state_hash` behind the tree.
+const STATE_HASH_BACKGROUND: Duration = Duration::from_secs(60);
+
 fn checkpoint_loop(db: std::sync::Weak<ClientDb>, stop: Arc<AtomicBool>, config: CheckpointConfig) {
     let poll = Duration::from_millis(100).min(config.interval.max(Duration::from_millis(1)));
     let mut last = Instant::now();
+    let mut last_hash = Instant::now();
     loop {
         if stop.load(Ordering::Relaxed) {
             return;
@@ -1119,6 +1160,16 @@ fn checkpoint_loop(db: std::sync::Weak<ClientDb>, stop: Arc<AtomicBool>, config:
                 );
             }
             last = Instant::now();
+        }
+        if last_hash.elapsed() >= STATE_HASH_BACKGROUND {
+            if let Err(error) = db.refresh_state_hash_pending() {
+                tracing::warn!(
+                    event = "state_hash",
+                    error = %error,
+                    "pending state digest refresh failed; will retry"
+                );
+            }
+            last_hash = Instant::now();
         }
         db.reap_readers();
     }
@@ -1294,6 +1345,42 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = ClientDb::open(dir.path().join("client.db"), [7u8; 16]).unwrap();
         (dir, db)
+    }
+
+    #[test]
+    fn a_pending_state_hash_is_drained_without_a_new_batch() {
+        let (_dir, db) = open();
+        let file = db
+            .create_file(ROOT_INO, OsStr::new("f"), CreateAttrs::new(0o644, 1000, 1000))
+            .unwrap();
+        db.write_at(file.ino, 0, b"hello").unwrap();
+        let tree = db.read().unwrap().state_hash().unwrap();
+        let stale = db.read().unwrap().meta_blob(keys::STATE_HASH).unwrap();
+        assert_ne!(stale, tree.to_vec());
+
+        // Make the time budget fresh so the next small batch stays pending.
+        let now = sqlite::now_secs();
+        db.write(|tx| {
+            tx.set_meta_i64(keys::STATE_HASH_AT, now)?;
+            tx.set_meta_i64(keys::STATE_HASH_PENDING, 0)?;
+            Ok(())
+        })
+        .unwrap();
+        db.write(|tx| {
+            tx.set_meta_i64(keys::APPLIED_SEQ, 1)?;
+            Ok(())
+        })
+        .unwrap();
+        {
+            let read = db.read().unwrap();
+            assert_eq!(read.meta_i64(keys::STATE_HASH_PENDING).unwrap(), 1);
+            assert_eq!(read.meta_blob(keys::STATE_HASH).unwrap(), stale);
+        }
+
+        assert!(db.refresh_state_hash_pending().unwrap());
+        let read = db.read().unwrap();
+        assert_eq!(read.meta_blob(keys::STATE_HASH).unwrap(), tree.to_vec());
+        assert_eq!(read.meta_i64(keys::STATE_HASH_PENDING).unwrap(), 0);
     }
 
     #[test]

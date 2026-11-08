@@ -357,9 +357,9 @@ may stay slow. See [`docs/known-limitations.md`](docs/known-limitations.md).
    list for non-empty files, a full `setattr`, and a `link` for every extra
    hard-link name); record `compacted_from_seq` (the old `seq`),
    `compacted_epoch` (the new epoch) and `compacted_seq` (the synthetic log's
-   final sequence); refresh chunk refcounts and `meta.state_hash`. The
-   object, name and chunk tables are not rewritten, so the state digest is
-   unchanged.
+   final sequence); refresh chunk refcounts and `meta.state_hash`. Compaction
+   then collects chunks that no object, event or replay frame references. The
+   object and name tables are not rewritten, so the state digest is unchanged.
 3. **Kick.** Every session receives `EpochMismatch` and stops. Clients exit 10.
 
 A crash skips compaction. The next start resumes `epoch` and `seq` from
@@ -372,8 +372,9 @@ epoch is `compacted_epoch - 1` and whose `applied_seq` equals
 keeps its objects, names and chunks, adopts the new epoch and sets
 `applied_seq` to `compacted_seq`. The server skips the synthetic log for that
 session, so only events written after the compaction are replayed. The
-decision uses the applied watermark and epoch alone; inode ids and mtimes
-differ between replicas, so no state hash is compared.
+decision uses the applied watermark and epoch alone; inode ids differ between
+replicas, and a tree built from an independent import may carry different
+timestamps, so no state hash is compared.
 
 A client below `compacted_from_seq`, an empty or damaged replica, or a client
 that did not negotiate the capability clears its replica, resets

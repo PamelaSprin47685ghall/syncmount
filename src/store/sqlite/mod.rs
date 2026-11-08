@@ -58,6 +58,7 @@ pub use schema::{CHUNK_BYTES, ROOT_INO, ROOT_MODE, ROOT_NLINK, keys};
 pub use types::{Chunk, ChunkRef, MetaValue, Name, Object, ObjectKind, OpId, RejectState};
 
 use std::fmt;
+use std::cell::Cell;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
@@ -75,6 +76,16 @@ pub const SCHEMA_VERSION: i64 = 1;
 
 /// First epoch of a fresh database.
 pub const DEFAULT_EPOCH: i64 = 1;
+
+/// Events between two client state-digest refreshes when no checkpoint runs.
+///
+/// A replay batch writes `applied_seq` once per batch; the digest walks the
+/// tree, so it must not run for every batch. A checkpoint or fast-forward
+/// forces a refresh regardless of this budget.
+const STATE_HASH_EVERY: i64 = 4_096;
+
+/// Seconds between two client state-digest refreshes when no checkpoint runs.
+const STATE_HASH_INTERVAL_SECS: i64 = 300;
 
 /// Largest page [`ReadTx::events_from`] will return. A caller that asks for
 /// more is clamped; a caller that asks for zero gets an empty page.
@@ -288,6 +299,8 @@ impl Db {
                 .conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)?,
             role: self.role,
+            state_hash_force: Cell::new(false),
+            state_hash_dirty: Cell::new(false),
         })
     }
 
@@ -774,6 +787,12 @@ struct IdleReader {
 pub struct WriteTx<'a> {
     tx: Transaction<'a>,
     role: Role,
+    /// A checkpoint or fast-forward moved `covered_seq`; refresh the client
+    /// digest in this transaction.
+    state_hash_force: Cell<bool>,
+    /// A replay batch moved `applied_seq`; refresh when the event or time
+    /// budget is due.
+    state_hash_dirty: Cell<bool>,
 }
 
 impl fmt::Debug for WriteTx<'_> {
@@ -801,6 +820,53 @@ impl WriteTx<'_> {
 
     /// Commit. Consuming `self` is deliberate: there is no way to commit twice.
     pub fn commit(self) -> Result<()> {
+        // A batch of replayed events, a checkpoint or a compaction
+        // fast-forward moves a watermark. Refresh the digest here, once per
+        // transaction, instead of walking the tree for every event. Replay
+        // batches are amortized: only a checkpoint, a fast-forward, the event
+        // budget or the time budget pays for the walk.
+        if self.role == Role::Client && (self.state_hash_force.get() || self.state_hash_dirty.get())
+        {
+            let applied = meta_i64_or_zero(&self.tx, keys::APPLIED_SEQ)?;
+            let hashed = meta_i64_or_zero(&self.tx, keys::STATE_HASH_SEQ)?;
+            let last_at = meta_i64_or_zero(&self.tx, keys::STATE_HASH_AT)?;
+            let now = now_secs();
+            let due = self.state_hash_force.get()
+                || applied.saturating_sub(hashed) >= STATE_HASH_EVERY
+                || now.saturating_sub(last_at) >= STATE_HASH_INTERVAL_SECS;
+            // A replay may skip an event whose parent is missing, leaving an
+            // object that no name reaches. The digest refuses that tree; keep
+            // the previous value and let the next consistent batch refresh it
+            // rather than failing the replay.
+            if due {
+                if let Ok(state) = hash::state_hash(&self.tx) {
+                    meta_set(&self.tx, keys::STATE_HASH, MetaValue::Blob(state.to_vec()))?;
+                    meta_set(
+                        &self.tx,
+                        keys::STATE_HASH_SEQ,
+                        MetaValue::Integer(applied),
+                    )?;
+                    meta_set(&self.tx, keys::STATE_HASH_AT, MetaValue::Integer(now))?;
+                    meta_set(
+                        &self.tx,
+                        keys::STATE_HASH_PENDING,
+                        MetaValue::Integer(0),
+                    )?;
+                } else {
+                    meta_set(
+                        &self.tx,
+                        keys::STATE_HASH_PENDING,
+                        MetaValue::Integer(1),
+                    )?;
+                }
+            } else {
+                meta_set(
+                    &self.tx,
+                    keys::STATE_HASH_PENDING,
+                    MetaValue::Integer(1),
+                )?;
+            }
+        }
         self.tx.commit()?;
         Ok(())
     }
@@ -847,22 +913,27 @@ impl WriteTx<'_> {
 
     /// Write one meta value.
     pub fn set_meta(&self, key: &str, value: MetaValue) -> Result<()> {
+        match key {
+            keys::COVERED_SEQ => self.state_hash_force.set(true),
+            keys::APPLIED_SEQ => self.state_hash_dirty.set(true),
+            _ => {}
+        }
         meta_set(&self.tx, key, value)
     }
 
     /// Write one integer meta value.
     pub fn set_meta_i64(&self, key: &str, value: i64) -> Result<()> {
-        meta_set(&self.tx, key, MetaValue::Integer(value))
+        self.set_meta(key, MetaValue::Integer(value))
     }
 
     /// Write one text meta value.
     pub fn set_meta_text(&self, key: &str, value: impl Into<String>) -> Result<()> {
-        meta_set(&self.tx, key, MetaValue::Text(value.into()))
+        self.set_meta(key, MetaValue::Text(value.into()))
     }
 
     /// Write one blob meta value.
     pub fn set_meta_blob(&self, key: &str, value: &[u8]) -> Result<()> {
-        meta_set(&self.tx, key, MetaValue::Blob(value.to_vec()))
+        self.set_meta(key, MetaValue::Blob(value.to_vec()))
     }
 
     /// Insert or update an object row.
@@ -1274,6 +1345,10 @@ impl WriteTx<'_> {
                     path2: Some(item.path.clone()),
                     payload: EventPayload::Link {
                         ino: item.object.ino,
+                        // The compacted `create_*` and `setattr` events
+                        // already carry the directory's final timestamp.
+                        // The synthetic link must not move it again.
+                        mtime_ns: None,
                     },
                     result: "ok".to_owned(),
                     created_at,
@@ -1424,6 +1499,47 @@ impl WriteTx<'_> {
         self.tx.execute(sql, [])?;
         Ok(())
     }
+
+    /// Delete chunks that no live object and no replayable event can need.
+    ///
+    /// Server only. A chunk is collectable when its refcount is zero and
+    /// neither `object_chunks` nor `event_chunks` names it. The caller passes
+    /// the newest compaction timestamp that may be collected; a database
+    /// compacted after `older_than` keeps its orphans for the retention
+    /// window. `replay_wire` frames are self-contained and are cleared by
+    /// compaction, so a frame never needs a `chunks` row that its event does
+    /// not already reference through `event_chunks`.
+    ///
+    /// The scan and the delete share the caller's transaction. A crash
+    /// therefore rolls the delete back; a retry sees the same rows.
+    pub fn gc_orphan_chunks(&self, older_than: i64) -> Result<GcReport> {
+        if self.role != Role::Server {
+            return Err(StoreError::WrongRole {
+                role: self.role,
+                operation: "gc_orphan_chunks",
+            });
+        }
+        let orphans: i64 = self
+            .tx
+            .query_row(GC_COUNT_ORPHANS, [], |row| row.get(0))?;
+        let compacted_at = meta_i64(&self.tx, keys::COMPACTED_AT)?;
+        if compacted_at <= 0 || compacted_at > older_than {
+            return Ok(GcReport {
+                orphans: u64::try_from(orphans).unwrap_or(0),
+                deleted: 0,
+                freed_bytes: 0,
+            });
+        }
+        let freed_bytes: i64 = self
+            .tx
+            .query_row(GC_BYTES_ORPHANS, [], |row| row.get(0))?;
+        let deleted = self.tx.execute(GC_DELETE_ORPHANS, [])?;
+        Ok(GcReport {
+            orphans: u64::try_from(orphans).unwrap_or(0),
+            deleted: u64::try_from(deleted).unwrap_or(0),
+            freed_bytes: u64::try_from(freed_bytes).unwrap_or(0),
+        })
+    }
 }
 
 /// Summary of one compaction.
@@ -1442,6 +1558,38 @@ pub struct CompactReport {
     /// Subset of `events` that are hard-link records.
     pub links: u64,
 }
+
+/// Summary of one orphan-chunk collection.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GcReport {
+    /// Chunks whose refcount is zero and that no object or event names.
+    pub orphans: u64,
+    /// Chunks deleted by this call (zero until the retention window passes).
+    pub deleted: u64,
+    /// Sum of `length(data)` over the deleted rows.
+    pub freed_bytes: u64,
+}
+
+const GC_COUNT_ORPHANS: &str = r#"
+SELECT COUNT(*) FROM chunks
+WHERE refcount = 0
+  AND NOT EXISTS (SELECT 1 FROM object_chunks oc WHERE oc.chunk_hash = chunks.hash)
+  AND NOT EXISTS (SELECT 1 FROM event_chunks ec WHERE ec.chunk_hash = chunks.hash)
+"#;
+
+const GC_BYTES_ORPHANS: &str = r#"
+SELECT COALESCE(SUM(length(data)), 0) FROM chunks
+WHERE refcount = 0
+  AND NOT EXISTS (SELECT 1 FROM object_chunks oc WHERE oc.chunk_hash = chunks.hash)
+  AND NOT EXISTS (SELECT 1 FROM event_chunks ec WHERE ec.chunk_hash = chunks.hash)
+"#;
+
+const GC_DELETE_ORPHANS: &str = r#"
+DELETE FROM chunks
+WHERE refcount = 0
+  AND NOT EXISTS (SELECT 1 FROM object_chunks oc WHERE oc.chunk_hash = chunks.hash)
+  AND NOT EXISTS (SELECT 1 FROM event_chunks ec WHERE ec.chunk_hash = chunks.hash)
+"#;
 
 const CLIENT_RECOUNT_ONE: &str = r#"
 UPDATE chunks SET refcount =
@@ -1550,6 +1698,19 @@ fn meta_i64(conn: &Connection, key: &str) -> Result<i64> {
             actual: other.type_name(),
         }),
         None => Err(StoreError::MissingMeta(key.to_owned())),
+    }
+}
+
+/// Read an integer meta value, treating a missing key as zero.
+fn meta_i64_or_zero(conn: &Connection, key: &str) -> Result<i64> {
+    match meta_get(conn, key)? {
+        Some(MetaValue::Integer(value)) => Ok(value),
+        Some(other) => Err(StoreError::MetaType {
+            key: key.to_owned(),
+            expected: "integer",
+            actual: other.type_name(),
+        }),
+        None => Ok(0),
     }
 }
 

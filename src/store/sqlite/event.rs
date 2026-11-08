@@ -11,11 +11,14 @@
 //! version:u8  ||  bincode(serde) EventPayload
 //! ```
 //!
-//! Version 2 is current. It appended `size` to `setattr`, so a version-1
-//! `setattr` decodes as an attribute-only change with `size: None`, exactly
-//! the operation version 1 recorded. Every other variant has the same layout
-//! in both versions, so only `setattr` needs a legacy decoder. New payloads
-//! are always written as version 2.
+//! Version 3 is current. It appended an optional `mtime_ns` to `rename`,
+//! `unlink`, `rmdir` and `link`, so the event stream carries the implicit
+//! timestamp change those operations make to the object and its parents.
+//! Version 2 appended `size` to `setattr`; a version-1 `setattr` decodes as an
+//! attribute-only change with `size: None`. The four timestamped variants
+//! decode from version 1 and 2 with `mtime_ns: None`, exactly the operation
+//! those versions recorded. Every other variant has the same layout in all
+//! versions. New payloads are always written as version 3.
 //!
 //! The version byte is the escape hatch for a future layout change. The
 //! bincode body is length-limited on decode so a corrupt or hostile row cannot
@@ -27,12 +30,15 @@ use super::types::ChunkRef;
 use super::{Result, StoreError, now_secs};
 
 /// Current payload encoding version.
-pub const PAYLOAD_VERSION: u8 = 2;
+pub const PAYLOAD_VERSION: u8 = 3;
+
+/// Version 2: `setattr` gained `size`; the other variants are unchanged.
+pub const PAYLOAD_VERSION_V2: u8 = 2;
 
 /// First payload version, still accepted on decode.
 ///
 /// Versions 1 and 2 differ only in `setattr`; every other variant decodes
-/// with the current layout.
+/// with the version-2 layout.
 pub const PAYLOAD_VERSION_V1: u8 = 1;
 
 /// Bincode's enum tag of `EventPayload::Setattr`, frozen at version 1.
@@ -40,6 +46,12 @@ pub const PAYLOAD_VERSION_V1: u8 = 1;
 /// Version 2 keeps the variant order, so the tag is unchanged. The legacy
 /// decoder reads it explicitly because it does not decode an `EventPayload`.
 const SETATTR_TAG: u32 = 5;
+
+/// Bincode's enum tags of the timestamped variants, frozen at version 1.
+const RENAME_TAG: u32 = 6;
+const UNLINK_TAG: u32 = 7;
+const RMDIR_TAG: u32 = 8;
+const LINK_TAG: u32 = 9;
 
 /// Upper bound on a payload body, matching the design's 4 MiB event ceiling.
 ///
@@ -191,15 +203,27 @@ pub enum EventPayload {
     },
     Rename {
         ino: [u8; 16],
+        /// Timestamp the operation writes to the object and both parents.
+        /// `None` only in a payload written before version 3.
+        mtime_ns: Option<i64>,
     },
     Unlink {
         ino: [u8; 16],
+        /// Timestamp the operation writes to the parent directory.
+        /// `None` only in a payload written before version 3.
+        mtime_ns: Option<i64>,
     },
     Rmdir {
         ino: [u8; 16],
+        /// Timestamp the operation writes to the parent directory.
+        /// `None` only in a payload written before version 3.
+        mtime_ns: Option<i64>,
     },
     Link {
         ino: [u8; 16],
+        /// Timestamp the operation writes to the parent directory.
+        /// `None` only in a payload written before version 3.
+        mtime_ns: Option<i64>,
     },
     Lock {
         ino: [u8; 16],
@@ -248,10 +272,10 @@ impl EventPayload {
             | Self::Write { ino, .. }
             | Self::Truncate { ino, .. }
             | Self::Setattr { ino, .. }
-            | Self::Rename { ino }
-            | Self::Unlink { ino }
-            | Self::Rmdir { ino }
-            | Self::Link { ino }
+            | Self::Rename { ino, .. }
+            | Self::Unlink { ino, .. }
+            | Self::Rmdir { ino, .. }
+            | Self::Link { ino, .. }
             | Self::Lock { ino, .. }
             | Self::Unlock { ino, .. } => *ino,
             Self::Leave | Self::SyncCtrl { .. } => return None,
@@ -287,8 +311,61 @@ impl EventPayload {
         };
         let payload = match version {
             PAYLOAD_VERSION => decode_body(body, "payload")?,
+            PAYLOAD_VERSION_V2 => match kind {
+                EventKind::Rename => decode_timestamped_v2(
+                    body,
+                    EventKind::Rename,
+                    "v2 rename",
+                    |ino| EventPayload::Rename { ino, mtime_ns: None },
+                )?,
+                EventKind::Unlink => decode_timestamped_v2(
+                    body,
+                    EventKind::Unlink,
+                    "v2 unlink",
+                    |ino| EventPayload::Unlink { ino, mtime_ns: None },
+                )?,
+                EventKind::Rmdir => decode_timestamped_v2(
+                    body,
+                    EventKind::Rmdir,
+                    "v2 rmdir",
+                    |ino| EventPayload::Rmdir { ino, mtime_ns: None },
+                )?,
+                EventKind::Link => decode_timestamped_v2(
+                    body,
+                    EventKind::Link,
+                    "v2 link",
+                    |ino| EventPayload::Link { ino, mtime_ns: None },
+                )?,
+                _ => decode_body(body, "payload")?,
+            },
             PAYLOAD_VERSION_V1 if kind == EventKind::Setattr => decode_setattr_v1(body)?,
-            PAYLOAD_VERSION_V1 => decode_body(body, "payload")?,
+            PAYLOAD_VERSION_V1 => match kind {
+                EventKind::Rename => decode_timestamped_v2(
+                    body,
+                    EventKind::Rename,
+                    "v1 rename",
+                    |ino| EventPayload::Rename { ino, mtime_ns: None },
+                )?,
+                EventKind::Unlink => decode_timestamped_v2(
+                    body,
+                    EventKind::Unlink,
+                    "v1 unlink",
+                    |ino| EventPayload::Unlink { ino, mtime_ns: None },
+                )?,
+                EventKind::Rmdir => decode_timestamped_v2(
+                    body,
+                    EventKind::Rmdir,
+                    "v1 rmdir",
+                    |ino| EventPayload::Rmdir { ino, mtime_ns: None },
+                )?,
+                EventKind::Link => decode_timestamped_v2(
+                    body,
+                    EventKind::Link,
+                    "v1 link",
+                    |ino| EventPayload::Link { ino, mtime_ns: None },
+                )?,
+                _ => decode_body(body, "payload")?,
+            },
             found => {
                 return Err(StoreError::PayloadVersion {
                     found,
@@ -322,6 +399,15 @@ struct SetattrV1 {
     mtime_ns: Option<i64>,
 }
 
+/// A version-1/2 `rename`, `unlink`, `rmdir` or `link` body.
+///
+/// Those versions stored only the inode: `u32 tag || ino`.
+#[derive(Deserialize)]
+struct InoOnlyV2 {
+    tag: u32,
+    ino: [u8; 16],
+}
+
 /// Decode one bincode body and require that it consumes every byte.
 fn decode_body<T: serde::de::DeserializeOwned>(body: &[u8], what: &str) -> Result<T> {
     let (value, used): (T, usize) = bincode::serde::decode_from_slice(body, codec_config())
@@ -349,6 +435,50 @@ fn decode_setattr_v1(body: &[u8]) -> Result<EventPayload> {
         mtime_ns: legacy.mtime_ns,
         size: None,
     })
+}
+
+/// Decode the pre-version-3 body of a timestamped variant.
+fn decode_timestamped_v2(
+    body: &[u8],
+    kind: EventKind,
+    what: &str,
+    make: impl FnOnce([u8; 16]) -> EventPayload,
+) -> Result<EventPayload> {
+    let legacy: InoOnlyV2 = decode_body(body, what)?;
+    let expected_tag = timestamped_tag(kind);
+    if legacy.tag != expected_tag {
+        if let Some(actual) = timestamped_kind(legacy.tag) {
+            return Err(StoreError::PayloadKindMismatch {
+                kind: kind.as_str(),
+                payload: actual.as_str(),
+            });
+        }
+        return Err(StoreError::Codec(format!(
+            "{what} has variant tag {}, expected {expected_tag}",
+            legacy.tag
+        )));
+    }
+    Ok(make(legacy.ino))
+}
+
+const fn timestamped_tag(kind: EventKind) -> u32 {
+    match kind {
+        EventKind::Rename => RENAME_TAG,
+        EventKind::Unlink => UNLINK_TAG,
+        EventKind::Rmdir => RMDIR_TAG,
+        EventKind::Link => LINK_TAG,
+        _ => 0,
+    }
+}
+
+const fn timestamped_kind(tag: u32) -> Option<EventKind> {
+    match tag {
+        RENAME_TAG => Some(EventKind::Rename),
+        UNLINK_TAG => Some(EventKind::Unlink),
+        RMDIR_TAG => Some(EventKind::Rmdir),
+        LINK_TAG => Some(EventKind::Link),
+        _ => None,
+    }
 }
 
 /// Version-1 `setattr` bytes, as written before the payload gained `size`.

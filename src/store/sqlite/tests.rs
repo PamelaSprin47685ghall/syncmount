@@ -627,6 +627,164 @@ fn u_store_sqlite_compact_rejects_client_role() {
 }
 
 #[test]
+fn u_store_sqlite_gc_reclaims_only_unreferenced_chunks() {
+    let (_dir, mut db) = temp_db(Role::Server);
+    let live_data = b"live";
+    let event_data = b"event-only";
+    let orphan_data = b"orphan";
+    let live = ChunkRef {
+        chunk_no: 0,
+        hash: chunk_hash(live_data),
+        offset: 0,
+        len: 4,
+    };
+    let event_only = ChunkRef {
+        chunk_no: 0,
+        hash: chunk_hash(event_data),
+        offset: 0,
+        len: 10,
+    };
+    let orphan_hash = chunk_hash(orphan_data);
+
+    let file = file_object(ino(2), 4, std::slice::from_ref(&live), 1);
+    {
+        let tx = db.write().unwrap();
+        tx.put_chunk(live.hash, 4, Some(live_data)).unwrap();
+        tx.put_chunk(event_only.hash, 10, Some(event_data))
+            .unwrap();
+        tx.put_chunk(orphan_hash, 6, Some(orphan_data)).unwrap();
+        tx.put_object(&file).unwrap();
+        tx.put_name(ROOT_INO, "f", ino(2), "/f").unwrap();
+        tx.set_object_chunks(ino(2), std::slice::from_ref(&live))
+            .unwrap();
+        let seq = tx.bump_seq().unwrap();
+        tx.insert_event(
+            seq,
+            EventDraft {
+                epoch: None,
+                op_id: Some(ino(9)),
+                session_id: None,
+                path: Some("/g".to_owned()),
+                path2: None,
+                payload: EventPayload::Write {
+                    ino: ino(2),
+                    offset: 0,
+                    len: 10,
+                    size: 10,
+                    file_root: file_root(
+                        ObjectKind::File,
+                        None,
+                        std::slice::from_ref(&event_only),
+                    ),
+                    mtime_ns: 2_000,
+                    chunks: vec![event_only.clone()],
+                },
+                result: "ok".to_owned(),
+                created_at: 1,
+            },
+        )
+        .unwrap();
+        tx.commit().unwrap();
+    }
+    {
+        let read = db.read().unwrap();
+        assert_eq!(read.chunk(event_only.hash).unwrap().unwrap().refcount, 1);
+        assert_eq!(read.chunk(orphan_hash).unwrap().unwrap().refcount, 0);
+    }
+
+    db.compact().unwrap();
+    let now = now_secs();
+
+    // Inside the retention window nothing is deleted.
+    {
+        let tx = db.write().unwrap();
+        let report = tx.gc_orphan_chunks(now - 3_600).unwrap();
+        assert_eq!(report.orphans, 2);
+        assert_eq!(report.deleted, 0);
+        tx.commit().unwrap();
+    }
+    {
+        let read = db.read().unwrap();
+        assert!(read.chunk(event_only.hash).unwrap().is_some());
+        assert!(read.chunk(orphan_hash).unwrap().is_some());
+    }
+
+    // An uncommitted collection rolls back with its transaction.
+    {
+        let tx = db.write().unwrap();
+        tx.gc_orphan_chunks(now).unwrap();
+    }
+    {
+        let read = db.read().unwrap();
+        assert!(read.chunk(orphan_hash).unwrap().is_some());
+    }
+
+    let report = {
+        let tx = db.write().unwrap();
+        let report = tx.gc_orphan_chunks(now).unwrap();
+        tx.commit().unwrap();
+        report
+    };
+    assert_eq!(report.orphans, 2);
+    assert_eq!(report.deleted, 2);
+    assert_eq!(report.freed_bytes, 16);
+
+    let read = db.read().unwrap();
+    assert!(read.chunk(event_only.hash).unwrap().is_none());
+    assert!(read.chunk(orphan_hash).unwrap().is_none());
+    let live = read.chunk(live.hash).unwrap().expect("live chunk kept");
+    assert_eq!(live.refcount, 2);
+}
+
+#[test]
+fn u_store_sqlite_client_watermark_refreshes_state_hash() {
+    let (_dir, mut db) = temp_db(Role::Client);
+    let before = db.read().unwrap().meta_blob(keys::STATE_HASH).unwrap();
+
+    // A plain local mutation does not pay for a whole-tree digest.
+    let data = b"hello";
+    let chunk = ChunkRef {
+        chunk_no: 0,
+        hash: chunk_hash(data),
+        offset: 0,
+        len: 5,
+    };
+    {
+        let tx = db.write().unwrap();
+        tx.put_chunk(chunk.hash, 5, Some(data)).unwrap();
+        tx.put_object(&file_object(
+            ino(2),
+            5,
+            std::slice::from_ref(&chunk),
+            1,
+        ))
+        .unwrap();
+        tx.put_name(ROOT_INO, "f", ino(2), "/f").unwrap();
+        tx.set_object_chunks(ino(2), std::slice::from_ref(&chunk))
+            .unwrap();
+        tx.commit().unwrap();
+    }
+    assert_eq!(
+        db.read().unwrap().meta_blob(keys::STATE_HASH).unwrap(),
+        before
+    );
+    let tree = db.state_hash().unwrap();
+    assert_ne!(tree.to_vec(), before);
+
+    // A replay batch, checkpoint or fast-forward writes a watermark; the
+    // commit refreshes the digest once for the whole transaction.
+    {
+        let tx = db.write().unwrap();
+        tx.set_meta_i64(keys::APPLIED_SEQ, 1).unwrap();
+        tx.commit().unwrap();
+    }
+    assert_eq!(
+        db.read().unwrap().meta_blob(keys::STATE_HASH).unwrap(),
+        tree.to_vec()
+    );
+}
+
+#[test]
 fn u_store_sqlite_payload_roundtrips_every_kind() {
     let chunk = ChunkRef {
         chunk_no: 0,
@@ -683,10 +841,22 @@ fn u_store_sqlite_payload_roundtrips_every_kind() {
             mtime_ns: Some(8),
             size: None,
         },
-        EventPayload::Rename { ino: ino(7) },
-        EventPayload::Unlink { ino: ino(8) },
-        EventPayload::Rmdir { ino: ino(9) },
-        EventPayload::Link { ino: ino(10) },
+        EventPayload::Rename {
+            ino: ino(7),
+            mtime_ns: Some(9),
+        },
+        EventPayload::Unlink {
+            ino: ino(8),
+            mtime_ns: Some(10),
+        },
+        EventPayload::Rmdir {
+            ino: ino(9),
+            mtime_ns: Some(11),
+        },
+        EventPayload::Link {
+            ino: ino(10),
+            mtime_ns: Some(12),
+        },
         EventPayload::Lock {
             ino: ino(11),
             start: 0,
@@ -777,10 +947,22 @@ fn u_store_sqlite_decodes_version_1_payloads_of_every_other_kind() {
             file_root: [6; 32],
             mtime_ns: 7,
         },
-        EventPayload::Rename { ino: ino(7) },
-        EventPayload::Unlink { ino: ino(8) },
-        EventPayload::Rmdir { ino: ino(9) },
-        EventPayload::Link { ino: ino(10) },
+        EventPayload::Rename {
+            ino: ino(7),
+            mtime_ns: None,
+        },
+        EventPayload::Unlink {
+            ino: ino(8),
+            mtime_ns: None,
+        },
+        EventPayload::Rmdir {
+            ino: ino(9),
+            mtime_ns: None,
+        },
+        EventPayload::Link {
+            ino: ino(10),
+            mtime_ns: None,
+        },
         EventPayload::Lock {
             ino: ino(11),
             start: 0,
@@ -796,7 +978,19 @@ fn u_store_sqlite_decodes_version_1_payloads_of_every_other_kind() {
         EventPayload::SyncCtrl { code: 42 },
     ];
     for payload in payloads {
+        // Version 1 stored only the inode for these four kinds; version 3
+        // appends the optional timestamp.
+        let timestamped = matches!(
+            payload,
+            EventPayload::Rename { .. }
+                | EventPayload::Unlink { .. }
+                | EventPayload::Rmdir { .. }
+                | EventPayload::Link { .. }
+        );
         let mut bytes = payload.encode().unwrap();
+        if timestamped {
+            assert_eq!(bytes.pop(), Some(0), "None timestamp is one tag byte");
+        }
         assert_eq!(bytes[0], PAYLOAD_VERSION);
         bytes[0] = PAYLOAD_VERSION_V1;
         assert_eq!(
@@ -805,10 +999,12 @@ fn u_store_sqlite_decodes_version_1_payloads_of_every_other_kind() {
             "{:?} keeps its version-1 layout",
             payload.kind()
         );
-        assert!(matches!(
-            EventPayload::decode(other_kind(payload.kind()), &bytes),
-            Err(StoreError::PayloadKindMismatch { .. })
-        ));
+        if !timestamped {
+            assert!(matches!(
+                EventPayload::decode(other_kind(payload.kind()), &bytes),
+                Err(StoreError::PayloadKindMismatch { .. })
+            ));
+        }
     }
 }
 
@@ -838,8 +1034,8 @@ fn u_store_sqlite_payload_rejects_corrupt_bytes() {
         Err(StoreError::Codec(_))
     ));
     assert!(matches!(
-        EventPayload::decode(EventKind::Leave, &[3, 0]),
-        Err(StoreError::PayloadVersion { found: 3, .. })
+        EventPayload::decode(EventKind::Leave, &[PAYLOAD_VERSION + 1, 0]),
+        Err(StoreError::PayloadVersion { found, .. }) if found == PAYLOAD_VERSION + 1
     ));
 
     let bytes = EventPayload::SyncCtrl { code: 1 }.encode().unwrap();
@@ -876,7 +1072,14 @@ fn u_store_sqlite_rejects_inconsistent_event_drafts() {
         Err(StoreError::InvalidEvent { .. })
     ));
 
-    let rename_without_path2 = EventDraft::new(ino(1), EventPayload::Rename { ino: ino(2) }, "/a");
+    let rename_without_path2 = EventDraft::new(
+        ino(1),
+        EventPayload::Rename {
+            ino: ino(2),
+            mtime_ns: None,
+        },
+        "/a",
+    );
     assert!(matches!(
         tx.insert_event(1, rename_without_path2),
         Err(StoreError::InvalidEvent { .. })

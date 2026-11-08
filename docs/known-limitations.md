@@ -206,8 +206,9 @@ stream stays monotonic.
    `create_*` per object in path order, a `write` carrying the current chunk
    list for non-empty files, a full `setattr`, and a `link` for every extra
    hard-link name); record `compacted_from_seq`, `compacted_epoch` and
-   `compacted_seq`; refresh chunk refcounts and `meta.state_hash`. The object,
-   name and chunk tables are not rewritten, so the state digest is unchanged.
+   `compacted_seq`; refresh chunk refcounts and `meta.state_hash`. Compaction
+   then collects chunks that no object, event or replay frame references. The
+   object and name tables are not rewritten, so the state digest is unchanged.
 3. **Kick.** Every session receives `EpochMismatch` and stops. Clients exit 10.
 
 A crash skips compaction. The next start resumes `epoch` and `seq` from
@@ -218,11 +219,15 @@ produces the same state digest.
 `WELCOME` carries the three compaction watermarks. A client at
 `(compacted_epoch - 1, compacted_from_seq)` adopts `compacted_epoch` and
 `compacted_seq` without replaying; the server starts that session after the
-synthetic log. The test uses only the epoch and the applied watermark: inode
-ids and mtimes differ between replicas of the same tree, so no state hash is
-compared. A rolled-back compaction leaves the metadata unchanged, and a
-client that already adopted a watermark it cannot prove falls back to a full
-replay.
+synthetic log. Live create, remove, rename and link events carry the timestamp
+they write to the affected object and its parents (payload version 3), so two
+replicas that applied the same history agree on directory mtimes as well as
+content; a fast-forwarding replica therefore keeps the metadata it already
+has. The test uses only the epoch and the applied watermark: inode ids differ
+between replicas, and a tree built from an independent import may carry
+different timestamps, so no state hash is compared. A rolled-back compaction
+leaves the metadata unchanged, and a client that already adopted a watermark
+it cannot prove falls back to a full replay.
 
 `replay_floor` is the oldest sequence still replayable. Compaction always
 leaves it at 1 because the synthetic log starts at 1. There is no bulk tree
@@ -233,11 +238,13 @@ from the pre-compaction point or replays the synthetic log from the beginning.
 ### 1.8 State hashes are local diagnostics
 
 `state_hash` is a BLAKE3 digest of the object table, including the 128-bit
-inode ids. It is written on compaction and on a clean shutdown; during normal
-operation it shows the value from the last close. It is useful for comparing
-two databases that were built from the same import, but it is not a
-cross-cluster consensus value and two independently written databases need not
-agree.
+inode ids. The server writes it on compaction and on a clean shutdown. The
+client refreshes it from replay: a batch that moves `applied_seq` rewrites the
+digest after 4096 events or 300 seconds, and otherwise marks
+`meta.state_hash_pending`, which the background checkpoint thread drains
+within a minute. It is useful for comparing two databases that were built
+from the same import, but it is not a cross-cluster consensus value and two
+independently written databases need not agree.
 
 ## 2. POSIX surface
 

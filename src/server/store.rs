@@ -68,7 +68,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fmt::Display;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rusqlite::{Connection, OptionalExtension, params};
 use tokio::sync::{mpsc, oneshot};
@@ -100,6 +100,15 @@ const MAX_FILE_BYTES: u64 = 4 << 30;
 /// staged plan is deterministic and the failed transaction rolled back, so the
 /// retry keeps the sequence numbers the caller will broadcast in order.
 const BATCH_ATTEMPTS: u32 = 3;
+
+/// How long a chunk left without references must survive before a periodic
+/// collection may delete it. Compaction-triggered collection uses no delay:
+/// the compacted transaction has already dropped every event that could name
+/// an orphan.
+const GC_RETENTION_SECS: i64 = 3_600;
+
+/// Minimum time between periodic collections on the store thread.
+const GC_INTERVAL: Duration = Duration::from_secs(3_600);
 
 const _: () = assert!(state::CHUNK_BYTES == sqlite::CHUNK_BYTES as u64);
 
@@ -468,6 +477,8 @@ struct StoreThread {
     sidecar: Connection,
     state: State,
     meta: StoreMeta,
+    /// Last successful orphan-chunk scan, for the periodic trigger.
+    last_gc: Instant,
 }
 
 impl StoreThread {
@@ -495,15 +506,16 @@ impl StoreThread {
                 meta.replay_floor
             ));
         }
-        Ok((
-            Self {
-                db,
-                sidecar,
-                state,
-                meta,
-            },
+        let mut store = Self {
+            db,
+            sidecar,
+            state,
             meta,
-        ))
+            last_gc: Instant::now(),
+        };
+        // Reclaim chunks orphaned by an earlier compaction before serving.
+        store.gc_orphans(sqlite::now_secs() - GC_RETENTION_SECS, "startup");
+        Ok((store, meta))
     }
 
     /// Serve commands until shutdown or until the handle is dropped.
@@ -716,6 +728,9 @@ impl StoreThread {
                     }
                 }
             }
+        }
+        if self.last_gc.elapsed() >= GC_INTERVAL {
+            self.gc_orphans(sqlite::now_secs() - GC_RETENTION_SECS, "periodic");
         }
         finish_outcomes(outcomes)
     }
@@ -1124,7 +1139,45 @@ impl StoreThread {
             .map_err(|err| format!("clear replay_wire: {err}"))?;
         let report = self.db.compact().map_err(err_str)?;
         self.refresh_meta()?;
+        // Every event that could have named an orphan is gone, so the
+        // retention window is satisfied by the compaction itself.
+        self.gc_orphans(sqlite::now_secs(), "compaction");
         Ok(report)
+    }
+
+    /// Delete chunks that no object, event or replay frame can need.
+    ///
+    /// A maintenance step: a failure is logged and does not fail the caller.
+    fn gc_orphans(&mut self, older_than: i64, reason: &str) {
+        let tx = match self.db.write() {
+            Ok(tx) => tx,
+            Err(err) => {
+                tracing::warn!(event = "chunk_gc", reason, %err, "cannot begin chunk collection");
+                return;
+            }
+        };
+        let report = match tx.gc_orphan_chunks(older_than) {
+            Ok(report) => report,
+            Err(err) => {
+                tracing::warn!(event = "chunk_gc", reason, %err, "chunk collection failed");
+                return;
+            }
+        };
+        if let Err(err) = tx.commit() {
+            tracing::warn!(event = "chunk_gc", reason, %err, "cannot commit chunk collection");
+            return;
+        }
+        self.last_gc = Instant::now();
+        if report.orphans > 0 || report.deleted > 0 {
+            tracing::info!(
+                event = "chunk_gc",
+                reason,
+                orphans = report.orphans,
+                deleted = report.deleted,
+                freed_bytes = report.freed_bytes,
+                "orphan chunk collection finished; freed pages are reused by later writes"
+            );
+        }
     }
 
     /// Store the state digest on clean shutdown.
@@ -2100,6 +2153,71 @@ mod tests {
         assert_eq!(meta.compacted_from_seq, 2);
         assert_eq!(meta.compacted_epoch, 2);
         assert_eq!(meta.compacted_seq, report.compacted_seq);
+        store.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn compaction_collects_orphan_chunks_and_keeps_replayable_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, _, path) = start(&dir);
+
+        assert_eq!(
+            store.commit(request(create_file(1, "/keep"), None)).await,
+            applied(1)
+        );
+        let (op, content) = write_op(2, "/keep", b"keep");
+        assert_eq!(store.commit(request(op, content)).await, applied(2));
+        assert_eq!(
+            store.commit(request(create_file(3, "/drop"), None)).await,
+            applied(3)
+        );
+        let (op, content) = write_op(4, "/drop", b"drop");
+        assert_eq!(store.commit(request(op, content)).await, applied(4));
+        let mut unlink = base(OpClass::UNLINK, "/drop");
+        unlink.op_id = ino_id(5);
+        assert_eq!(store.commit(request(unlink, None)).await, applied(5));
+
+        let keep_hash = sqlite::chunk_hash(b"keep");
+        let drop_hash = sqlite::chunk_hash(b"drop");
+        {
+            let conn = Connection::open(&path).unwrap();
+            let count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM chunks WHERE hash = ?1",
+                    [drop_hash.as_slice()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 1, "the dropped file's chunk exists before compaction");
+        }
+
+        let report = store.compact().await.unwrap();
+        assert!(report.epoch >= 2);
+
+        {
+            let conn = Connection::open(&path).unwrap();
+            let count = |hash: [u8; 32]| -> i64 {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM chunks WHERE hash = ?1",
+                    [hash.as_slice()],
+                    |row| row.get(0),
+                )
+                .unwrap()
+            };
+            assert_eq!(count(keep_hash), 1, "a live object keeps its chunk");
+            assert_eq!(count(drop_hash), 0, "an unreferenced chunk is collected");
+        }
+
+        // The compacted log still describes the live file, and its bytes are
+        // available to a replaying client.
+        let rows = store.events(report.epoch, 0, 1_000).await.unwrap();
+        assert!(rows.iter().any(|row| {
+            row.kind == EventKind::Write && row.path.as_deref() == Some("/keep")
+        }));
+        assert_eq!(
+            store.chunk_data(keep_hash).await.unwrap(),
+            Some(b"keep".to_vec())
+        );
         store.shutdown().await.unwrap();
     }
 

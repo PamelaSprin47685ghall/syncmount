@@ -52,7 +52,7 @@ use syncmount::client::config::mount_id_for;
 use syncmount::client::ops::AttrChange;
 use syncmount::store::Errno;
 use syncmount::store::sqlite::{
-    EventKind, EventPayload, ObjectKind, ROOT_INO, chunk_hash, file_root,
+    EventKind, EventPayload, ObjectKind, PAYLOAD_VERSION, ROOT_INO, chunk_hash, file_root,
 };
 
 /// The master password every fixture writes to its 0600 key file.
@@ -679,6 +679,113 @@ fn db_value_i64(path: &Path, sql: &str) -> Option<i64> {
     conn.query_row(sql, [], |row| row.get(0)).ok()
 }
 
+/// `(mtime_ns, mode, uid, gid)` of one visible path in a SQLite tree.
+fn db_attrs(path: &Path, name: &str) -> Option<(i64, u32, u32, u32)> {
+    let conn = open_ro(path)?;
+    let read = |row: &rusqlite::Row<'_>| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, i64>(1)?,
+            row.get::<_, i64>(2)?,
+            row.get::<_, i64>(3)?,
+        ))
+    };
+    let raw: Option<(i64, i64, i64, i64)> = if name == "/" {
+        conn.query_row(
+            "SELECT mtime_ns, mode, uid, gid FROM objects
+              WHERE ino = ?1 AND deleted = 0",
+            [ROOT_INO.as_slice()],
+            read,
+        )
+        .ok()
+    } else {
+        conn.query_row(
+            "SELECT o.mtime_ns, o.mode, o.uid, o.gid
+               FROM names n JOIN objects o ON o.ino = n.ino
+              WHERE n.path = ?1 AND o.deleted = 0",
+            [name],
+            read,
+        )
+        .ok()
+    };
+    let (mtime_ns, mode, uid, gid) = raw?;
+    Some((
+        mtime_ns,
+        u32::try_from(mode).ok()?,
+        u32::try_from(uid).ok()?,
+        u32::try_from(gid).ok()?,
+    ))
+}
+
+/// Assert that every named directory matches the server's attributes.
+fn assert_attrs_match(server_db: &Path, client_db: &Path, paths: &[&str]) {
+    for path in paths {
+        let server = db_attrs(server_db, path)
+            .unwrap_or_else(|| panic!("server has no live {path}"));
+        let client = db_attrs(client_db, path)
+            .unwrap_or_else(|| panic!("client has no live {path}"));
+        assert_eq!(client, server, "{path} attributes differ");
+    }
+}
+
+/// Assert the object/name invariants the server also maintains.
+fn assert_replica_rows_consistent(db: &Path) {
+    let checks = [
+        (
+            "live object without a name",
+            "SELECT COUNT(*) FROM objects o
+              WHERE o.deleted = 0
+                AND o.ino <> x'00000000000000000000000000000000'
+                AND NOT EXISTS (SELECT 1 FROM names n WHERE n.ino = o.ino)",
+        ),
+        (
+            "deleted object with links",
+            "SELECT COUNT(*) FROM objects WHERE deleted = 1 AND nlink <> 0",
+        ),
+        (
+            "deleted object with a name",
+            "SELECT COUNT(*) FROM objects o
+              WHERE o.deleted = 1
+                AND EXISTS (SELECT 1 FROM names n WHERE n.ino = o.ino)",
+        ),
+        (
+            "name to a missing or deleted object",
+            "SELECT COUNT(*) FROM names n
+               LEFT JOIN objects o ON o.ino = n.ino
+              WHERE o.ino IS NULL OR o.deleted = 1",
+        ),
+        (
+            "name under a missing parent",
+            "SELECT COUNT(*) FROM names n
+               LEFT JOIN objects p ON p.ino = n.parent
+              WHERE p.ino IS NULL OR p.deleted = 1 OR p.kind <> 'dir'",
+        ),
+        (
+            "directory nlink mismatch",
+            "SELECT COUNT(*) FROM objects o
+              WHERE o.deleted = 0 AND o.kind = 'dir'
+                AND o.nlink <> 2 + (
+                    SELECT COUNT(*) FROM names n
+                      JOIN objects c ON c.ino = n.ino
+                     WHERE n.parent = o.ino AND c.deleted = 0 AND c.kind = 'dir')",
+        ),
+        (
+            "non-directory nlink mismatch",
+            "SELECT COUNT(*) FROM objects o
+              WHERE o.deleted = 0 AND o.kind <> 'dir'
+                AND o.nlink <> (SELECT COUNT(*) FROM names n WHERE n.ino = o.ino)",
+        ),
+    ];
+    for (label, sql) in checks {
+        assert_eq!(
+            db_count(db, sql),
+            Some(0),
+            "{label} in {}",
+            db.display()
+        );
+    }
+}
+
 /// Linux process state from `/proc/<pid>/stat` (`R`, `S`, `T`, ...).
 fn process_state(pid: u32) -> Option<char> {
     let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
@@ -1017,6 +1124,7 @@ fn seed_upload_then_second_client_replays_from_zero() {
         db_i64(&server.db, "seq"),
         db_count(&server.db, "SELECT COUNT(*) FROM events")
     );
+    assert_attrs_match(&server.db, &db, &["/"]);
 
     // The second client starts at applied_seq 0 and must replay the log.
     let mut b = env.client("seed-b", "seed-b.db", &env.key, &server);
@@ -1027,6 +1135,7 @@ fn seed_upload_then_second_client_replays_from_zero() {
         db_i64(&b.db, "applied_seq"),
         db_i64(&server.db, "seq")
     );
+    assert_attrs_match(&server.db, &b.db, &["/"]);
     wait_file(&b.mountpoint, "seed.txt", &content);
     wait_file(&a2.mountpoint, "seed.txt", &content);
     assert_eq!(
@@ -1083,6 +1192,12 @@ fn two_clients_converge_on_write_rename_unlink() {
 
     wait_synced(&mut a, &server);
     wait_synced(&mut b, &server);
+    for db in [&a.db, &b.db, &server.db] {
+        assert_replica_rows_consistent(db);
+    }
+    for db in [&a.db, &b.db] {
+        assert_attrs_match(&server.db, db, &["/", "/dir"]);
+    }
     assert_eq!(
         sha_file(&a.mountpoint, "from-b.txt"),
         sha_file(&b.mountpoint, "from-b.txt")
@@ -1342,7 +1457,10 @@ fn server_restart_compacts_and_clients_fast_forward() {
         "/file.txt",
         Some("/hard.txt"),
         file_ino,
-        &EventPayload::Link { ino: file_ino }
+        &EventPayload::Link {
+            ino: file_ino,
+            mtime_ns: Some(1_700_000_000_000_000_000),
+        }
             .encode()
             .expect("link payload"),
     );
@@ -1351,6 +1469,12 @@ fn server_restart_compacts_and_clients_fast_forward() {
     wait_file(&b.mountpoint, "hard.txt", &big);
     wait_synced(&mut a2, &server);
     wait_synced(&mut b, &server);
+    for db in [&a2.db, &b.db, &server.db] {
+        assert_replica_rows_consistent(db);
+    }
+    for db in [&a2.db, &b.db] {
+        assert_attrs_match(&server.db, db, &["/", "/dir"]);
+    }
     assert_eq!(
         db_count(
             &server.db,
@@ -1460,6 +1584,12 @@ fn server_restart_compacts_and_clients_fast_forward() {
     wait_readlink(&b3.mountpoint, "sym", "file.txt");
     wait_file(&a3.mountpoint, "hard.txt", &big);
     wait_file(&b3.mountpoint, "hard.txt", &big);
+    for db in [&a3.db, &b3.db, &server2.db] {
+        assert_replica_rows_consistent(db);
+    }
+    for db in [&a3.db, &b3.db] {
+        assert_attrs_match(&server2.db, db, &["/", "/dir"]);
+    }
     assert_eq!(
         sha_file(&a3.mountpoint, "file.txt"),
         sha_file(&b3.mountpoint, "file.txt")
@@ -2047,7 +2177,10 @@ fn version_1_setattr_rows_replay_after_upgrade() {
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .expect("setattr event");
-        assert_eq!(payload[0], 2, "the row was written by the current codec");
+        assert_eq!(
+            payload[0], PAYLOAD_VERSION,
+            "the row was written by the current codec"
+        );
         let mut legacy = payload;
         assert_eq!(
             legacy.pop(),

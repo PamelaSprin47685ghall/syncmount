@@ -173,8 +173,8 @@ impl ReplayProgress {
 ///
 /// The test is deliberately local: the durable epoch and applied watermark,
 /// plus the tree having content when the compaction point is non-zero. It
-/// never compares state hashes, because inode ids and mtimes differ between
-/// replicas of the same tree.
+/// never compares state hashes, because inode ids differ between replicas of
+/// the same tree and an independent import may carry other timestamps.
 fn fast_forward_target(
     welcome: &Welcome,
     local_epoch: i64,
@@ -1302,12 +1302,14 @@ fn synthesize_payload(
         .lookup_by_path(path)
         .map_err(|_| DbError::Corrupt("ORDERED path is unknown"))?;
     let mode = fields.u32(fid::F_MODE).ok().flatten();
-    let mtime_ns = fields
-        .u64(fid::F_MTIME_NS)
-        .ok()
-        .flatten()
+    let raw_mtime = fields.u64(fid::F_MTIME_NS).ok().flatten();
+    let mtime_ns = raw_mtime
         .map(|value| value as i64)
         .unwrap_or_else(super::db::now_ns);
+    // A pre-version-3 server wrote zero for the timestamped classes. Zero is
+    // not a usable operation timestamp there, so treat it as absent instead
+    // of stamping the parents with the Unix epoch.
+    let timestamped_mtime = raw_mtime.filter(|value| *value != 0).map(|value| value as i64);
     let uid = fields.u32(fid::F_UID).ok().flatten().unwrap_or(0);
     let gid = fields.u32(fid::F_GID).ok().flatten().unwrap_or(0);
     Ok(match class {
@@ -1331,13 +1333,25 @@ fn synthesize_payload(
             mode,
             uid: fields.u32(fid::F_UID).ok().flatten(),
             gid: fields.u32(fid::F_GID).ok().flatten(),
-            mtime_ns: fields.u64(fid::F_MTIME_NS).ok().flatten().map(|v| v as i64),
+            mtime_ns: timestamped_mtime,
             size: fields.u64(fid::F_LENGTH).ok().flatten(),
         },
-        OpClass::RENAME => EventPayload::Rename { ino: object.ino },
-        OpClass::UNLINK => EventPayload::Unlink { ino: object.ino },
-        OpClass::RMDIR => EventPayload::Rmdir { ino: object.ino },
-        OpClass::LINK => EventPayload::Link { ino: object.ino },
+        OpClass::RENAME => EventPayload::Rename {
+            ino: object.ino,
+            mtime_ns: timestamped_mtime,
+        },
+        OpClass::UNLINK => EventPayload::Unlink {
+            ino: object.ino,
+            mtime_ns: timestamped_mtime,
+        },
+        OpClass::RMDIR => EventPayload::Rmdir {
+            ino: object.ino,
+            mtime_ns: timestamped_mtime,
+        },
+        OpClass::LINK => EventPayload::Link {
+            ino: object.ino,
+            mtime_ns: timestamped_mtime,
+        },
         OpClass::MKDIR => EventPayload::CreateDir {
             ino: object.ino,
             mode: mode.unwrap_or(0o755),
@@ -1388,6 +1402,29 @@ fn kind_for(class: OpClass) -> EventKind {
         OpClass::LEAVE => EventKind::Leave,
         OpClass::SYNC_CTRL => EventKind::SyncCtrl,
         _ => EventKind::SyncCtrl,
+    }
+}
+
+/// The timestamp an outbox payload records for its operation.
+///
+/// `None` means the payload predates version 3 or carries no timestamp of its
+/// own; the caller then falls back to the object's current value.
+fn outbox_mtime(payload: &EventPayload) -> Option<i64> {
+    match payload {
+        EventPayload::CreateFile { mtime_ns, .. }
+        | EventPayload::CreateDir { mtime_ns, .. }
+        | EventPayload::Symlink { mtime_ns, .. }
+        | EventPayload::Write { mtime_ns, .. }
+        | EventPayload::Truncate { mtime_ns, .. } => Some(*mtime_ns),
+        EventPayload::Setattr { mtime_ns, .. } => *mtime_ns,
+        EventPayload::Rename { mtime_ns, .. }
+        | EventPayload::Unlink { mtime_ns, .. }
+        | EventPayload::Rmdir { mtime_ns, .. }
+        | EventPayload::Link { mtime_ns, .. } => *mtime_ns,
+        EventPayload::Lock { .. }
+        | EventPayload::Unlock { .. }
+        | EventPayload::Leave
+        | EventPayload::SyncCtrl { .. } => None,
     }
 }
 
@@ -1867,9 +1904,19 @@ async fn send_meta(
         .or_else(|| op.ino.and_then(|ino| store.path_of(ino).ok()))
         .ok_or_else(|| SessionError::Fatal("outbox row has no path".to_owned()))?;
     let object = op.ino.and_then(|ino| store.getattr(ino).ok());
-    let (mtime_ns, uid, gid) = object.as_ref().map_or((super::db::now_ns(), 0, 0), |object| {
-        (object.mtime_ns, object.uid, object.gid)
-    });
+    let (fallback_mtime, uid, gid) =
+        object.as_ref().map_or((super::db::now_ns(), 0, 0), |object| {
+            (object.mtime_ns, object.uid, object.gid)
+        });
+    // The payload is the operation's authoritative timestamp. In particular
+    // an unlink or rmdir has already tombstoned its object locally, so
+    // `getattr` cannot supply the value the server must record on the parent.
+    // A `setattr` with no timestamp keeps the object's mtime; zero is the
+    // wire's "leave it alone" value for that class.
+    let mtime_ns = match &op.decoded {
+        EventPayload::Setattr { mtime_ns: None, .. } => 0,
+        other => outbox_mtime(other).unwrap_or(fallback_mtime),
+    };
     let class = match op.kind {
         EventKind::CreateFile => OpClass::CREATE_EXCL,
         EventKind::CreateDir => OpClass::MKDIR,

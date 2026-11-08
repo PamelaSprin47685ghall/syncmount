@@ -152,6 +152,10 @@ impl ClientDb {
             if kind.is_dir() {
                 bump_nlink(tx, parent, 1)?;
             }
+            // The server records the create's timestamp on the parent as
+            // well. Keep the optimistic local tree identical so an own echo
+            // can stay ack-only.
+            touch_object(tx, parent, mtime_ns, seq)?;
             Self::next_fuse_ino(tx, ino)?;
             let payload = match kind {
                 ObjectKind::File => EventPayload::CreateFile {
@@ -189,6 +193,7 @@ impl ClientDb {
     /// Add a hard link.
     pub fn link(&self, ino: Ino, newparent: Ino, newname: &OsStr) -> Result<Object, DbError> {
         let name_text = validate_name(newname)?;
+        let mtime_ns = now_ns();
         self.write(|tx| {
             let object = Self::object_in(tx, ino)?.ok_or(DbError::Errno(Errno::ENOENT))?;
             if object.deleted {
@@ -213,13 +218,17 @@ impl ClientDb {
             let op_id = alloc_op_id();
             tx.put_name(newparent, &name_text, ino, &path)?;
             bump_nlink(tx, ino, 1)?;
+            touch_object(tx, newparent, mtime_ns, seq)?;
             Self::next_fuse_ino(tx, ino)?;
             let mut linked = object;
             linked.nlink = linked.nlink.saturating_add(1);
             Self::enqueue(
                 tx,
                 op_id,
-                &EventPayload::Link { ino },
+                &EventPayload::Link {
+                    ino,
+                    mtime_ns: Some(mtime_ns),
+                },
                 Some(&target_path),
                 Some(&path),
                 &[],
@@ -232,6 +241,7 @@ impl ClientDb {
     /// Remove one non-directory entry.
     pub fn unlink(&self, parent: Ino, name: &OsStr) -> Result<(), DbError> {
         let name_text = validate_name(name)?;
+        let mtime_ns = now_ns();
         self.flush_entry(parent, name)?;
         self.write(|tx| {
             let object = Self::remove_name(tx, parent, &name_text)?;
@@ -241,10 +251,14 @@ impl ClientDb {
             let seq = Self::next_local_seq(tx)?;
             let op_id = alloc_op_id();
             let path = join_path(&Self::path_in(tx, parent)?, &name_text);
+            touch_object(tx, parent, mtime_ns, seq)?;
             Self::enqueue(
                 tx,
                 op_id,
-                &EventPayload::Unlink { ino: object.ino },
+                &EventPayload::Unlink {
+                    ino: object.ino,
+                    mtime_ns: Some(mtime_ns),
+                },
                 Some(&path),
                 None,
                 &[],
@@ -257,6 +271,7 @@ impl ClientDb {
     /// Remove one empty directory.
     pub fn rmdir(&self, parent: Ino, name: &OsStr) -> Result<(), DbError> {
         let name_text = validate_name(name)?;
+        let mtime_ns = now_ns();
         self.write(|tx| {
             let entry =
                 Self::name_in(tx, parent, &name_text)?.ok_or(DbError::Errno(Errno::ENOENT))?;
@@ -276,10 +291,14 @@ impl ClientDb {
             let seq = Self::next_local_seq(tx)?;
             let op_id = alloc_op_id();
             Self::remove_name(tx, parent, &name_text)?;
+            touch_object(tx, parent, mtime_ns, seq)?;
             Self::enqueue(
                 tx,
                 op_id,
-                &EventPayload::Rmdir { ino: object.ino },
+                &EventPayload::Rmdir {
+                    ino: object.ino,
+                    mtime_ns: Some(mtime_ns),
+                },
                 Some(&path),
                 None,
                 &[],
@@ -303,6 +322,7 @@ impl ClientDb {
         }
         let old_text = validate_name(old_name)?;
         let new_text = validate_name(new_name)?;
+        let mtime_ns = now_ns();
         self.flush_entry(old_parent, old_name)?;
         self.flush_entry(new_parent, new_name)?;
         self.write(|tx| {
@@ -372,11 +392,19 @@ impl ClientDb {
                 }
             }
             tx.put_name(new_parent, &new_text, object.ino, &new_path)?;
+            touch_object(tx, object.ino, mtime_ns, seq)?;
+            touch_object(tx, old_parent, mtime_ns, seq)?;
+            if old_parent != new_parent {
+                touch_object(tx, new_parent, mtime_ns, seq)?;
+            }
             Self::next_fuse_ino(tx, object.ino)?;
             Self::enqueue(
                 tx,
                 op_id,
-                &EventPayload::Rename { ino: object.ino },
+                &EventPayload::Rename {
+                    ino: object.ino,
+                    mtime_ns: Some(mtime_ns),
+                },
                 Some(&old_path),
                 Some(&new_path),
                 &[],
@@ -899,11 +927,20 @@ impl ClientDb {
             bump_nlink(tx, parent, -1)?;
         }
         let mut updated = object.clone();
-        updated.nlink = updated.nlink.saturating_sub(1);
-        if updated.nlink == 0 {
+        if updated.kind.is_dir() {
+            // A directory has one name and `nlink` counts its own `.` link.
+            // Removing that name removes the directory itself; decrementing
+            // `nlink` would leave a live, nameless directory behind.
             tx.set_object_chunks(ino, &[])?;
             updated.deleted = true;
             updated.nlink = 0;
+        } else {
+            updated.nlink = updated.nlink.saturating_sub(1);
+            if updated.nlink == 0 {
+                tx.set_object_chunks(ino, &[])?;
+                updated.deleted = true;
+                updated.nlink = 0;
+            }
         }
         updated.updated_seq = Self::current_local_seq(tx)?;
         tx.put_object(&updated)?;
@@ -934,6 +971,20 @@ pub(crate) fn bump_nlink(tx: &WriteTx<'_>, ino: Ino, delta: i32) -> Result<(), D
     let next = (current + i64::from(delta)).max(0);
     object.nlink = u32::try_from(next).map_err(|_| DbError::Corrupt("nlink out of range"))?;
     object.updated_seq = ClientDb::current_local_seq(tx)?;
+    tx.put_object(&object)?;
+    Ok(())
+}
+
+/// Set one object's modification time and replay watermark.
+pub(crate) fn touch_object(
+    tx: &WriteTx<'_>,
+    ino: Ino,
+    mtime_ns: i64,
+    seq: i64,
+) -> Result<(), DbError> {
+    let mut object = ClientDb::object_in(tx, ino)?.ok_or(DbError::Errno(Errno::ENOENT))?;
+    object.mtime_ns = mtime_ns;
+    object.updated_seq = seq;
     tx.put_object(&object)?;
     Ok(())
 }

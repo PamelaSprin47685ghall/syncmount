@@ -27,7 +27,7 @@ use std::collections::BTreeMap;
 use rusqlite::{OptionalExtension, params};
 
 use super::db::{ApplyOutcome, ClientDb, DbError, Ino, OutboxState, now_ns, split_path};
-use super::ops::{bump_nlink, validate_name};
+use super::ops::{bump_nlink, touch_object, validate_name};
 use crate::store::Errno;
 use crate::store::sqlite::{
     self, ChunkRef, EventKind, EventPayload, Object, ObjectKind, ROOT_INO, ReadTx, RejectState,
@@ -40,6 +40,89 @@ pub struct SeedReport {
     pub objects: u64,
     pub events: u64,
     pub chunks: u64,
+}
+
+/// One broken invariant in the replicated tree.
+///
+/// These are the checks that decide whether the local object/name tables can
+/// describe a tree at all. They do not compare attributes with the server;
+/// that is what a full replay is for.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReplicaIssue {
+    /// The root row is missing, deleted, or not a directory.
+    RootMissing,
+    /// A live non-root object has no name. The server cannot address it.
+    LiveObjectWithoutName { ino: Ino },
+    /// A tombstone still has a name.
+    DeletedObjectWithName { ino: Ino, path: String },
+    /// A name's parent is missing, deleted, or not a directory.
+    NameUnderMissingParent { path: String },
+    /// A name points at an object row that does not exist.
+    NameToMissingObject { path: String },
+    /// A name points at a tombstone.
+    NameToDeletedObject { path: String },
+    /// A name points at the root, which has no directory entry.
+    RootHasName { path: String },
+    /// A live object's `nlink` does not match its names and children.
+    NlinkMismatch { ino: Ino, found: u32, expected: u32 },
+    /// A tombstone still carries links.
+    DeletedObjectWithLinks { ino: Ino, nlink: u32 },
+    /// The denormalized `names.path` does not match the parent chain.
+    PathMismatch { stored: String, expected: String },
+}
+
+impl ReplicaIssue {
+    /// Stable label for logs and tests.
+    pub const fn label(&self) -> &'static str {
+        match self {
+            Self::RootMissing => "root_missing",
+            Self::LiveObjectWithoutName { .. } => "live_object_without_name",
+            Self::DeletedObjectWithName { .. } => "deleted_object_with_name",
+            Self::NameUnderMissingParent { .. } => "name_under_missing_parent",
+            Self::NameToMissingObject { .. } => "name_to_missing_object",
+            Self::NameToDeletedObject { .. } => "name_to_deleted_object",
+            Self::RootHasName { .. } => "root_has_name",
+            Self::NlinkMismatch { .. } => "nlink_mismatch",
+            Self::DeletedObjectWithLinks { .. } => "deleted_object_with_links",
+            Self::PathMismatch { .. } => "path_mismatch",
+        }
+    }
+}
+
+/// What one metadata repair changed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ReplicaRepair {
+    /// Invariants the check found before repairing.
+    pub issues: u64,
+    /// Root rows recreated because they were missing or not a live directory.
+    pub roots: u64,
+    /// Live nameless objects turned into tombstones.
+    pub tombstones: u64,
+    /// Link counts rewritten.
+    pub nlinks: u64,
+    /// Names removed because their parent or object was gone.
+    pub names_removed: u64,
+    /// Denormalized paths rewritten.
+    pub paths: u64,
+}
+
+impl ReplicaRepair {
+    /// True when the repair changed something.
+    pub const fn changed(&self) -> bool {
+        self.roots != 0
+            || self.tombstones != 0
+            || self.nlinks != 0
+            || self.names_removed != 0
+            || self.paths != 0
+    }
+}
+
+/// One `names` row loaded for a consistency pass.
+struct ReplicaName {
+    parent: Ino,
+    name: String,
+    ino: Ino,
+    path: String,
 }
 
 /// `meta` key: server events skipped because the local tree had already
@@ -215,7 +298,7 @@ impl ClientDb {
             // server's effect to the local tree.
             if acknowledged_op.is_some() && !replaying_local {
                 match &event.payload {
-                    EventPayload::Rename { ino } => {
+                    EventPayload::Rename { ino, mtime_ns } => {
                         let old_path = event
                             .path
                             .as_deref()
@@ -224,15 +307,22 @@ impl ClientDb {
                             .path2
                             .as_deref()
                             .ok_or(DbError::Corrupt("rename event without a destination"))?;
-                        Self::apply_own_rename(&tx, event.seq, *ino, old_path, new_path)?;
+                        Self::apply_own_rename(
+                            &tx,
+                            event.seq,
+                            *ino,
+                            old_path,
+                            new_path,
+                            *mtime_ns,
+                        )?;
                     }
-                    EventPayload::Link { ino } => {
+                    EventPayload::Link { ino, mtime_ns } => {
                         let path = event
                             .path2
                             .as_deref()
                             .or(event.path.as_deref())
                             .ok_or(DbError::Corrupt("link event without a path"))?;
-                        Self::apply_own_link(&tx, event.seq, *ino, path)?;
+                        Self::apply_own_link(&tx, event.seq, *ino, path, *mtime_ns)?;
                     }
                     _ => {}
                 }
@@ -321,21 +411,25 @@ impl ClientDb {
                     Self::note_skip(tx, seq, "setattr", *ino, path, "object is gone")?;
                 }
             }
-            EventPayload::Rename { ino } => {
+            EventPayload::Rename { ino, mtime_ns } => {
                 let old_path = path.ok_or(DbError::Corrupt("rename event without a path"))?;
                 let new_path =
                     path2.ok_or(DbError::Corrupt("rename event without a destination"))?;
-                Self::apply_rename(tx, seq, *ino, old_path, new_path)?;
+                Self::apply_rename(tx, seq, *ino, old_path, new_path, *mtime_ns)?;
             }
-            EventPayload::Unlink { ino } | EventPayload::Rmdir { ino } => {
+            EventPayload::Unlink { ino, mtime_ns } => {
                 let path = path.ok_or(DbError::Corrupt("unlink event without a path"))?;
-                Self::apply_remove(tx, seq, *ino, path)?;
+                Self::apply_remove(tx, seq, *ino, path, false, *mtime_ns)?;
             }
-            EventPayload::Link { ino } => {
+            EventPayload::Rmdir { ino, mtime_ns } => {
+                let path = path.ok_or(DbError::Corrupt("rmdir event without a path"))?;
+                Self::apply_remove(tx, seq, *ino, path, true, *mtime_ns)?;
+            }
+            EventPayload::Link { ino, mtime_ns } => {
                 let path = path2
                     .or(path)
                     .ok_or(DbError::Corrupt("link event without a path"))?;
-                Self::apply_link(tx, seq, *ino, path)?;
+                Self::apply_link(tx, seq, *ino, path, *mtime_ns)?;
             }
             EventPayload::Lock { .. }
             | EventPayload::Unlock { .. }
@@ -542,6 +636,10 @@ impl ClientDb {
                 bump_nlink(tx, parent, 1)?;
             }
         }
+        // The server stamps the parent with the create's timestamp. A
+        // fast-forwarding replica never sees a synthetic `setattr`, so the
+        // live create event must carry this change itself.
+        touch_object(tx, parent, mtime_ns, seq)?;
         Self::next_fuse_ino(tx, ino)?;
         Ok(())
     }
@@ -754,6 +852,7 @@ impl ClientDb {
         ino: Ino,
         old_path: &str,
         new_path: &str,
+        mtime_ns: Option<i64>,
     ) -> Result<(), DbError> {
         let (old_parent_path, old_name) =
             split_path(old_path).ok_or(DbError::Corrupt("rename of the root"))?;
@@ -773,6 +872,15 @@ impl ClientDb {
             Self::note_skip(tx, seq, "rename", ino, Some(old_path), "destination parent is gone")?;
             return Ok(());
         };
+        // The server stamps the moved object and both parents, whether or not
+        // the names still match the local tree. Apply that metadata first.
+        if let Some(mtime_ns) = mtime_ns {
+            touch_object(tx, ino, mtime_ns, seq)?;
+            touch_object(tx, old_parent, mtime_ns, seq)?;
+            if old_parent != new_parent {
+                touch_object(tx, new_parent, mtime_ns, seq)?;
+            }
+        }
         let old_entry = Self::name_in_tx(tx, old_parent, old_name)?;
         let new_entry = Self::name_in_tx(tx, new_parent, new_name)?;
         let Some(source) = old_entry else {
@@ -825,6 +933,7 @@ impl ClientDb {
         ino: Ino,
         old_path: &str,
         new_path: &str,
+        mtime_ns: Option<i64>,
     ) -> Result<(), DbError> {
         if old_path == new_path {
             return Ok(());
@@ -848,10 +957,19 @@ impl ClientDb {
             )?;
             return Ok(());
         };
+        let old_parent = Self::live_dir_in(tx, old_parent_path)?;
+        if let Some(mtime_ns) = mtime_ns {
+            touch_object(tx, ino, mtime_ns, seq)?;
+            if let Some(parent) = old_parent {
+                touch_object(tx, parent, mtime_ns, seq)?;
+            }
+            if old_parent != Some(new_parent) {
+                touch_object(tx, new_parent, mtime_ns, seq)?;
+            }
+        }
 
         // Drop the source name when it still names the event inode. The
         // optimistic local rename usually removed it already.
-        let old_parent = Self::live_dir_in(tx, old_parent_path)?;
         let source_present = match old_parent {
             Some(parent) => Self::name_in_tx(tx, parent, old_name)? == Some(ino),
             None => false,
@@ -905,6 +1023,7 @@ impl ClientDb {
         seq: i64,
         ino: Ino,
         path: &str,
+        mtime_ns: Option<i64>,
     ) -> Result<(), DbError> {
         let (parent_path, name) =
             split_path(path).ok_or(DbError::Corrupt("link at the root"))?;
@@ -916,6 +1035,9 @@ impl ClientDb {
             Self::note_skip(tx, seq, "link", ino, Some(path), "object is gone")?;
             return Ok(());
         };
+        if let Some(mtime_ns) = mtime_ns {
+            touch_object(tx, parent, mtime_ns, seq)?;
+        }
         match Self::name_in_tx(tx, parent, name)? {
             Some(existing) if existing == ino => {
                 Self::note_echo(seq, "link", ino, Some(path), "name already exists");
@@ -944,6 +1066,8 @@ impl ClientDb {
         seq: i64,
         ino: Ino,
         path: &str,
+        is_dir: bool,
+        mtime_ns: Option<i64>,
     ) -> Result<(), DbError> {
         let (parent_path, name) =
             split_path(path).ok_or(DbError::Corrupt("unlink of the root"))?;
@@ -952,12 +1076,17 @@ impl ClientDb {
             // name row left behind by an earlier directory conflict so the
             // path cannot resurrect, then skip.
             Self::drop_unreachable_name(tx, seq, path)?;
+            Self::settle_removed(tx, seq, ino, is_dir, mtime_ns)?;
             Self::note_skip(tx, seq, "remove", ino, Some(path), "parent directory is gone")?;
             return Ok(());
         };
+        if let Some(mtime_ns) = mtime_ns {
+            touch_object(tx, parent, mtime_ns, seq)?;
+        }
         match Self::name_in_tx(tx, parent, name)? {
             None => {
                 // The local removal (or its echo) already deleted the name.
+                Self::settle_removed(tx, seq, ino, is_dir, mtime_ns)?;
                 Self::note_echo(seq, "remove", ino, Some(path), "name is gone");
                 return Ok(());
             }
@@ -966,6 +1095,7 @@ impl ClientDb {
                 // order wins: the local winner loses the name and its pending
                 // outbox rows recreate it afterwards.
                 Self::detach_name(tx, parent, name, existing, seq)?;
+                Self::settle_removed(tx, seq, ino, is_dir, mtime_ns)?;
                 Self::note_skip(
                     tx,
                     seq,
@@ -978,24 +1108,20 @@ impl ClientDb {
             }
             Some(_) => {}
         }
-        // The name row references this inode, so a missing object row is real
-        // corruption, not an overtaken deletion.
-        let object = Self::object_in(tx, ino)?
-            .ok_or(DbError::Corrupt("unlink names an object the tree does not hold"))?;
         tx.delete_name(parent, name)?;
+        let Some(object) = Self::object_in(tx, ino)? else {
+            // The client never held this object (an earlier create was
+            // overtaken by a later deletion). Keep the server's tombstone so
+            // the object tables stay aligned.
+            if is_dir {
+                bump_nlink(tx, parent, -1)?;
+            }
+            return Self::put_tombstone(tx, seq, ino, is_dir, mtime_ns);
+        };
         if object.kind.is_dir() {
             bump_nlink(tx, parent, -1)?;
         }
-        let mut updated = object;
-        updated.nlink = updated.nlink.saturating_sub(1);
-        if updated.nlink == 0 {
-            tx.set_object_chunks(ino, &[])?;
-            updated.deleted = true;
-            updated.nlink = 0;
-        }
-        updated.updated_seq = seq;
-        tx.put_object(&updated)?;
-        Ok(())
+        Self::tombstone_removed(tx, seq, object)
     }
 
     fn apply_link(
@@ -1003,6 +1129,7 @@ impl ClientDb {
         seq: i64,
         ino: Ino,
         path: &str,
+        mtime_ns: Option<i64>,
     ) -> Result<(), DbError> {
         let (parent_path, name) =
             split_path(path).ok_or(DbError::Corrupt("link at the root"))?;
@@ -1010,6 +1137,9 @@ impl ClientDb {
             Self::note_skip(tx, seq, "link", ino, Some(path), "parent directory is gone")?;
             return Ok(());
         };
+        if let Some(mtime_ns) = mtime_ns {
+            touch_object(tx, parent, mtime_ns, seq)?;
+        }
         if Self::name_in_tx(tx, parent, name)?.is_some() {
             // The local link (or its echo) already created the name.
             Self::note_echo(seq, "link", ino, Some(path), "name already exists");
@@ -1037,10 +1167,13 @@ impl ClientDb {
     ) -> Result<(), DbError> {
         tx.delete_name(parent, name)?;
         let Some(mut object) = Self::object_in(tx, ino)? else {
-            return Ok(());
+            // The name referenced an inode this replica never held. Leave the
+            // server's tombstone behind so the object table stays aligned.
+            return Self::put_tombstone(tx, seq, ino, false, None);
         };
         if object.kind.is_dir() {
             bump_nlink(tx, parent, -1)?;
+            return Self::tombstone_subtree(tx, seq, ino);
         }
         object.nlink = object.nlink.saturating_sub(1);
         if object.nlink == 0 {
@@ -1049,6 +1182,145 @@ impl ClientDb {
             object.nlink = 0;
         }
         object.updated_seq = seq;
+        tx.put_object(&object)?;
+        Ok(())
+    }
+
+    /// Remove an object whose name is already gone.
+    ///
+    /// A live row with no name is the signature of a directory removal that
+    /// decremented `nlink` instead of dropping the directory. The server keeps
+    /// a tombstone, so the replica does too.
+    fn settle_removed(
+        tx: &WriteTx<'_>,
+        seq: i64,
+        ino: Ino,
+        is_dir: bool,
+        mtime_ns: Option<i64>,
+    ) -> Result<(), DbError> {
+        let Some(object) = Self::object_in(tx, ino)? else {
+            return Self::put_tombstone(tx, seq, ino, is_dir, mtime_ns);
+        };
+        if object.deleted {
+            return Ok(());
+        }
+        let names: i64 = tx.conn().query_row(
+            "SELECT COUNT(*) FROM names WHERE ino = ?1",
+            [ino.as_slice()],
+            |row| row.get(0),
+        )?;
+        if names == 0 {
+            if object.kind.is_dir() {
+                return Self::tombstone_subtree(tx, seq, object.ino);
+            }
+            return Self::tombstone_now(tx, seq, object);
+        }
+        Ok(())
+    }
+
+    /// Drop one object outright, regardless of its recorded link count.
+    fn tombstone_now(tx: &WriteTx<'_>, seq: i64, object: Object) -> Result<(), DbError> {
+        tx.set_object_chunks(object.ino, &[])?;
+        let mut updated = object;
+        updated.deleted = true;
+        updated.nlink = 0;
+        updated.updated_seq = seq;
+        tx.put_object(&updated)?;
+        Ok(())
+    }
+
+    /// Tombstone one object and, for a directory, its remaining subtree.
+    fn tombstone_removed(tx: &WriteTx<'_>, seq: i64, object: Object) -> Result<(), DbError> {
+        if object.kind.is_dir() {
+            return Self::tombstone_subtree(tx, seq, object.ino);
+        }
+        let mut updated = object;
+        updated.nlink = updated.nlink.saturating_sub(1);
+        if updated.nlink == 0 {
+            tx.set_object_chunks(updated.ino, &[])?;
+            updated.deleted = true;
+            updated.nlink = 0;
+        }
+        updated.updated_seq = seq;
+        tx.put_object(&updated)?;
+        Ok(())
+    }
+
+    /// Tombstone a directory and every child name it still holds.
+    ///
+    /// Server order removes a directory's children before the directory. A
+    /// child that remains here is local intent the server never accepted; the
+    /// outbox recreates it after the replay, so dropping the speculative rows
+    /// keeps the replicated tree equal to the server's.
+    fn tombstone_subtree(tx: &WriteTx<'_>, seq: i64, ino: Ino) -> Result<(), DbError> {
+        let mut children = Vec::new();
+        {
+            let mut stmt = tx
+                .conn()
+                .prepare("SELECT name, ino FROM names WHERE parent = ?1 ORDER BY name")?;
+            let mut rows = stmt.query([ino.as_slice()])?;
+            while let Some(row) = rows.next()? {
+                let name: String = row.get(0)?;
+                let child: Vec<u8> = row.get(1)?;
+                let child: Ino = child
+                    .try_into()
+                    .map_err(|_| DbError::Corrupt("names.ino is not 16 bytes"))?;
+                children.push((name, child));
+            }
+        }
+        for (name, child) in children {
+            tx.delete_name(ino, &name)?;
+            if let Some(object) = Self::object_in(tx, child)? {
+                Self::tombstone_removed(tx, seq, object)?;
+            }
+        }
+        let Some(mut object) = Self::object_in(tx, ino)? else {
+            return Ok(());
+        };
+        tx.set_object_chunks(ino, &[])?;
+        object.deleted = true;
+        object.nlink = 0;
+        object.updated_seq = seq;
+        tx.put_object(&object)?;
+        Ok(())
+    }
+
+    /// Leave a tombstone for an inode this replica never held.
+    ///
+    /// The attributes are unknown; a tombstone is never visible through the
+    /// mount, and its only job is to keep the object table aligned with the
+    /// server's deleted row.
+    fn put_tombstone(
+        tx: &WriteTx<'_>,
+        seq: i64,
+        ino: Ino,
+        is_dir: bool,
+        mtime_ns: Option<i64>,
+    ) -> Result<(), DbError> {
+        if Self::object_in(tx, ino)?.is_some() {
+            return Ok(());
+        }
+        let kind = if is_dir {
+            ObjectKind::Dir
+        } else {
+            ObjectKind::File
+        };
+        let object = Object {
+            ino,
+            kind,
+            mode: if is_dir { 0o755 } else { 0o644 },
+            uid: 0,
+            gid: 0,
+            mtime_ns: mtime_ns.unwrap_or(0),
+            size: 0,
+            file_root: crate::store::sqlite::file_root(kind, None, &[]),
+            block_count: 0,
+            target: None,
+            nlink: 0,
+            deleted: true,
+            created_seq: seq,
+            updated_seq: seq,
+        };
         tx.put_object(&object)?;
         Ok(())
     }
@@ -1226,6 +1498,353 @@ impl ClientDb {
         })
     }
 
+    /// Report every broken object/name invariant in the replicated tree.
+    ///
+    /// The check reads only local rows. A clean report means the tree is
+    /// addressable and its link counts agree with its names; it does not
+    /// compare attributes with the server, which only a replay can settle.
+    pub fn check_replica(&self) -> Result<Vec<ReplicaIssue>, DbError> {
+        let tx = self.read()?;
+        Self::check_replica_rows(tx.conn())
+    }
+
+    fn check_replica_rows(
+        conn: &rusqlite::Connection,
+    ) -> Result<Vec<ReplicaIssue>, DbError> {
+        let (objects, names) = Self::replica_rows(conn)?;
+        let mut issues = Vec::new();
+        if !objects
+            .get(&ROOT_INO)
+            .is_some_and(|root| !root.deleted && root.kind.is_dir())
+        {
+            issues.push(ReplicaIssue::RootMissing);
+        }
+
+        let mut name_count: BTreeMap<Ino, u32> = BTreeMap::new();
+        let mut child_dirs: BTreeMap<Ino, u32> = BTreeMap::new();
+        for name in &names {
+            *name_count.entry(name.ino).or_default() += 1;
+            if objects
+                .get(&name.ino)
+                .is_some_and(|object| !object.deleted && object.kind.is_dir())
+            {
+                *child_dirs.entry(name.parent).or_default() += 1;
+            }
+        }
+
+        for (ino, object) in &objects {
+            if object.deleted {
+                if object.nlink != 0 {
+                    issues.push(ReplicaIssue::DeletedObjectWithLinks {
+                        ino: *ino,
+                        nlink: object.nlink,
+                    });
+                }
+                continue;
+            }
+            if *ino != ROOT_INO && name_count.get(ino).copied().unwrap_or(0) == 0 {
+                issues.push(ReplicaIssue::LiveObjectWithoutName { ino: *ino });
+            }
+            let expected = if object.kind.is_dir() {
+                2 + child_dirs.get(ino).copied().unwrap_or(0)
+            } else {
+                name_count.get(ino).copied().unwrap_or(0)
+            };
+            if object.nlink != expected {
+                issues.push(ReplicaIssue::NlinkMismatch {
+                    ino: *ino,
+                    found: object.nlink,
+                    expected,
+                });
+            }
+        }
+
+        for name in &names {
+            let parent_ok = objects
+                .get(&name.parent)
+                .is_some_and(|parent| !parent.deleted && parent.kind.is_dir());
+            if !parent_ok {
+                issues.push(ReplicaIssue::NameUnderMissingParent {
+                    path: name.path.clone(),
+                });
+            }
+            match objects.get(&name.ino) {
+                None => issues.push(ReplicaIssue::NameToMissingObject {
+                    path: name.path.clone(),
+                }),
+                Some(_) if name.ino == ROOT_INO => {
+                    issues.push(ReplicaIssue::RootHasName {
+                        path: name.path.clone(),
+                    });
+                }
+                Some(object) if object.deleted => {
+                    issues.push(ReplicaIssue::NameToDeletedObject {
+                        path: name.path.clone(),
+                    });
+                    issues.push(ReplicaIssue::DeletedObjectWithName {
+                        ino: name.ino,
+                        path: name.path.clone(),
+                    });
+                }
+                Some(_) => {}
+            }
+        }
+
+        Self::check_replica_paths(&objects, &names, &mut issues);
+        Ok(issues)
+    }
+
+    fn check_replica_paths(
+        objects: &BTreeMap<Ino, Object>,
+        names: &[ReplicaName],
+        issues: &mut Vec<ReplicaIssue>,
+    ) {
+        let mut by_parent: BTreeMap<Ino, Vec<&ReplicaName>> = BTreeMap::new();
+        for name in names {
+            by_parent.entry(name.parent).or_default().push(name);
+        }
+        let mut stack = vec![(ROOT_INO, "/".to_owned())];
+        let mut visited = BTreeMap::new();
+        visited.insert(ROOT_INO, ());
+        while let Some((parent, parent_path)) = stack.pop() {
+            let Some(children) = by_parent.get(&parent) else {
+                continue;
+            };
+            for name in children {
+                let expected = if parent_path == "/" {
+                    format!("/{}", name.name)
+                } else {
+                    format!("{parent_path}/{}", name.name)
+                };
+                if name.path != expected {
+                    issues.push(ReplicaIssue::PathMismatch {
+                        stored: name.path.clone(),
+                        expected: expected.clone(),
+                    });
+                }
+                if objects
+                    .get(&name.ino)
+                    .is_some_and(|object| !object.deleted && object.kind.is_dir())
+                    && visited.insert(name.ino, ()).is_none()
+                {
+                    stack.push((name.ino, expected));
+                }
+            }
+        }
+    }
+
+    /// Repair the object/name invariants without changing the visible tree.
+    ///
+    /// The repair only touches rows that are already invisible: nameless live
+    /// objects become tombstones, tombstones lose their stale links and names,
+    /// dangling names disappear, and the denormalized `names.path` is rebuilt
+    /// from the parent chain. It never adds or renames a visible entry.
+    pub fn repair_replica_metadata(&self) -> Result<ReplicaRepair, DbError> {
+        // A clean replica needs no write transaction at all. The check and
+        // the repair both run before the write gate and the write-back
+        // thread, so no local writer can slip between them.
+        let issues = self.check_replica()?;
+        if issues.is_empty() {
+            return Ok(ReplicaRepair::default());
+        }
+        self.write(|tx| {
+            let mut report = ReplicaRepair {
+                issues: issues.len() as u64,
+                ..ReplicaRepair::default()
+            };
+            let (mut objects, mut names) = Self::replica_rows(tx.conn())?;
+
+            if !objects
+                .get(&ROOT_INO)
+                .is_some_and(|root| !root.deleted && root.kind.is_dir())
+            {
+                let root = Object {
+                    ino: ROOT_INO,
+                    kind: ObjectKind::Dir,
+                    mode: 0o755,
+                    uid: 0,
+                    gid: 0,
+                    mtime_ns: 0,
+                    size: 0,
+                    file_root: crate::store::sqlite::file_root(ObjectKind::Dir, None, &[]),
+                    block_count: 0,
+                    target: None,
+                    nlink: 2,
+                    deleted: false,
+                    created_seq: 0,
+                    updated_seq: 0,
+                };
+                tx.put_object(&root)?;
+                objects.insert(ROOT_INO, root);
+                report.roots += 1;
+            }
+
+            // Tombstoning a nameless directory orphans its children, and
+            // tombstoning those can orphan theirs. Repeat until the tree
+            // stops changing; every round removes at least one row.
+            loop {
+                let mut kept = Vec::with_capacity(names.len());
+                for name in names.drain(..) {
+                    let parent_ok = objects
+                        .get(&name.parent)
+                        .is_some_and(|parent| !parent.deleted && parent.kind.is_dir());
+                    let ino_ok = name.ino != ROOT_INO
+                        && objects
+                            .get(&name.ino)
+                            .is_some_and(|object| !object.deleted);
+                    if parent_ok && ino_ok {
+                        kept.push(name);
+                    } else {
+                        tx.delete_name(name.parent, &name.name)?;
+                        report.names_removed += 1;
+                    }
+                }
+                names = kept;
+
+                let mut name_count: BTreeMap<Ino, u32> = BTreeMap::new();
+                for name in &names {
+                    *name_count.entry(name.ino).or_default() += 1;
+                }
+                let nameless: Vec<Ino> = objects
+                    .iter()
+                    .filter(|(ino, object)| {
+                        **ino != ROOT_INO
+                            && !object.deleted
+                            && name_count.get(*ino).copied().unwrap_or(0) == 0
+                    })
+                    .map(|(ino, _)| *ino)
+                    .collect();
+                if nameless.is_empty() {
+                    break;
+                }
+                for ino in nameless {
+                    if let Some(mut object) = objects.remove(&ino) {
+                        tx.set_object_chunks(ino, &[])?;
+                        object.deleted = true;
+                        object.nlink = 0;
+                        tx.put_object(&object)?;
+                        report.tombstones += 1;
+                    }
+                }
+            }
+
+            let mut name_count: BTreeMap<Ino, u32> = BTreeMap::new();
+            let mut child_dirs: BTreeMap<Ino, u32> = BTreeMap::new();
+            for name in &names {
+                *name_count.entry(name.ino).or_default() += 1;
+                if objects
+                    .get(&name.ino)
+                    .is_some_and(|object| !object.deleted && object.kind.is_dir())
+                {
+                    *child_dirs.entry(name.parent).or_default() += 1;
+                }
+            }
+
+            for (ino, object) in &mut objects {
+                let expected = if object.deleted {
+                    0
+                } else if object.kind.is_dir() {
+                    2 + child_dirs.get(ino).copied().unwrap_or(0)
+                } else {
+                    name_count.get(ino).copied().unwrap_or(0)
+                };
+                if object.nlink != expected {
+                    object.nlink = expected;
+                    tx.put_object(object)?;
+                    report.nlinks += 1;
+                }
+            }
+
+            for (parent, name, path) in Self::replica_path_updates(&objects, &names) {
+                tx.conn().execute(
+                    "UPDATE names SET path = ?1 WHERE parent = ?2 AND name = ?3",
+                    params![path, parent.as_slice(), name],
+                )?;
+                report.paths += 1;
+            }
+            Ok(report)
+        })
+    }
+
+    fn replica_path_updates(
+        objects: &BTreeMap<Ino, Object>,
+        names: &[ReplicaName],
+    ) -> Vec<(Ino, String, String)> {
+        let mut by_parent: BTreeMap<Ino, Vec<&ReplicaName>> = BTreeMap::new();
+        for name in names {
+            by_parent.entry(name.parent).or_default().push(name);
+        }
+        let mut updates = Vec::new();
+        let mut stack = vec![(ROOT_INO, "/".to_owned())];
+        let mut visited = BTreeMap::new();
+        visited.insert(ROOT_INO, ());
+        while let Some((parent, parent_path)) = stack.pop() {
+            let Some(children) = by_parent.get(&parent) else {
+                continue;
+            };
+            for name in children {
+                let expected = if parent_path == "/" {
+                    format!("/{}", name.name)
+                } else {
+                    format!("{parent_path}/{}", name.name)
+                };
+                if name.path != expected {
+                    updates.push((name.parent, name.name.clone(), expected.clone()));
+                }
+                if objects
+                    .get(&name.ino)
+                    .is_some_and(|object| !object.deleted && object.kind.is_dir())
+                    && visited.insert(name.ino, ()).is_none()
+                {
+                    stack.push((name.ino, expected));
+                }
+            }
+        }
+        updates
+    }
+
+    fn replica_rows(
+        conn: &rusqlite::Connection,
+    ) -> Result<(BTreeMap<Ino, Object>, Vec<ReplicaName>), DbError> {
+        let mut objects = BTreeMap::new();
+        {
+            let mut stmt = conn.prepare(
+                "SELECT ino, kind, mode, uid, gid, mtime_ns, size, file_root, block_count,
+                        target, nlink, deleted, created_seq, updated_seq
+                   FROM objects",
+            )?;
+            let mut rows = stmt.query([])?;
+            while let Some(row) = rows.next()? {
+                let object = super::db::object_from_row_offset(row, 0)?;
+                objects.insert(object.ino, object);
+            }
+        }
+        let mut names = Vec::new();
+        {
+            let mut stmt = conn.prepare("SELECT parent, name, ino, path FROM names")?;
+            let mut rows = stmt.query([])?;
+            while let Some(row) = rows.next()? {
+                let parent: Vec<u8> = row.get(0)?;
+                let parent: Ino = parent
+                    .try_into()
+                    .map_err(|_| DbError::Corrupt("names.parent is not 16 bytes"))?;
+                let name: String = row.get(1)?;
+                let ino: Vec<u8> = row.get(2)?;
+                let ino: Ino = ino
+                    .try_into()
+                    .map_err(|_| DbError::Corrupt("names.ino is not 16 bytes"))?;
+                let path: String = row.get(3)?;
+                names.push(ReplicaName {
+                    parent,
+                    name,
+                    ino,
+                    path,
+                });
+            }
+        }
+        Ok((objects, names))
+    }
+
     /// Clear the replicated tables for a new server epoch.
     ///
     /// The outbox survives: those are local intentions that will be resent
@@ -1291,6 +1910,9 @@ impl ClientDb {
         let mut db = self.lock_writer();
         let snapshot = db.read()?;
         let live = collect_live(&snapshot)?;
+        let root = snapshot
+            .object(ROOT_INO)?
+            .ok_or(DbError::Corrupt("root object is missing"))?;
         let mut desired = Vec::new();
         for item in &live {
             // The server derives a create's inode from its op id. Reuse the
@@ -1359,6 +1981,7 @@ impl ClientDb {
                 let link_id = seed_op_id("link", epoch, extra);
                 let payload = EventPayload::Link {
                     ino: item.object.ino,
+                    mtime_ns: Some(item.object.mtime_ns),
                 };
                 desired.push(SeedRow {
                     op_id: link_id,
@@ -1369,6 +1992,48 @@ impl ClientDb {
                 });
             }
         }
+        // A synthetic create carries the object's current timestamp, but the
+        // server's parent update used the original create timestamp. The
+        // difference is visible on directories, whose mtime moves with every
+        // child. Re-state each directory's attributes after all creates and
+        // writes, exactly as compaction does.
+        for item in &live {
+            if !item.object.kind.is_dir() {
+                continue;
+            }
+            desired.push(SeedRow {
+                op_id: seed_op_id("attrs", epoch, &item.path),
+                payload: EventPayload::Setattr {
+                    ino: item.object.ino,
+                    mode: Some(item.object.mode),
+                    uid: Some(item.object.uid),
+                    gid: Some(item.object.gid),
+                    mtime_ns: Some(item.object.mtime_ns),
+                    size: None,
+                },
+                path: item.path.clone(),
+                path2: None,
+                chunks: Vec::new(),
+            });
+        }
+        // The seed's creates stamp the server's root with each child's
+        // timestamp. Send the source root's own attributes last so the server
+        // and every replaying replica end on the imported root metadata, not
+        // on whichever top-level entry happened to be created last.
+        desired.push(SeedRow {
+            op_id: seed_op_id("root", epoch, "/"),
+            payload: EventPayload::Setattr {
+                ino: ROOT_INO,
+                mode: Some(root.mode),
+                uid: Some(root.uid),
+                gid: Some(root.gid),
+                mtime_ns: Some(root.mtime_ns),
+                size: None,
+            },
+            path: "/".to_owned(),
+            path2: None,
+            chunks: Vec::new(),
+        });
 
         // A repeated seed is a no-op when the outbox already holds exactly
         // this event set. Any other outbox content is local intent that the
@@ -1928,21 +2593,25 @@ impl ClientDb {
                 }
                 Self::apply_setattr_attrs(tx, seq, *ino, mode, uid, gid, mtime_ns)?;
             }
-            EventPayload::Rename { ino } => {
+            EventPayload::Rename { ino, mtime_ns } => {
                 let old_path = path.ok_or(DbError::Corrupt("rename event without a path"))?;
                 let new_path =
                     path2.ok_or(DbError::Corrupt("rename event without a destination"))?;
-                Self::apply_rename(tx, seq, *ino, old_path, new_path)?;
+                Self::apply_rename(tx, seq, *ino, old_path, new_path, *mtime_ns)?;
             }
-            EventPayload::Unlink { ino } | EventPayload::Rmdir { ino } => {
+            EventPayload::Unlink { ino, mtime_ns } => {
                 let path = path.ok_or(DbError::Corrupt("remove event without a path"))?;
-                Self::apply_remove(tx, seq, *ino, path)?;
+                Self::apply_remove(tx, seq, *ino, path, false, *mtime_ns)?;
             }
-            EventPayload::Link { ino } => {
+            EventPayload::Rmdir { ino, mtime_ns } => {
+                let path = path.ok_or(DbError::Corrupt("remove event without a path"))?;
+                Self::apply_remove(tx, seq, *ino, path, true, *mtime_ns)?;
+            }
+            EventPayload::Link { ino, mtime_ns } => {
                 let path = path2
                     .or(path)
                     .ok_or(DbError::Corrupt("link event without a path"))?;
-                Self::apply_link(tx, seq, *ino, path)?;
+                Self::apply_link(tx, seq, *ino, path, *mtime_ns)?;
             }
             EventPayload::Lock { .. }
             | EventPayload::Unlock { .. }
@@ -1982,7 +2651,7 @@ mod tests {
 
     use super::*;
     use crate::client::db::{ClientDb, DbError};
-    use crate::client::ops::CreateAttrs;
+    use crate::client::ops::{AttrChange, CreateAttrs};
     use crate::store::sqlite::{
         ChunkRef, EventPayload, ObjectKind, ROOT_INO, V1_SETATTR_BYTES,
     };
@@ -2215,7 +2884,10 @@ mod tests {
             1,
             Some(rename_op_id),
             "ok",
-            &EventPayload::Rename { ino: other },
+            &EventPayload::Rename {
+                ino: other,
+                mtime_ns: Some(2),
+            },
             Some("/x"),
             Some("/y"),
             None,
@@ -2366,6 +3038,16 @@ mod tests {
             b"d/f"
         );
         assert_eq!(target.applied_seq().unwrap(), rows.len() as i64);
+        let source_root = source.getattr(ROOT_INO).unwrap();
+        let target_root = target.getattr(ROOT_INO).unwrap();
+        assert_eq!(target_root.mode, source_root.mode);
+        assert_eq!(target_root.uid, source_root.uid);
+        assert_eq!(target_root.gid, source_root.gid);
+        assert_eq!(target_root.mtime_ns, source_root.mtime_ns);
+        let source_dir = source.lookup_by_path("/d").unwrap();
+        let target_dir = target.lookup_by_path("/d").unwrap();
+        assert_eq!(target_dir.mtime_ns, source_dir.mtime_ns);
+        assert!(target.check_replica().unwrap().is_empty());
     }
 
     #[test]
@@ -2414,7 +3096,10 @@ mod tests {
             1,
             Some([0xc3; 16]),
             "ok",
-            &EventPayload::Rename { ino: file_ino },
+            &EventPayload::Rename {
+                ino: file_ino,
+                mtime_ns: Some(3),
+            },
             Some("/d/f"),
             Some("/d/g"),
             None,
@@ -2426,7 +3111,10 @@ mod tests {
             1,
             Some([0xc4; 16]),
             "ok",
-            &EventPayload::Unlink { ino: file_ino },
+            &EventPayload::Unlink {
+                ino: file_ino,
+                mtime_ns: Some(4),
+            },
             Some("/d/g"),
             None,
             None,
@@ -2502,9 +3190,39 @@ mod tests {
         // The server's stream still carries the write, a rename, the child
         // unlink and the directory rmdir. All four must pass without Fatal.
         replay(&db, 4, &write, "/d/f", None, Some(b"hello"));
-        replay(&db, 5, &EventPayload::Rename { ino: file_ino }, "/d/f", Some("/d/g"), None);
-        replay(&db, 6, &EventPayload::Unlink { ino: file_ino }, "/d/g", None, None);
-        replay(&db, 7, &EventPayload::Rmdir { ino: dir_ino }, "/d", None, None);
+        replay(
+            &db,
+            5,
+            &EventPayload::Rename {
+                ino: file_ino,
+                mtime_ns: Some(5),
+            },
+            "/d/f",
+            Some("/d/g"),
+            None,
+        );
+        replay(
+            &db,
+            6,
+            &EventPayload::Unlink {
+                ino: file_ino,
+                mtime_ns: Some(6),
+            },
+            "/d/g",
+            None,
+            None,
+        );
+        replay(
+            &db,
+            7,
+            &EventPayload::Rmdir {
+                ino: dir_ino,
+                mtime_ns: Some(7),
+            },
+            "/d",
+            None,
+            None,
+        );
 
         assert_eq!(db.applied_seq().unwrap(), 7);
         assert!(matches!(db.lookup_by_path("/d"), Err(DbError::Errno(Errno::ENOENT))));
@@ -2527,16 +3245,39 @@ mod tests {
         db.rmdir(ROOT_INO, OsStr::new("d")).unwrap();
 
         replay(&db, 3, &file_payload([9u8; 16]), "/d/g", None, None);
-        replay(&db, 4, &EventPayload::Link { ino: file_ino }, "/e", None, None);
+        replay(
+            &db,
+            4,
+            &EventPayload::Link {
+                ino: file_ino,
+                mtime_ns: Some(4),
+            },
+            "/e",
+            None,
+            None,
+        );
         replay(
             &db,
             5,
-            &EventPayload::Rename { ino: file_ino },
+            &EventPayload::Rename {
+                ino: file_ino,
+                mtime_ns: Some(5),
+            },
             "/d/f",
             Some("/x/f"),
             None,
         );
-        replay(&db, 6, &EventPayload::Link { ino: [9u8; 16] }, "/d/g", None, None);
+        replay(
+            &db,
+            6,
+            &EventPayload::Link {
+                ino: [9u8; 16],
+                mtime_ns: Some(6),
+            },
+            "/d/g",
+            None,
+            None,
+        );
 
         assert_eq!(db.applied_seq().unwrap(), 6);
         assert!(db.lookup_by_path("/d").is_err());
@@ -2682,5 +3423,326 @@ mod tests {
         let again = ClientDb::open(&path, [9u8; 16]).unwrap();
         assert_eq!(again.applied_seq().unwrap(), 2);
         assert_eq!(again.read_at(ino, 0, 13).unwrap(), b"durable batch");
+    }
+
+    fn dir_payload_mtime(ino: Ino, mtime_ns: i64) -> EventPayload {
+        EventPayload::CreateDir {
+            ino,
+            mode: 0o755,
+            uid: 1,
+            gid: 2,
+            mtime_ns,
+            file_root: crate::store::sqlite::file_root(ObjectKind::Dir, None, &[]),
+        }
+    }
+
+    fn file_payload_mtime(ino: Ino, mtime_ns: i64) -> EventPayload {
+        EventPayload::CreateFile {
+            ino,
+            mode: 0o644,
+            uid: 3,
+            gid: 4,
+            mtime_ns,
+            file_root: crate::store::sqlite::file_root(ObjectKind::File, None, &[]),
+        }
+    }
+
+    fn object_state(db: &ClientDb, ino: Ino) -> (i64, i64, i64) {
+        let tx = db.read().unwrap();
+        let row = tx
+            .conn()
+            .query_row(
+                "SELECT deleted, nlink,
+                        (SELECT COUNT(*) FROM names WHERE names.ino = objects.ino)
+                   FROM objects WHERE ino = ?1",
+                [ino.as_slice()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        row
+    }
+
+    #[test]
+    fn create_remove_rename_and_link_events_stamp_directories() {
+        let (_dir, db) = open();
+        let a = [0x41u8; 16];
+        let f = [0x42u8; 16];
+        let b = [0x43u8; 16];
+
+        replay(&db, 1, &dir_payload_mtime(a, 100), "/a", None, None);
+        assert_eq!(db.getattr(ROOT_INO).unwrap().mtime_ns, 100);
+        replay(&db, 2, &file_payload_mtime(f, 200), "/a/f", None, None);
+        assert_eq!(db.getattr(a).unwrap().mtime_ns, 200);
+        assert_eq!(db.getattr(ROOT_INO).unwrap().mtime_ns, 100);
+
+        replay(
+            &db,
+            3,
+            &EventPayload::Rename {
+                ino: f,
+                mtime_ns: Some(300),
+            },
+            "/a/f",
+            Some("/a/g"),
+            None,
+        );
+        assert_eq!(db.getattr(f).unwrap().mtime_ns, 300);
+        assert_eq!(db.getattr(a).unwrap().mtime_ns, 300);
+
+        replay(&db, 4, &dir_payload_mtime(b, 400), "/b", None, None);
+        replay(
+            &db,
+            5,
+            &EventPayload::Link {
+                ino: f,
+                mtime_ns: Some(500),
+            },
+            "/b/h",
+            None,
+            None,
+        );
+        assert_eq!(db.getattr(b).unwrap().mtime_ns, 500);
+        assert_eq!(db.getattr(a).unwrap().mtime_ns, 300);
+        assert_eq!(db.getattr(f).unwrap().nlink, 2);
+
+        replay(
+            &db,
+            6,
+            &EventPayload::Unlink {
+                ino: f,
+                mtime_ns: Some(600),
+            },
+            "/a/g",
+            None,
+            None,
+        );
+        assert_eq!(db.getattr(a).unwrap().mtime_ns, 600);
+        assert_eq!(db.getattr(f).unwrap().nlink, 1);
+
+        replay(
+            &db,
+            7,
+            &EventPayload::Rmdir {
+                ino: a,
+                mtime_ns: Some(700),
+            },
+            "/a",
+            None,
+            None,
+        );
+        assert_eq!(db.getattr(ROOT_INO).unwrap().mtime_ns, 700);
+        assert!(db.check_replica().unwrap().is_empty());
+    }
+
+    #[test]
+    fn rmdir_tombstones_the_directory_instead_of_leaving_a_nameless_row() {
+        let (_dir, db) = open();
+        let d = [0x51u8; 16];
+        replay(&db, 1, &dir_payload_mtime(d, 10), "/d", None, None);
+        assert_eq!(db.getattr(ROOT_INO).unwrap().nlink, 3);
+
+        replay(
+            &db,
+            2,
+            &EventPayload::Rmdir {
+                ino: d,
+                mtime_ns: Some(20),
+            },
+            "/d",
+            None,
+            None,
+        );
+
+        assert_eq!(db.getattr(ROOT_INO).unwrap().nlink, 2);
+        assert_eq!(object_state(&db, d), (1, 0, 0));
+        assert!(db.check_replica().unwrap().is_empty());
+    }
+
+    #[test]
+    fn repair_tombstones_nameless_live_rows_and_fixes_links() {
+        let (_dir, db) = open();
+        let d = [0x61u8; 16];
+        replay(&db, 1, &dir_payload_mtime(d, 10), "/d", None, None);
+
+        // Reproduce the old rmdir bug: the name is gone but the object stays
+        // live with a decremented link count.
+        db.write(|tx| {
+            tx.delete_name(ROOT_INO, "d")?;
+            let mut object = ClientDb::object_in(tx, d)?.unwrap();
+            object.nlink = 1;
+            tx.put_object(&object)?;
+            Ok(())
+        })
+        .unwrap();
+
+        let issues = db.check_replica().unwrap();
+        assert!(issues.iter().any(|issue| matches!(
+            issue,
+            ReplicaIssue::LiveObjectWithoutName { ino } if *ino == d
+        )));
+
+        let report = db.repair_replica_metadata().unwrap();
+        assert_eq!(report.tombstones, 1);
+        assert!(report.changed());
+        assert_eq!(object_state(&db, d), (1, 0, 0));
+        assert!(db.check_replica().unwrap().is_empty());
+    }
+
+    #[test]
+    fn remove_events_leave_tombstones_for_objects_the_replica_never_held() {
+        let (_dir, db) = open();
+        let dir = [0xa1u8; 16];
+        let file = [0xa2u8; 16];
+        replay(
+            &db,
+            1,
+            &EventPayload::Rmdir {
+                ino: dir,
+                mtime_ns: Some(10),
+            },
+            "/gone",
+            None,
+            None,
+        );
+        replay(
+            &db,
+            2,
+            &EventPayload::Unlink {
+                ino: file,
+                mtime_ns: Some(20),
+            },
+            "/missing",
+            None,
+            None,
+        );
+        assert_eq!(object_state(&db, dir), (1, 0, 0));
+        assert_eq!(object_state(&db, file), (1, 0, 0));
+        assert!(db.check_replica().unwrap().is_empty());
+    }
+
+    #[test]
+    fn repair_removes_dangling_names_and_rebuilds_paths() {
+        let (_dir, db) = open();
+        let f = [0x71u8; 16];
+        let ghost = [0x72u8; 16];
+        replay(&db, 1, &file_payload_mtime(f, 10), "/f", None, None);
+        replay(
+            &db,
+            2,
+            &file_payload_mtime(ghost, 10),
+            "/ghost",
+            None,
+            None,
+        );
+        db.write(|tx| {
+            // A tombstone that still carries a name: the name is invisible
+            // through the mount but breaks the object/name invariant.
+            let mut object = ClientDb::object_in(tx, ghost)?.unwrap();
+            object.deleted = true;
+            object.nlink = 0;
+            tx.put_object(&object)?;
+            tx.conn().execute(
+                "UPDATE names SET path = '/wrong' WHERE parent = ?1 AND name = 'f'",
+                [ROOT_INO.as_slice()],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+        let issues = db.check_replica().unwrap();
+        assert!(issues
+            .iter()
+            .any(|issue| matches!(issue, ReplicaIssue::NameToDeletedObject { .. })));
+        assert!(issues
+            .iter()
+            .any(|issue| matches!(issue, ReplicaIssue::PathMismatch { .. })));
+
+        let report = db.repair_replica_metadata().unwrap();
+        assert_eq!(report.names_removed, 1);
+        assert_eq!(report.paths, 1);
+        assert!(db.check_replica().unwrap().is_empty());
+        assert_eq!(db.lookup_by_path("/f").unwrap().ino, f);
+    }
+
+    #[test]
+    fn repair_tombstones_the_children_of_a_nameless_directory() {
+        let (_dir, db) = open();
+        let d = [0x91u8; 16];
+        let e = [0x92u8; 16];
+        let f = [0x93u8; 16];
+        replay(&db, 1, &dir_payload_mtime(d, 10), "/d", None, None);
+        replay(&db, 2, &dir_payload_mtime(e, 20), "/d/e", None, None);
+        replay(&db, 3, &file_payload_mtime(f, 30), "/d/e/f", None, None);
+
+        db.write(|tx| {
+            tx.delete_name(ROOT_INO, "d")?;
+            let mut object = ClientDb::object_in(tx, d)?.unwrap();
+            object.nlink = 1;
+            tx.put_object(&object)?;
+            Ok(())
+        })
+        .unwrap();
+
+        let report = db.repair_replica_metadata().unwrap();
+        assert_eq!(report.tombstones, 3);
+        assert_eq!(object_state(&db, d), (1, 0, 0));
+        assert_eq!(object_state(&db, e), (1, 0, 0));
+        assert_eq!(object_state(&db, f), (1, 0, 0));
+        assert!(db.check_replica().unwrap().is_empty());
+    }
+
+    #[test]
+    fn setattr_without_a_size_still_applies_its_mtime() {
+        let (_dir, db) = open();
+        let f = [0x81u8; 16];
+        replay(&db, 1, &file_payload_mtime(f, 10), "/f", None, None);
+        replay(
+            &db,
+            2,
+            &EventPayload::Setattr {
+                ino: f,
+                mode: None,
+                uid: None,
+                gid: None,
+                mtime_ns: Some(99),
+                size: None,
+            },
+            "/f",
+            None,
+            None,
+        );
+        assert_eq!(db.getattr(f).unwrap().mtime_ns, 99);
+    }
+
+    #[test]
+    fn a_local_mtime_only_setattr_keeps_its_timestamp_in_the_outbox() {
+        let (_dir, db) = open();
+        let file = db
+            .create_file(ROOT_INO, OsStr::new("f"), CreateAttrs::new(0o644, 1, 2))
+            .unwrap();
+        let changed = db
+            .setattr(
+                file.ino,
+                AttrChange {
+                    mtime_ns: Some(123),
+                    ..AttrChange::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(changed.mtime_ns, 123);
+        let rows = db.outbox_page(10).unwrap();
+        match &rows.last().unwrap().decoded {
+            EventPayload::Setattr {
+                ino,
+                mtime_ns,
+                size,
+                ..
+            } => {
+                assert_eq!(*ino, file.ino);
+                assert_eq!(*mtime_ns, Some(123));
+                assert_eq!(*size, None);
+            }
+            other => panic!("expected a setattr row, got {other:?}"),
+        }
     }
 }

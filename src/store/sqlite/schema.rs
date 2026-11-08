@@ -59,6 +59,13 @@ pub mod keys {
     pub const BOOTSTRAP_DONE: &str = "bootstrap_done";
     /// BLAKE3 state digest, see [`super::hash::state_hash`].
     pub const STATE_HASH: &str = "state_hash";
+    /// Client: `applied_seq` covered by the last state digest refresh.
+    pub const STATE_HASH_SEQ: &str = "state_hash_seq";
+    /// Client: Unix seconds of the last state digest refresh.
+    pub const STATE_HASH_AT: &str = "state_hash_at";
+    /// Client: 1 when a replay batch advanced `applied_seq` after the last
+    /// digest refresh. The background checkpoint thread drains it.
+    pub const STATE_HASH_PENDING: &str = "state_hash_pending";
     /// Content chunk size; recorded so a future build can refuse a mismatch.
     pub const CHUNK_SIZE: &str = "chunk_size";
     /// Client: `full` or `lazy` chunk caching.
@@ -369,12 +376,15 @@ fn ensure_defaults(conn: &Connection, role: Role) -> Result<()> {
         (keys::BOOTSTRAP_DONE, 0),
         (keys::COMPACTED_AT, 0),
     ];
-    const CLIENT_DEFAULTS: [(&str, i64); 5] = [
+    const CLIENT_DEFAULTS: [(&str, i64); 8] = [
         (keys::APPLIED_SEQ, 0),
         (keys::COVERED_SEQ, 0),
         (keys::DIRTY, 0),
         (keys::FUSE_INO_NEXT, 2),
         (keys::LAST_CHECKPOINT_AT, 0),
+        (keys::STATE_HASH_SEQ, 0),
+        (keys::STATE_HASH_AT, 0),
+        (keys::STATE_HASH_PENDING, 0),
     ];
 
     let common: [(&str, i64); 2] = [

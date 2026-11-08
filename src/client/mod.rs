@@ -137,6 +137,27 @@ impl Client {
             "opening the client database"
         );
         let store = Arc::new(ClientDb::open(&db_path, cluster)?);
+        // A previous version could leave a removed directory live and
+        // nameless, or a name dangling after an overtaken create. Repair only
+        // those invisible rows before the mount exposes the tree.
+        match store.repair_replica_metadata() {
+            Ok(report) if report.changed() => tracing::warn!(
+                event = "replica_repair",
+                issues = report.issues,
+                roots = report.roots,
+                tombstones = report.tombstones,
+                nlinks = report.nlinks,
+                names_removed = report.names_removed,
+                paths = report.paths,
+                "repaired replicated tree metadata"
+            ),
+            Ok(_) => {}
+            Err(error) => tracing::warn!(
+                event = "replica_repair",
+                error = %error,
+                "cannot repair replicated tree metadata"
+            ),
+        }
         store.start_writeback();
         store.start_checkpoint();
         self.gate.set(State::Mounting);
