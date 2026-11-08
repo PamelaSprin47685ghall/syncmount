@@ -37,7 +37,8 @@ use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -153,12 +154,18 @@ impl Env {
 
     /// Start a client against `server`, using `db_name` (reused on restart).
     fn client(&self, name: &str, db_name: &str, key: &Path, server: &Server) -> Client {
+        self.client_at(name, db_name, key, server.port)
+    }
+
+    /// Start a client against an explicit TCP port, so a test can put a
+    /// controllable proxy between the client and the server.
+    fn client_at(&self, name: &str, db_name: &str, key: &Path, port: u16) -> Client {
         let n = self.serial.fetch_add(1, Ordering::Relaxed);
         let mountpoint = self.path(&format!("mnt-{name}"));
         fs::create_dir_all(&mountpoint).expect("mountpoint");
         let db = self.path(db_name);
         let log = self.path(&format!("client-{name}-{n}.log"));
-        let url = format!("http://127.0.0.1:{}/sync", server.port);
+        let url = format!("http://127.0.0.1:{port}/sync");
 
         let mut cmd = Command::new(BIN);
         cmd.arg("--log-format")
@@ -183,6 +190,87 @@ impl Env {
             run_dir: self.run_dir.clone(),
             mount_id: mount_id_for(&self.path(&format!("mnt-{name}"))),
             name: name.to_owned(),
+        }
+    }
+}
+
+/// A TCP proxy whose live connections a test can cut.
+///
+/// Both halves of a syncmount session are ordinary TCP streams, so one proxy
+/// instance forwards them transparently. `cut` shuts every live socket down;
+/// the client must treat that as a transient transport end, reconnect through
+/// the still-listening proxy, and resume from its durable `applied_seq`.
+struct Proxy {
+    port: u16,
+    streams: Arc<Mutex<Vec<TcpStream>>>,
+    stop: Arc<AtomicBool>,
+    listener: Option<thread::JoinHandle<()>>,
+}
+
+impl Proxy {
+    fn start(upstream: u16) -> Self {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("proxy bind");
+        listener.set_nonblocking(true).expect("proxy nonblocking");
+        let port = listener.local_addr().expect("proxy addr").port();
+        let streams = Arc::new(Mutex::new(Vec::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let accepted = Arc::clone(&streams);
+        let running = Arc::clone(&stop);
+        let handle = thread::spawn(move || {
+            while !running.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((client, _)) => {
+                        let Ok(server) = TcpStream::connect(("127.0.0.1", upstream)) else {
+                            continue;
+                        };
+                        let _ = client.set_nodelay(true);
+                        let _ = server.set_nodelay(true);
+                        accepted.lock().expect("proxy streams").extend([
+                            client.try_clone().expect("client clone"),
+                            server.try_clone().expect("server clone"),
+                        ]);
+                        let (mut from, mut to) = (
+                            client.try_clone().expect("client"),
+                            server.try_clone().expect("server"),
+                        );
+                        thread::spawn(move || {
+                            let _ = std::io::copy(&mut from, &mut to);
+                        });
+                        let (mut from, mut to) = (server, client);
+                        thread::spawn(move || {
+                            let _ = std::io::copy(&mut from, &mut to);
+                        });
+                    }
+                    Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        Self {
+            port,
+            streams,
+            stop,
+            listener: Some(handle),
+        }
+    }
+
+    /// Close every live client/server socket. The listener stays up so the
+    /// client's reconnect succeeds.
+    fn cut(&self) {
+        for stream in self.streams.lock().expect("proxy streams").drain(..) {
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+        }
+    }
+}
+
+impl Drop for Proxy {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        self.cut();
+        if let Some(handle) = self.listener.take() {
+            let _ = handle.join();
         }
     }
 }
@@ -1082,6 +1170,72 @@ fn eleven_clients_write_4k_concurrently_without_a_gap() {
             &format!("c{index}-39.bin"),
             &payload,
         );
+    }
+    for client in &mut clients {
+        assert!(
+            client.proc.try_wait().is_none(),
+            "{} exited during the eleven-client stress\n{}",
+            client.name,
+            client.proc.tail()
+        );
+    }
+}
+
+/// A transport close is transient. The client must reconnect through the
+/// same endpoint, resume from its durable `applied_seq`, and stay resident
+/// instead of exiting 10. The proxy reproduces the HKG0 shape: the client is
+/// paused while its two TCP streams are killed underneath it.
+#[test]
+fn transport_close_reconnects_and_resumes_from_applied_seq() {
+    if let Err(reason) = fuse_available() {
+        eprintln!("SKIP transport_close_reconnects_and_resumes_from_applied_seq: {reason}");
+        return;
+    }
+    let env = Env::new();
+    let server = env.server("reconnect.db");
+    let proxy = Proxy::start(server.port);
+    let mut a = env.client_at("reconnect-a", "reconnect-a.db", &env.key, proxy.port);
+    a.wait_mounted();
+    wait_synced(&mut a, &server);
+
+    let mut b = env.client("reconnect-b", "reconnect-b.db", &env.key, &server);
+    b.wait_mounted();
+    wait_synced(&mut b, &server);
+
+    let payload = vec![0x5au8; 4096];
+    for index in 0..10 {
+        write_retry(&b.mountpoint, &format!("cut-{index}.bin"), &payload);
+    }
+    wait_synced(&mut b, &server);
+
+    // Pause the client so the close lands on a socket it is not reading,
+    // then kill both streams. This is the HKG0 shape.
+    a.proc.signal(Signal::STOP);
+    thread::sleep(Duration::from_millis(200));
+    proxy.cut();
+    thread::sleep(Duration::from_millis(200));
+    a.proc.signal(Signal::CONT);
+
+    // Events written after the cut must reach the client by replay, not by
+    // the live broadcast it missed.
+    for index in 10..30 {
+        write_retry(&b.mountpoint, &format!("cut-{index}.bin"), &payload);
+    }
+    wait_synced(&mut b, &server);
+    wait_synced(&mut a, &server);
+
+    assert!(
+        a.proc.try_wait().is_none(),
+        "client exited after a transport close\n{}",
+        a.proc.tail()
+    );
+    assert!(
+        a.proc.log_contains("\"event\":\"reconnect\""),
+        "client did not reconnect\n{}",
+        a.proc.tail()
+    );
+    for index in 0..30 {
+        wait_file(&a.mountpoint, &format!("cut-{index}.bin"), &payload);
     }
 }
 

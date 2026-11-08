@@ -758,6 +758,51 @@ fn is_kick(frame: &Bytes) -> bool {
         && frame[2] == MsgType::KICK.get()
 }
 
+/// Largest byte run replay hands to the downlink in one chunk.
+///
+/// A chunk is not a frame: HTTP chunk boundaries carry no protocol meaning,
+/// and the receiver's decoder splits frames from any byte run. Coalescing
+/// keeps one syscall and one HTTP chunk for many events instead of one per
+/// event.
+const REPLAY_CHUNK_BYTES: usize = 64 * 1024;
+
+/// Accumulates replay frames into bounded byte runs.
+struct ReplayChunk {
+    tx: mpsc::Sender<Bytes>,
+    buf: Vec<u8>,
+}
+
+impl ReplayChunk {
+    fn new(tx: mpsc::Sender<Bytes>) -> Self {
+        Self {
+            tx,
+            buf: Vec::with_capacity(REPLAY_CHUNK_BYTES),
+        }
+    }
+
+    /// Add one frame, sending the buffer when it is full.
+    async fn push(&mut self, frame: &[u8]) -> Result<(), ()> {
+        if !self.buf.is_empty() && self.buf.len() + frame.len() > REPLAY_CHUNK_BYTES {
+            self.flush().await?;
+        }
+        self.buf.extend_from_slice(frame);
+        if self.buf.len() >= REPLAY_CHUNK_BYTES {
+            self.flush().await?;
+        }
+        Ok(())
+    }
+
+    /// Send everything buffered. Backpressure is the channel's.
+    async fn flush(&mut self) -> Result<(), ()> {
+        if self.buf.is_empty() {
+            return Ok(());
+        }
+        let chunk = Bytes::from(std::mem::take(&mut self.buf));
+        self.buf = Vec::with_capacity(REPLAY_CHUNK_BYTES);
+        self.tx.send(chunk).await.map_err(|_| ())
+    }
+}
+
 /// Replay `(replay_from ..= current)` from SQLite, then switch to live.
 async fn run_replay(
     context: SessionContext,
@@ -776,6 +821,7 @@ async fn run_replay(
     let nonces = NonceMinter::new(&mut rand::rng());
     let mut next = replay_from.get();
     let mut target = current_seq.get();
+    let mut chunk = ReplayChunk::new(tx);
     loop {
         while next <= target {
             let page = match store
@@ -802,7 +848,7 @@ async fn run_replay(
                 }
                 let content = replay_content(&store, &event).await;
                 if let Some((data, replay)) = &content {
-                    if send_replay_content(&tx, &ring, &nonces, replay, data)
+                    if send_replay_content(&mut chunk, &ring, &nonces, replay, data)
                         .await
                         .is_err()
                     {
@@ -824,7 +870,7 @@ async fn run_replay(
                 .and_then(|bytes| super::wire::with_seq(&bytes, Seq(seq)));
                 match frame {
                     Ok(bytes) => {
-                        if tx.send(Bytes::from(bytes)).await.is_err() {
+                        if chunk.push(&bytes).await.is_err() {
                             return;
                         }
                     }
@@ -835,6 +881,9 @@ async fn run_replay(
                 }
                 next = seq.saturating_add(1);
             }
+        }
+        if chunk.flush().await.is_err() {
+            return;
         }
         match context
             .sequencer
@@ -876,7 +925,7 @@ async fn replay_content(
 }
 
 async fn send_replay_content(
-    tx: &mpsc::Sender<Bytes>,
+    chunk: &mut ReplayChunk,
     ring: &crate::protocol::crypto::PskKeyRing,
     nonces: &NonceMinter,
     content: &super::wire::ReplayContent,
@@ -892,7 +941,7 @@ async fn send_replay_content(
         ring,
         nonces,
     )?;
-    if tx.send(Bytes::from(open)).await.is_err() {
+    if chunk.push(&open).await.is_err() {
         return Err(());
     }
     let total_chunks = data.len().div_ceil(crate::protocol::CHUNK_PLAIN).max(1) as u32;
@@ -913,7 +962,7 @@ async fn send_replay_content(
             ring,
             nonces,
         )?;
-        if tx.send(Bytes::from(frame)).await.is_err() {
+        if chunk.push(&frame).await.is_err() {
             return Err(());
         }
     }

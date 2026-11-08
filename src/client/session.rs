@@ -109,7 +109,7 @@ impl std::fmt::Debug for SessionOptions {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 enum Signal {
     CaughtUp,
     Disconnected,
@@ -374,6 +374,18 @@ enum SessionError {
     Unexpected(MsgType),
     #[error("{0}")]
     Fatal(String),
+}
+
+/// Signal for a failure while sending on the uplink.
+///
+/// A transport end is transient: the durable `applied_seq` is the replay
+/// cursor, so the driver reconnects instead of unmounting. A local database
+/// or encoding failure is not, because a reconnect cannot repair it.
+fn uplink_signal(error: SessionError) -> Signal {
+    match error {
+        SessionError::Transport(_) | SessionError::Closed => Signal::Disconnected,
+        other => Signal::Fatal(other.to_string()),
+    }
 }
 
 async fn handshake(
@@ -971,11 +983,18 @@ async fn flush_replay(
         Ok(report) => report,
         Err(error) => {
             Counters::bump(&counters.materialize_errors);
-            if matches!(&error, DbError::Corrupt("event sequence gap")) {
+            let replayable = match &error {
                 // A gap means the peer's stream lost an event (or a frame
-                // arrived out of order). The batch rolled back, so the durable
-                // applied_seq is still the last contiguous event. Reconnect:
-                // HELLO advertises it and the server replays the hole.
+                // arrived out of order). A missing chunk means the local
+                // cache lacks bytes this event needs. Both roll the batch
+                // back, so the durable applied_seq is still the last
+                // contiguous event. Reconnect: HELLO advertises it and the
+                // server replays the hole with its content.
+                DbError::Corrupt("event sequence gap") => Some("event sequence gap"),
+                DbError::MissingChunk(_) => Some("missing chunk"),
+                _ => None,
+            };
+            if let Some(reason) = replayable {
                 let applied = store.applied_seq().unwrap_or(0);
                 let missing = pending
                     .iter()
@@ -987,8 +1006,9 @@ async fn flush_replay(
                     applied,
                     expected = applied + 1,
                     got = missing,
+                    reason,
                     error = %error,
-                    "event sequence gap; reconnecting to replay from applied_seq"
+                    "replay cannot advance; reconnecting from applied_seq"
                 );
                 let _ = signal.send(Signal::Resync).await;
             } else {
@@ -1238,7 +1258,8 @@ async fn uplink(
     loop {
         while let Ok(bytes) = control.try_recv() {
             if let Err(error) = rpc.send(Bytes::from(bytes)).await {
-                let _ = signal.send(Signal::Fatal(error.to_string())).await;
+                tracing::warn!(event = "disconnect", error = %error, "uplink failed; reconnecting");
+                let _ = signal.send(Signal::Disconnected).await;
                 return;
             }
         }
@@ -1251,7 +1272,7 @@ async fn uplink(
             if let Err(error) =
                 send_ping(&mut rpc, &store, &sealer, epoch, &counters, &conntrace).await
             {
-                let _ = signal.send(Signal::Fatal(error.to_string())).await;
+                let _ = signal.send(uplink_signal(error)).await;
                 return;
             }
         }
@@ -1277,7 +1298,7 @@ async fn uplink(
                 )
                 .await
                 {
-                    let _ = signal.send(Signal::Fatal(error.to_string())).await;
+                    let _ = signal.send(uplink_signal(error)).await;
                     return;
                 }
             } else {
@@ -1304,7 +1325,7 @@ async fn uplink(
                         )
                         .await
                         {
-                            let _ = signal.send(Signal::Fatal(error.to_string())).await;
+                            let _ = signal.send(uplink_signal(error)).await;
                             return;
                         }
                         if let Err(error) = mark_sent(&store, &wire, &members) {
@@ -1327,7 +1348,7 @@ async fn uplink(
                             )
                             .await
                             {
-                                let _ = signal.send(Signal::Fatal(error.to_string())).await;
+                                let _ = signal.send(uplink_signal(error)).await;
                                 return;
                             }
                             if let Err(error) = mark_sent(&store, &wire, &members) {
@@ -1350,7 +1371,7 @@ async fn uplink(
                         )
                         .await
                         {
-                            let _ = signal.send(Signal::Fatal(error.to_string())).await;
+                            let _ = signal.send(uplink_signal(error)).await;
                             return;
                         }
                         if let Err(error) = mark_sent(&store, &wire, &members) {
@@ -1377,7 +1398,7 @@ async fn uplink(
                     )
                     .await
                     {
-                        let _ = signal.send(Signal::Fatal(error.to_string())).await;
+                        let _ = signal.send(uplink_signal(error)).await;
                         return;
                     }
                     if let Err(error) = mark_sent(&store, &wire, &members) {
@@ -1388,7 +1409,7 @@ async fn uplink(
                 if let Err(error) =
                     send_meta(&mut rpc, &store, &sealer, op, &counters, &conntrace).await
                 {
-                    let _ = signal.send(Signal::Fatal(error.to_string())).await;
+                    let _ = signal.send(uplink_signal(error)).await;
                     return;
                 }
                 if let Err(error) = store.mark_sent(op.op_id, &[op.op_id]) {
@@ -1411,7 +1432,7 @@ async fn uplink(
             )
             .await
             {
-                let _ = signal.send(Signal::Fatal(error.to_string())).await;
+                let _ = signal.send(uplink_signal(error)).await;
                 return;
             }
             if let Err(error) = mark_sent(&store, &wire, &members) {
@@ -1837,6 +1858,24 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+
+    #[test]
+    fn a_transport_end_is_a_resync_not_a_fatal_exit() {
+        // The downlink already reports a closed stream as Disconnected. The
+        // uplink used to turn the same condition into Fatal, which the
+        // driver treats as terminal and exits 10.
+        assert_eq!(
+            uplink_signal(SessionError::Transport(
+                crate::transport::TransportError::Closed
+            )),
+            Signal::Disconnected
+        );
+        assert_eq!(uplink_signal(SessionError::Closed), Signal::Disconnected);
+        assert_eq!(
+            uplink_signal(SessionError::Fatal("encode".to_owned())),
+            Signal::Fatal("encode".to_owned())
+        );
+    }
 
     #[test]
     fn hello_prefix_carries_the_local_watermark_and_epoch() {
