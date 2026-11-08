@@ -1178,6 +1178,7 @@ impl WriteTx<'_> {
             });
         }
 
+        let from_seq = meta_i64(&self.tx, keys::SEQ)?;
         let epoch = meta_i64(&self.tx, keys::EPOCH)? + 1;
         self.tx.execute("DELETE FROM event_chunks", [])?;
         self.tx.execute("DELETE FROM events", [])?;
@@ -1186,6 +1187,8 @@ impl WriteTx<'_> {
         self.set_meta_i64(keys::SEQ, 0)?;
         self.set_meta_i64(keys::REPLAY_FLOOR, 1)?;
         self.set_meta_i64(keys::COMPACTED_AT, now_secs())?;
+        self.set_meta_i64(keys::COMPACTED_FROM_SEQ, from_seq)?;
+        self.set_meta_i64(keys::COMPACTED_EPOCH, epoch)?;
 
         let live = collect_live_objects(&self.tx)?;
         let created_at = now_secs();
@@ -1284,9 +1287,13 @@ impl WriteTx<'_> {
         self.refresh_all_refcounts()?;
         let state = hash::state_hash(&self.tx)?;
         self.set_meta_blob(keys::STATE_HASH, &state)?;
+        let compacted_seq = meta_i64(&self.tx, keys::SEQ)?;
+        self.set_meta_i64(keys::COMPACTED_SEQ, compacted_seq)?;
 
         Ok(CompactReport {
             epoch,
+            from_seq,
+            compacted_seq,
             objects: live.len() as u64,
             events,
             links,
@@ -1424,6 +1431,10 @@ impl WriteTx<'_> {
 pub struct CompactReport {
     /// New epoch.
     pub epoch: i64,
+    /// `seq` immediately before the compaction.
+    pub from_seq: i64,
+    /// Last sequence of the new replay log.
+    pub compacted_seq: i64,
     /// Live objects described by the new log.
     pub objects: u64,
     /// Events written in total.

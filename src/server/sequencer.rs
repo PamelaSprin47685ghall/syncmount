@@ -31,7 +31,7 @@
 //! then calls `Attach`. An unauthenticated peer never enters the online table.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -40,7 +40,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::protocol::crypto::{NonceMinter, PskKeyRing, Sealer};
-use crate::protocol::messages::{Kick as KickMessage, WcpWriter, fid};
+use crate::protocol::messages::{CompactionState, Kick as KickMessage, WcpWriter, fid};
 use crate::protocol::{
     BodyEncoding, Caps, ErrorMessage, Flags, FrameBuf, FrameHeader, FrameRef, KickReason, MsgType,
     Prefix, PrefixKind, ProtocolError, Seq, SessionId, TrnReason, encode_frame,
@@ -67,6 +67,7 @@ pub struct Sequencer {
     cmd_tx: mpsc::Sender<SeqCmd>,
     seq_view: Arc<AtomicU64>,
     epoch: Epoch,
+    compaction: Arc<Mutex<CompactionState>>,
     metrics: Arc<Metrics>,
     store: StoreHandle,
     ring: Arc<PskKeyRing>,
@@ -193,6 +194,8 @@ pub struct AttachRequest {
     pub epoch_seen: u64,
     /// Applied sequence reported by the client.
     pub applied_seq: Seq,
+    /// The client negotiated [`Caps::COMPACTION_FASTFORWARD`].
+    pub fast_forward: bool,
 }
 
 /// What the actor hands back after a successful `Attach`.
@@ -425,6 +428,11 @@ impl Sequencer {
         let (cmd_tx, cmd_rx) = mpsc::channel(config.command_capacity.max(1));
         let epoch = Epoch::new(meta.epoch.max(1) as u64);
         let seq_view = Arc::new(AtomicU64::new(meta.seq.max(0) as u64));
+        let compaction = Arc::new(Mutex::new(CompactionState {
+            from_seq: meta.compacted_from_seq.max(0) as u64,
+            epoch: meta.compacted_epoch.max(0) as u64,
+            seq: meta.compacted_seq.max(0) as u64,
+        }));
         metrics.seq.store(meta.seq.max(0) as u64, Ordering::Release);
         let handle_store = store.clone();
         let handle_ring = Arc::clone(&ring);
@@ -435,6 +443,7 @@ impl Sequencer {
             last_op_seq: meta.seq.max(0) as u64,
             replay_floor: meta.replay_floor.max(1) as u64,
             epoch,
+            compaction: Arc::clone(&compaction),
             online: OnlineTable::new(),
             generation: 0,
             relay: RelayHub::new(RelayLimits::default()),
@@ -462,6 +471,7 @@ impl Sequencer {
                 cmd_tx,
                 seq_view,
                 epoch,
+                compaction,
                 metrics,
                 store: handle_store,
                 ring: handle_ring,
@@ -479,6 +489,14 @@ impl Sequencer {
     /// Current sequence without asking the actor.
     pub fn current_seq(&self) -> Seq {
         Seq(self.seq_view.load(Ordering::Acquire))
+    }
+
+    /// Compaction watermarks advertised to new sessions.
+    pub fn compaction(&self) -> CompactionState {
+        *self
+            .compaction
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Shared counters.
@@ -737,6 +755,7 @@ struct SequencerCore {
     /// First sequence a fresh replica must replay.
     replay_floor: u64,
     epoch: Epoch,
+    compaction: Arc<Mutex<CompactionState>>,
     online: OnlineTable,
     generation: u64,
     relay: RelayHub,
@@ -1009,13 +1028,31 @@ impl SequencerCore {
             return Err(TrnReason::Protocol);
         }
         let current = self.current_seq();
+        let compaction = *self
+            .compaction
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        // The client holds the pre-compaction tree and understood the
+        // `WELCOME` metadata. Its replica is the base of the synthetic log,
+        // so the server must not resend that log.
+        let fast_forward = request.fast_forward
+            && compaction.epoch == self.epoch.get()
+            && compaction.seq <= current.get()
+            && compaction.admits(request.epoch_seen, request.applied_seq.get());
         let caught_up = request.epoch_seen == self.epoch.get()
             && request.applied_seq >= Seq(self.replay_floor.saturating_sub(1))
             && request.applied_seq <= current;
-        let replay_from = if caught_up {
+        let replay_from = if fast_forward {
+            Seq(compaction.seq.saturating_add(1))
+        } else if caught_up {
             Seq(request.applied_seq.get().saturating_add(1))
         } else {
             Seq(self.replay_floor)
+        };
+        let applied_seq = if fast_forward {
+            Seq(compaction.seq)
+        } else {
+            request.applied_seq
         };
         let AttachRequest {
             session_id,
@@ -1023,8 +1060,17 @@ impl SequencerCore {
             peer,
             outbox,
             epoch_seen,
-            applied_seq,
+            applied_seq: _,
+            fast_forward: _,
         } = request;
+        // A fast-forwarded session belongs to the new epoch. Reporting the
+        // old `epoch_seen` would make `Session::new` discard the adopted
+        // watermark as foreign and hide the session from drain and health.
+        let epoch_seen = if fast_forward {
+            self.epoch.get()
+        } else {
+            epoch_seen
+        };
         let replay_tx = outbox.data.clone();
         let ctrl_tx = outbox.ctrl.clone();
         let queued = Arc::clone(&outbox.queued);
@@ -1626,14 +1672,22 @@ impl SequencerCore {
         }
         let report = self.store.compact().await?;
         self.epoch = Epoch::new(report.epoch.max(1) as u64);
+        *self
+            .compaction
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = CompactionState {
+            from_seq: report.from_seq.max(0) as u64,
+            epoch: report.epoch.max(1) as u64,
+            seq: report.compacted_seq.max(0) as u64,
+        };
         // Compaction resets `meta.seq` to zero and then emits one replayable
-        // event per live object, so the final sequence equals `events`.
-        self.seq = report.events;
-        self.last_op_seq = report.events;
+        // event per live object; `compacted_seq` is that final sequence.
+        self.seq = report.compacted_seq.max(0) as u64;
+        self.last_op_seq = self.seq;
         self.replay_floor = 1;
-        self.seq_view.store(report.events, Ordering::Release);
+        self.seq_view.store(self.seq, Ordering::Release);
         self.metrics.publish_epoch(report.epoch.max(1) as u64);
-        self.metrics.seq.store(report.events, Ordering::Release);
+        self.metrics.seq.store(self.seq, Ordering::Release);
         Ok(report)
     }
 
@@ -1975,7 +2029,7 @@ pub(crate) fn encode_control(
 
 /// Capabilities the server advertises.
 pub(crate) fn server_caps() -> Caps {
-    Caps::REQUIRED
+    Caps::REQUIRED.union(Caps::COMPACTION_FASTFORWARD)
 }
 
 /// Wall clock in microseconds, diagnostic only.
@@ -2011,6 +2065,7 @@ mod tests {
     fn server_caps_require_only_the_psk_world() {
         let caps = server_caps();
         assert!(caps.contains(Caps::PSK_AUTH));
+        assert!(caps.contains(Caps::COMPACTION_FASTFORWARD));
     }
 
     #[test]

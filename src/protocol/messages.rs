@@ -126,8 +126,17 @@ pub mod fid {
     pub const F_CLIENT_ID: u8 = 0x34;
     /// Client nonce, 32 B (`HELLO`).
     pub const F_CLIENT_NONCE: u8 = 0x35;
+    /// Sequence immediately before the last server compaction, `u64`
+    /// (`WELCOME`). Zero when the server has never compacted.
+    pub const F_COMPACTED_FROM_SEQ: u8 = 0x36;
+    /// Epoch produced by the last server compaction, `u64` (`WELCOME`).
+    /// Zero when the server has never compacted.
+    pub const F_COMPACTED_EPOCH: u8 = 0x37;
     /// Server nonce, 32 B (`WELCOME`).
     pub const F_SERVER_NONCE: u8 = 0x38;
+    /// Last sequence of the compacted replay log, `u64` (`WELCOME`). A client
+    /// that already holds the pre-compaction tree adopts this watermark.
+    pub const F_COMPACTED_SEQ: u8 = 0x39;
     /// Relay sub-message kind, `u8` (`RELAY`).
     pub const F_SUB_KIND: u8 = 0x40;
     /// Vendor extension, bytes.
@@ -1162,6 +1171,39 @@ impl Hello {
     }
 }
 
+/// Compaction watermarks a server advertises in `WELCOME`.
+///
+/// A client that applied exactly `from_seq` in epoch `epoch - 1` already
+/// holds the tree the compacted log describes. It may adopt epoch `epoch` and
+/// watermark `seq` without replaying that log.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CompactionState {
+    /// Sequence immediately before the last compaction; zero if none.
+    pub from_seq: u64,
+    /// Epoch produced by the last compaction; zero if none.
+    pub epoch: u64,
+    /// Last sequence of the compacted replay log; zero if none.
+    pub seq: u64,
+}
+
+impl CompactionState {
+    /// No compaction has happened.
+    pub const NONE: Self = Self {
+        from_seq: 0,
+        epoch: 0,
+        seq: 0,
+    };
+
+    /// Whether a replica at `(epoch_seen, applied)` holds the compacted tree.
+    ///
+    /// The epoch must be exactly the one before the compaction: sequence
+    /// numbers restart at zero, so an equal `applied` from an older epoch
+    /// names a different state.
+    pub const fn admits(self, epoch_seen: u64, applied: u64) -> bool {
+        self.epoch != 0 && epoch_seen.saturating_add(1) == self.epoch && applied == self.from_seq
+    }
+}
+
 /// `WELCOME` body: plain WCP (44 §3.4, 44 D5).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Welcome {
@@ -1173,6 +1215,12 @@ pub struct Welcome {
     pub epoch: u64,
     /// Current server sequence.
     pub current_seq: Seq,
+    /// Sequence immediately before the last compaction; zero if none.
+    pub compacted_from_seq: u64,
+    /// Epoch produced by the last compaction; zero if none.
+    pub compacted_epoch: u64,
+    /// Last sequence of the compacted replay log; zero if none.
+    pub compacted_seq: u64,
     /// Echoed client identifier.
     pub client_id: ClientId,
     /// Requested resync mode.
@@ -1212,6 +1260,11 @@ impl Welcome {
                 fields.u64(fid::F_CURRENT_SEQ)?,
                 fid::F_CURRENT_SEQ,
             )?),
+            // Optional so that a peer without compaction metadata still
+            // decodes; a missing field means "never compacted".
+            compacted_from_seq: fields.u64(fid::F_COMPACTED_FROM_SEQ)?.unwrap_or(0),
+            compacted_epoch: fields.u64(fid::F_COMPACTED_EPOCH)?.unwrap_or(0),
+            compacted_seq: fields.u64(fid::F_COMPACTED_SEQ)?.unwrap_or(0),
             client_id: ClientId::from_bytes(required(
                 fields.fixed::<16>(fid::F_CLIENT_ID)?,
                 fid::F_CLIENT_ID,
@@ -1294,6 +1347,11 @@ impl Welcome {
         writer.u32(fid::F_CAPS, self.caps.bits());
         writer.u64(fid::F_EPOCH, self.epoch);
         writer.u64(fid::F_CURRENT_SEQ, self.current_seq.get());
+        if self.compacted_epoch != 0 {
+            writer.u64(fid::F_COMPACTED_FROM_SEQ, self.compacted_from_seq);
+            writer.u64(fid::F_COMPACTED_EPOCH, self.compacted_epoch);
+            writer.u64(fid::F_COMPACTED_SEQ, self.compacted_seq);
+        }
         writer.bytes(fid::F_CLIENT_ID, &self.client_id.to_bytes());
         writer.u8(fid::F_RESYNC, self.resync.as_u8());
         writer.nested(fid::F_LIMITS, |nested| self.limits.write(nested));
@@ -2416,6 +2474,9 @@ mod tests {
             caps: Caps::REQUIRED,
             epoch: 9,
             current_seq: Seq(42),
+            compacted_from_seq: 40,
+            compacted_epoch: 9,
+            compacted_seq: 42,
             client_id: ClientId::from_bytes([0x11; 16]),
             resync: ResyncMode::None,
             limits: WelcomeLimits {
@@ -2454,7 +2515,6 @@ mod tests {
             .as_bytes()
         );
         assert_eq!(Welcome::decode(&body, &limits()).unwrap(), welcome);
-
         let without = welcome.encode().unwrap();
         assert_eq!(Welcome::server_proof(&without, &limits()).unwrap(), None);
         assert_eq!(Welcome::sealed_accept(&without, &limits()).unwrap(), None);
@@ -2462,6 +2522,40 @@ mod tests {
             Welcome::proof_input(&without, &limits()).unwrap(),
             *blake3::hash(&without).as_bytes()
         );
+    }
+
+    #[test]
+    fn welcome_compaction_fields_roundtrip_and_default_to_zero() {
+        let welcome = welcome_fixture();
+        let body = welcome.encode().unwrap();
+        assert_eq!(Welcome::decode(&body, &limits()).unwrap(), welcome);
+
+        let mut plain = welcome;
+        plain.compacted_from_seq = 0;
+        plain.compacted_epoch = 0;
+        plain.compacted_seq = 0;
+        let body = plain.encode().unwrap();
+        let decoded = Welcome::decode(&body, &limits()).unwrap();
+        assert_eq!(decoded.compacted_from_seq, 0);
+        assert_eq!(decoded.compacted_epoch, 0);
+        assert_eq!(decoded.compacted_seq, 0);
+    }
+
+    #[test]
+    fn compaction_state_admits_only_the_pre_compaction_watermark() {
+        let state = CompactionState {
+            from_seq: 300,
+            epoch: 8,
+            seq: 20,
+        };
+        assert!(state.admits(7, 300));
+        assert!(!state.admits(7, 299));
+        assert!(!state.admits(7, 301));
+        // Sequence numbers restart at zero, so an older epoch with the same
+        // applied value names a different tree.
+        assert!(!state.admits(6, 300));
+        assert!(!state.admits(8, 300));
+        assert!(!CompactionState::NONE.admits(0, 0));
     }
 
     #[test]
@@ -2734,6 +2828,9 @@ mod tests {
             caps: Caps::REQUIRED,
             epoch: 42,
             current_seq: Seq(9),
+            compacted_from_seq: 0,
+            compacted_epoch: 0,
+            compacted_seq: 0,
             client_id: ClientId::from_bytes([7u8; 16]),
             resync: ResyncMode::None,
             limits: WelcomeLimits {
@@ -2862,6 +2959,9 @@ mod tests {
             caps: Caps::REQUIRED,
             epoch: 42,
             current_seq: Seq(9),
+            compacted_from_seq: 0,
+            compacted_epoch: 0,
+            compacted_seq: 0,
             client_id: ClientId::from_bytes([7u8; 16]),
             resync: ResyncMode::Full,
             limits: WelcomeLimits {

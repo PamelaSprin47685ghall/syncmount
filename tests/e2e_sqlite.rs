@@ -1297,12 +1297,13 @@ fn client_restart_resumes_from_applied_seq() {
 }
 
 /// Server SIGTERM drains, compacts (epoch + 1), and kicks the clients. After
-/// both processes restart, every client replays the compacted log from zero
-/// and the tree (including a hard link) matches the pre-restart bytes.
+/// both processes restart, every drained client keeps its tree, adopts the
+/// new epoch without replaying, and the tree (including a hard link) matches
+/// the pre-restart bytes.
 #[test]
-fn server_restart_compacts_and_clients_full_replay() {
+fn server_restart_compacts_and_clients_fast_forward() {
     if let Err(reason) = fuse_available() {
-        eprintln!("SKIP server_restart_compacts_and_clients_full_replay: {reason}");
+        eprintln!("SKIP server_restart_compacts_and_clients_fast_forward: {reason}");
         return;
     }
     let env = Env::new();
@@ -1398,6 +1399,17 @@ fn server_restart_compacts_and_clients_full_replay() {
     let seq_after = db_i64(&db, "seq").expect("compacted seq");
     assert!(seq_after > 0, "compaction emits replayable events");
     assert_eq!(
+        db_i64(&db, "compacted_from_seq"),
+        Some(seq_before),
+        "the compaction point is the pre-compaction sequence"
+    );
+    assert_eq!(
+        db_i64(&db, "compacted_epoch"),
+        Some(epoch_before + 1),
+        "the compaction point names the new epoch"
+    );
+    assert_eq!(db_i64(&db, "compacted_seq"), Some(seq_after));
+    assert_eq!(
         Some(seq_after),
         db_count(&db, "SELECT COUNT(*) FROM events"),
         "meta.seq must match the compacted event count"
@@ -1425,6 +1437,20 @@ fn server_restart_compacts_and_clients_full_replay() {
     assert_eq!(db_i64(&b3.db, "epoch"), Some(epoch_before + 1));
     assert_eq!(db_i64(&a3.db, "applied_seq"), Some(seq_after));
     assert_eq!(db_i64(&b3.db, "applied_seq"), Some(seq_after));
+    for client in [&a3, &b3] {
+        assert!(
+            client.proc.log_contains("compaction_fast_forward"),
+            "{} did not fast-forward\n{}",
+            client.name,
+            client.proc.tail()
+        );
+        assert!(
+            !client.proc.log_contains("\"event\":\"epoch_reset\""),
+            "{} reset the replica instead of fast-forwarding\n{}",
+            client.name,
+            client.proc.tail()
+        );
+    }
 
     wait_file(&a3.mountpoint, "file.txt", &big);
     wait_file(&b3.mountpoint, "file.txt", &big);
@@ -1444,6 +1470,264 @@ fn server_restart_compacts_and_clients_full_replay() {
         "compaction must not change the state digest"
     );
     let _ = (b_db, b_mount);
+}
+
+/// Eleven drained clients keep their trees across a compaction and adopt the
+/// new epoch without replaying the synthetic log.
+#[test]
+fn eleven_clients_fast_forward_after_compaction() {
+    if let Err(reason) = fuse_available() {
+        eprintln!("SKIP eleven_clients_fast_forward_after_compaction: {reason}");
+        return;
+    }
+    let env = Env::new();
+    let mut server = env.server("eleven-compact.db");
+    let mut clients: Vec<Client> = (0..11)
+        .map(|index| {
+            env.client(
+                &format!("f{index}"),
+                &format!("f{index}.db"),
+                &env.key,
+                &server,
+            )
+        })
+        .collect();
+    for client in &mut clients {
+        client.wait_mounted();
+    }
+    for client in &mut clients {
+        wait_synced(client, &server);
+    }
+
+    for (index, client) in clients.iter().enumerate() {
+        write_retry(
+            &client.mountpoint,
+            &format!("f{index}.txt"),
+            format!("client {index}\n").as_bytes(),
+        );
+    }
+    for client in &mut clients {
+        wait_synced(client, &server);
+    }
+    for index in 0..11 {
+        let reader = &clients[(index + 1) % 11];
+        wait_file(
+            &reader.mountpoint,
+            &format!("f{index}.txt"),
+            format!("client {index}\n").as_bytes(),
+        );
+    }
+
+    let seq_before = db_i64(&server.db, "seq").expect("pre-compaction seq");
+    let epoch_before = db_i64(&server.db, "epoch").expect("pre-compaction epoch");
+    for client in &clients {
+        assert_eq!(
+            db_i64(&client.db, "applied_seq"),
+            Some(seq_before),
+            "{} is not drained before the stop\n{}",
+            client.name,
+            client.proc.tail()
+        );
+    }
+    let db = server.db.clone();
+    let status = server.stop_graceful();
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "server must drain and compact\n{}",
+        server.proc.tail()
+    );
+    drop(server);
+    for client in &mut clients {
+        let status = client.wait_exit_unmounting(Duration::from_secs(20));
+        assert_eq!(
+            status.code(),
+            Some(10),
+            "{} must be kicked by the epoch change\n{}",
+            client.name,
+            client.proc.tail()
+        );
+    }
+    drop(clients);
+
+    assert_eq!(db_i64(&db, "compacted_from_seq"), Some(seq_before));
+    assert_eq!(db_i64(&db, "compacted_epoch"), Some(epoch_before + 1));
+    let seq_after = db_i64(&db, "seq").expect("compacted seq");
+    assert_eq!(db_i64(&db, "compacted_seq"), Some(seq_after));
+
+    let server2 = env.server("eleven-compact.db");
+    let mut restarted: Vec<Client> = (0..11)
+        .map(|index| {
+            env.client(
+                &format!("g{index}"),
+                &format!("f{index}.db"),
+                &env.key,
+                &server2,
+            )
+        })
+        .collect();
+    for client in &mut restarted {
+        client.wait_mounted();
+    }
+    for (index, client) in restarted.iter_mut().enumerate() {
+        wait_status_state(client, "STEADY");
+        assert_eq!(
+            db_i64(&client.db, "applied_seq"),
+            Some(seq_after),
+            "{} did not adopt the compacted watermark\n{}",
+            client.name,
+            client.proc.tail()
+        );
+        assert!(
+            client.proc.log_contains("compaction_fast_forward"),
+            "{} did not fast-forward\n{}",
+            client.name,
+            client.proc.tail()
+        );
+        assert!(
+            !client.proc.log_contains("\"event\":\"epoch_reset\""),
+            "{} reset the replica instead of fast-forwarding\n{}",
+            client.name,
+            client.proc.tail()
+        );
+        wait_file(
+            &client.mountpoint,
+            &format!("f{index}.txt"),
+            format!("client {index}\n").as_bytes(),
+        );
+        wait_file(
+            &client.mountpoint,
+            &format!("f{}.txt", (index + 1) % 11),
+            format!("client {}\n", (index + 1) % 11).as_bytes(),
+        );
+    }
+
+    // The adopted watermark must line up with the stream: a write after the
+    // compaction is replayed as an increment, not lost or duplicated.
+    write_retry(&restarted[0].mountpoint, "after.txt", b"after\n");
+    for client in &mut restarted {
+        wait_file(&client.mountpoint, "after.txt", b"after\n");
+        wait_synced(client, &server2);
+    }
+}
+
+/// A client with an empty database joins after a compaction and replays the
+/// synthetic log from zero.
+#[test]
+fn new_client_replays_the_compacted_log_from_zero() {
+    if let Err(reason) = fuse_available() {
+        eprintln!("SKIP new_client_replays_the_compacted_log_from_zero: {reason}");
+        return;
+    }
+    let env = Env::new();
+    let mut server = env.server("join-compact.db");
+    let mut a = env.client("a", "a.db", &env.key, &server);
+    a.wait_mounted();
+    wait_synced(&mut a, &server);
+    write_retry(&a.mountpoint, "data.txt", b"payload\n");
+    wait_synced(&mut a, &server);
+
+    let db = server.db.clone();
+    let status = server.stop_graceful();
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "server must drain and compact\n{}",
+        server.proc.tail()
+    );
+    drop(server);
+    let status = a.wait_exit_unmounting(Duration::from_secs(20));
+    assert_eq!(status.code(), Some(10), "{}", a.proc.tail());
+    drop(a);
+    let seq_after = db_i64(&db, "seq").expect("compacted seq");
+
+    let server2 = env.server("join-compact.db");
+    let mut fresh = env.client("fresh", "fresh.db", &env.key, &server2);
+    fresh.wait_mounted();
+    wait_status_state(&mut fresh, "STEADY");
+    wait_file(&fresh.mountpoint, "data.txt", b"payload\n");
+    assert_eq!(db_i64(&fresh.db, "applied_seq"), Some(seq_after));
+    assert!(
+        fresh.proc.log_contains("\"event\":\"epoch_reset\""),
+        "a new client must replay the compacted log\n{}",
+        fresh.proc.tail()
+    );
+    assert!(
+        !fresh.proc.log_contains("compaction_fast_forward"),
+        "a new client must not fast-forward\n{}",
+        fresh.proc.tail()
+    );
+}
+
+/// A client that stopped before the compaction is below the compaction point
+/// and replays the whole synthetic log when it returns.
+#[test]
+fn lagging_client_replays_after_compaction() {
+    if let Err(reason) = fuse_available() {
+        eprintln!("SKIP lagging_client_replays_after_compaction: {reason}");
+        return;
+    }
+    let env = Env::new();
+    let mut server = env.server("lagging.db");
+    let mut a = env.client("a", "a.db", &env.key, &server);
+    let mut b = env.client("b", "b.db", &env.key, &server);
+    a.wait_mounted();
+    b.wait_mounted();
+    wait_synced(&mut a, &server);
+    wait_synced(&mut b, &server);
+
+    write_retry(&a.mountpoint, "one.txt", b"one\n");
+    wait_file(&b.mountpoint, "one.txt", b"one\n");
+    wait_synced(&mut a, &server);
+    wait_synced(&mut b, &server);
+
+    let b_applied = db_i64(&b.db, "applied_seq").expect("b applied");
+    let status = b.stop_graceful();
+    assert_eq!(status.code(), Some(0), "{}", b.proc.tail());
+    drop(b);
+
+    // Only `a` is online, so the drain does not wait for `b`.
+    write_retry(&a.mountpoint, "two.txt", b"two\n");
+    wait_synced(&mut a, &server);
+    let seq_before = db_i64(&server.db, "seq").expect("pre-compaction seq");
+    assert!(
+        b_applied < seq_before,
+        "b applied {b_applied}, compaction point {seq_before}"
+    );
+
+    let db = server.db.clone();
+    let status = server.stop_graceful();
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "server must drain and compact\n{}",
+        server.proc.tail()
+    );
+    drop(server);
+    let status = a.wait_exit_unmounting(Duration::from_secs(20));
+    assert_eq!(status.code(), Some(10), "{}", a.proc.tail());
+    drop(a);
+
+    assert_eq!(db_i64(&db, "compacted_from_seq"), Some(seq_before));
+    let seq_after = db_i64(&db, "seq").expect("compacted seq");
+
+    let server2 = env.server("lagging.db");
+    let mut b2 = env.client("b2", "b.db", &env.key, &server2);
+    b2.wait_mounted();
+    wait_status_state(&mut b2, "STEADY");
+    wait_file(&b2.mountpoint, "one.txt", b"one\n");
+    wait_file(&b2.mountpoint, "two.txt", b"two\n");
+    assert_eq!(db_i64(&b2.db, "applied_seq"), Some(seq_after));
+    assert!(
+        b2.proc.log_contains("\"event\":\"epoch_reset\""),
+        "a lagging client must replay from zero\n{}",
+        b2.proc.tail()
+    );
+    assert!(
+        !b2.proc.log_contains("compaction_fast_forward"),
+        "a lagging client must not fast-forward\n{}",
+        b2.proc.tail()
+    );
 }
 
 /// A semantically invalid op is rejected point-to-point: the author gets an

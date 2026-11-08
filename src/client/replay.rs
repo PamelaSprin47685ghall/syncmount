@@ -1199,6 +1199,33 @@ impl ClientDb {
         })
     }
 
+    /// Adopt a compacted server epoch without clearing the replicated tree.
+    ///
+    /// The caller has established that the local tree already equals the
+    /// state the compacted log describes: `applied` is the last sequence of
+    /// that log and `epoch` the epoch that carries it. Buffered writes are
+    /// committed first; they are local intent, and the new watermark must sit
+    /// above the tree those writes produced.
+    pub fn fast_forward(&self, epoch: i64, applied: i64) -> Result<(), DbError> {
+        self.flush_all()?;
+        self.write(|tx| {
+            tx.set_meta_i64(keys::EPOCH, epoch)?;
+            tx.set_meta_i64(keys::APPLIED_SEQ, applied)?;
+            tx.set_meta_i64(keys::COVERED_SEQ, applied)?;
+            tx.set_meta_i64(keys::LAST_CHECKPOINT_AT, now_ns() / 1_000_000_000)?;
+            // The local event cache describes the old epoch; sequence numbers
+            // restart at zero, so those rows no longer name this history.
+            tx.conn().execute("DELETE FROM events", [])?;
+            let pending: i64 = tx.conn().query_row(
+                "SELECT COUNT(*) FROM outbox WHERE state IN ('pending', 'sent')",
+                [],
+                |row| row.get(0),
+            )?;
+            tx.set_meta_i64(keys::DIRTY, i64::from(pending != 0))?;
+            Ok(())
+        })
+    }
+
     /// Clear the replicated tables for a new server epoch.
     ///
     /// The outbox survives: those are local intentions that will be resent
@@ -2228,6 +2255,38 @@ mod tests {
         assert!(!db.has_content().unwrap());
         assert_eq!(db.lookup_by_path("/d").unwrap_err().errno(), Errno::ENOENT);
         // Local intent survives; the tree it referred to does not.
+        assert_eq!(
+            db.outbox_count(super::super::db::OutboxState::Pending).unwrap(),
+            pending
+        );
+    }
+
+    #[test]
+    fn fast_forward_keeps_the_replica_and_moves_the_watermark() {
+        let (_dir, db) = open();
+        let ino = [2u8; 16];
+        let create = EventPayload::CreateDir {
+            ino,
+            mode: 0o755,
+            uid: 0,
+            gid: 0,
+            mtime_ns: 1,
+            file_root: crate::store::sqlite::file_root(ObjectKind::Dir, None, &[]),
+        };
+        db.apply_remote(1, 1, Some([0xb1; 16]), "ok", &create, Some("/d"), None, None)
+            .unwrap();
+        db.create_file(ino, OsStr::new("local"), CreateAttrs::new(0o644, 0, 0))
+            .unwrap();
+        let pending = db.outbox_count(super::super::db::OutboxState::Pending).unwrap();
+
+        db.fast_forward(2, 9).unwrap();
+
+        assert_eq!(db.epoch().unwrap(), 2);
+        assert_eq!(db.applied_seq().unwrap(), 9);
+        assert!(db.lookup_by_path("/d").is_ok());
+        assert!(db.lookup_by_path("/d/local").is_ok());
+        assert!(db.has_content().unwrap());
+        // Local intent survives; it is not part of the adopted watermark.
         assert_eq!(
             db.outbox_count(super::super::db::OutboxState::Pending).unwrap(),
             pending

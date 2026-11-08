@@ -29,8 +29,8 @@ use crate::protocol::frame::{
     CTRL_PREFIX_LEN, ClientId, CtrlPrefix, Limits as FrameLimits, Seq, SessionId,
 };
 use crate::protocol::messages::{
-    ACCEPT_SEALED_LEN, AUTH_SEALED_LEN, Accept, Auth, Hello, MessageError, ResyncMode, Welcome,
-    WelcomeLimits,
+    ACCEPT_SEALED_LEN, AUTH_SEALED_LEN, Accept, Auth, CompactionState, Hello, MessageError,
+    ResyncMode, Welcome, WelcomeLimits,
 };
 use crate::protocol::version::{Caps, Negotiated, ProtoVersion, VersionError, negotiate};
 
@@ -396,6 +396,7 @@ pub struct ServerHandshake {
     ring: PskKeyRing,
     epoch: u64,
     current_seq: Seq,
+    compaction: CompactionState,
     limits: WelcomeLimits,
     caps: Caps,
 }
@@ -406,6 +407,7 @@ impl ServerHandshake {
         ring: PskKeyRing,
         epoch: u64,
         current_seq: Seq,
+        compaction: CompactionState,
         limits: WelcomeLimits,
         caps: Caps,
     ) -> Self {
@@ -413,6 +415,7 @@ impl ServerHandshake {
             ring,
             epoch,
             current_seq,
+            compaction,
             limits,
             caps,
         }
@@ -471,6 +474,9 @@ impl ServerHandshake {
             caps: negotiated.caps,
             epoch: self.epoch,
             current_seq: self.current_seq,
+            compacted_from_seq: self.compaction.from_seq,
+            compacted_epoch: self.compaction.epoch,
+            compacted_seq: self.compaction.seq,
             client_id: hello.client_id,
             resync: input.resync,
             limits: self.limits,
@@ -781,7 +787,14 @@ mod tests {
     }
 
     fn server(ring: PskKeyRing) -> ServerHandshake {
-        ServerHandshake::new(ring, NOW, Seq(7), limits(), Caps::REQUIRED)
+        ServerHandshake::new(
+            ring,
+            NOW,
+            Seq(7),
+            CompactionState::NONE,
+            limits(),
+            Caps::REQUIRED,
+        )
     }
 
     fn seal_hello(client: &ClientHandshake, nonces: &NonceMinter) -> Hello {
@@ -1181,6 +1194,9 @@ mod tests {
             caps: Caps::REQUIRED,
             epoch: NOW,
             current_seq: Seq(7),
+            compacted_from_seq: 0,
+            compacted_epoch: 0,
+            compacted_seq: 0,
             client_id: ClientId::from_bytes([0x11; 16]),
             resync: ResyncMode::None,
             limits: limits(),

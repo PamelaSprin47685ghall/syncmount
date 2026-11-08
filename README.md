@@ -32,7 +32,8 @@ The server derives the same PSK as every client from the master password
 authoritative state, commits the object/name/chunk rows and one event in a
 single SQLite transaction, and only then broadcasts. A semantic rejection
 consumes no sequence and goes back to the author alone. Clients replay events
-in `seq` order; an epoch change clears the replica and replays from zero.
+in `seq` order; an epoch change normally clears the replica and replays from
+zero, except for a drained client that adopts the compaction point.
 
 The client has no backing tree. Every FUSE callback reads a SQLite read transaction or
 runs one local-first `BEGIN IMMEDIATE` transaction that updates the replica and
@@ -321,8 +322,11 @@ A transport disconnect or a `QueueOverflow` kick reconnects in-process from
 process exits with status 10. Any other kick, or a protocol violation,
 unmounts the client and exits 10. There is no offline mode. The outbox
 survives a restart, so pending and previously sent operations are resent. An
-epoch change clears the replica tables and replays the compacted stream from
-zero; pending outbox rows survive that reset too.
+epoch change normally clears the replica tables and replays the compacted
+stream from zero; pending outbox rows survive that reset too. A drained
+client that applied exactly the sequence immediately before the compaction
+is the exception: it keeps its tree and adopts the new epoch without a
+replay (see below).
 
 A client whose replica is behind replays the server's event log from
 `applied_seq + 1`. Writes return `EROFS` during `JOINING`, but reads are
@@ -351,17 +355,33 @@ may stay slow. See [`docs/known-limitations.md`](docs/known-limitations.md).
    `replay_floor` to 1; emit a minimal replayable log for the live tree (one
    `create_*` per object in path order, a `write` carrying the current chunk
    list for non-empty files, a full `setattr`, and a `link` for every extra
-   hard-link name); refresh chunk refcounts and `meta.state_hash`. The object,
-   name and chunk tables are not rewritten, so the state digest is unchanged.
+   hard-link name); record `compacted_from_seq` (the old `seq`),
+   `compacted_epoch` (the new epoch) and `compacted_seq` (the synthetic log's
+   final sequence); refresh chunk refcounts and `meta.state_hash`. The
+   object, name and chunk tables are not rewritten, so the state digest is
+   unchanged.
 3. **Kick.** Every session receives `EpochMismatch` and stops. Clients exit 10.
 
 A crash skips compaction. The next start resumes `epoch` and `seq` from
 `meta`, replays the existing event log, and clients continue from their
-`applied_seq + 1`. A client that sees a different epoch clears its replica,
-resets `applied_seq` to zero and replays the new log from the beginning. The
-first client to reach an empty server (`seq == 0`) with a non-empty,
-never-synced database seeds the cluster from that database; this is the only
-path that uploads a whole local tree.
+`applied_seq + 1`.
+
+`WELCOME` carries the three compaction watermarks. A client whose durable
+epoch is `compacted_epoch - 1` and whose `applied_seq` equals
+`compacted_from_seq` already holds the tree the synthetic log describes: it
+keeps its objects, names and chunks, adopts the new epoch and sets
+`applied_seq` to `compacted_seq`. The server skips the synthetic log for that
+session, so only events written after the compaction are replayed. The
+decision uses the applied watermark and epoch alone; inode ids and mtimes
+differ between replicas, so no state hash is compared.
+
+A client below `compacted_from_seq`, an empty or damaged replica, or a client
+that did not negotiate the capability clears its replica, resets
+`applied_seq` to zero and replays the new log from the beginning. A new
+client with an empty database always takes this path. The first client to
+reach an empty server (`seq == 0`) with a non-empty, never-synced database
+seeds the cluster from that database; this is the only path that uploads a
+whole local tree.
 
 `replay_floor` is the oldest sequence still replayable. Compaction always
 leaves it at 1 because the synthetic log starts at 1.

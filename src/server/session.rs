@@ -28,8 +28,9 @@ use crate::protocol::crypto::{NonceMinter, Opener, PskSalt, Sealer};
 use crate::protocol::handshake::{HelloInput, NonceReplayGuard, ServerHandshake};
 use crate::protocol::messages::{Message, Pong, WelcomeLimits, decode_plain, decode_sealed};
 use crate::protocol::{
-    ErrorMessage, Flags, FrameBuf, FrameDecoder, FrameHeader, FrameRef, KickReason, MsgType,
-    Prefix, PrefixKind, RoutePrefix, Seq, SessionId, StreamId, TrnReason, encode_frame,
+    Caps, ErrorMessage, Flags, FrameBuf, FrameDecoder, FrameHeader, FrameRef, KickReason,
+    MsgType, Prefix, PrefixKind, ResyncMode, RoutePrefix, Seq, SessionId, StreamId, TrnReason,
+    encode_frame,
 };
 use crate::store::sqlite::EventPayload;
 use crate::transport::{AcceptedHttp, BodyStream, MpscSender, PeerId};
@@ -290,28 +291,42 @@ async fn start_hello(
         .map_err(|_| ())?;
     let epoch = context.sequencer.epoch().get();
     let current_seq = context.sequencer.current_seq();
+    let compaction = context.sequencer.compaction();
     let limits = WelcomeLimits {
         max_frame: context.config.limits.effective_cap(),
         credit_bytes: context.config.welcome.credit_bytes,
         session_ttl_s: context.config.welcome.session_ttl_s,
         max_sessions: context.config.welcome.max_sessions,
     };
-    let mut handshake = ServerHandshake::new(ring, epoch, current_seq, limits, server_caps());
+    let mut handshake = ServerHandshake::new(
+        ring,
+        epoch,
+        current_seq,
+        compaction,
+        limits,
+        server_caps(),
+    );
 
     let session_id = random_session_id();
     let server_nonce = random_32();
     let proof_nonce = random_12();
     let accept_nonce = random_12();
+    let fast_forward = hello.caps.contains(Caps::COMPACTION_FASTFORWARD)
+        && compaction.epoch == epoch
+        && compaction.seq <= current_seq.get()
+        && compaction.admits(ctrl.epoch_seen, ctrl.applied_seq.get());
     let input = HelloInput {
         session_id,
         server_nonce,
         proof_nonce,
         accept_nonce,
         server_time: now_secs().max(0) as u64,
-        resync: if ctrl.epoch_seen != epoch || ctrl.applied_seq > current_seq {
-            crate::protocol::ResyncMode::Full
+        resync: if fast_forward {
+            ResyncMode::None
+        } else if ctrl.epoch_seen != epoch || ctrl.applied_seq > current_seq {
+            ResyncMode::Full
         } else {
-            crate::protocol::ResyncMode::None
+            ResyncMode::None
         },
         ctrl: *ctrl,
     };
@@ -370,6 +385,7 @@ async fn start_hello(
         outbox,
         epoch_seen: ctrl.epoch_seen,
         applied_seq: ctrl.applied_seq,
+        fast_forward: hello.caps.contains(Caps::COMPACTION_FASTFORWARD),
     };
     let reply = match context.sequencer.attach(request).await {
         Ok(reply) => reply,

@@ -77,7 +77,8 @@ use crate::protocol::messages::OpClass;
 use crate::server::wire::{self, WireOp};
 use crate::state::{self, Change, Chunk, Errno, Ino, Kind, ObjectPatch, Reject, State, Verdict};
 use crate::store::sqlite::{
-    self, ChunkRef, Db, EventDraft, EventRow, ObjectKind, ReadTx, RejectState, Role, WriteTx, keys,
+    self, ChunkRef, Db, EventDraft, EventRow, MetaValue, ObjectKind, ReadTx, RejectState, Role,
+    WriteTx, keys,
 };
 
 pub use crate::store::sqlite::CompactReport;
@@ -111,6 +112,12 @@ pub struct StoreMeta {
     pub seq: i64,
     /// Oldest sequence number still replayable.
     pub replay_floor: i64,
+    /// `seq` immediately before the last compaction; `0` if none.
+    pub compacted_from_seq: i64,
+    /// Epoch produced by the last compaction; `0` if none.
+    pub compacted_epoch: i64,
+    /// Last sequence of the compacted replay log; `0` if none.
+    pub compacted_seq: i64,
     /// State digest recorded by the last compaction or clean shutdown.
     pub state_hash: [u8; 32],
 }
@@ -1305,8 +1312,20 @@ fn load_meta(db: &Db) -> Result<StoreMeta, String> {
         epoch: read.meta_i64(keys::EPOCH).map_err(err_str)?,
         seq: read.meta_i64(keys::SEQ).map_err(err_str)?,
         replay_floor: read.meta_i64(keys::REPLAY_FLOOR).map_err(err_str)?,
+        compacted_from_seq: optional_i64(&read, keys::COMPACTED_FROM_SEQ)?,
+        compacted_epoch: optional_i64(&read, keys::COMPACTED_EPOCH)?,
+        compacted_seq: optional_i64(&read, keys::COMPACTED_SEQ)?,
         state_hash: read_state_hash(&read)?,
     })
+}
+
+/// Read an integer meta value, treating a missing key as zero.
+fn optional_i64(read: &ReadTx, key: &str) -> Result<i64, String> {
+    match read.get_meta(key).map_err(err_str)? {
+        Some(MetaValue::Integer(value)) => Ok(value),
+        Some(_) => Err(format!("meta.{key} is not an integer")),
+        None => Ok(0),
+    }
 }
 
 /// Read `meta.state_hash` and check its width.
@@ -2065,6 +2084,8 @@ mod tests {
 
         let report = store.compact().await.unwrap();
         assert_eq!(report.epoch, 2);
+        assert_eq!(report.from_seq, 2);
+        assert_eq!(report.compacted_seq, report.events as i64);
         assert!(report.events >= 3);
         assert!(store.events(1, 0, 10).await.is_err());
         let rows = store.events(2, 0, 1_000).await.unwrap();
@@ -2076,6 +2097,9 @@ mod tests {
         assert_eq!(meta.epoch, 2);
         assert_eq!(meta.seq, report.events as i64);
         assert_eq!(meta.replay_floor, 1);
+        assert_eq!(meta.compacted_from_seq, 2);
+        assert_eq!(meta.compacted_epoch, 2);
+        assert_eq!(meta.compacted_seq, report.compacted_seq);
         store.shutdown().await.unwrap();
     }
 
@@ -2104,6 +2128,36 @@ mod tests {
         assert_eq!(store.wire(99).await.unwrap(), Some(vec![7u8; 4]));
         assert_eq!(store.wire(1).await.unwrap(), Some(vec![0xAA, 0xBB]));
         store.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_rolled_back_compaction_leaves_the_watermarks_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, _, path) = start(&dir);
+        assert_eq!(
+            store.commit(request(create_file(1, "/f"), None)).await,
+            applied(1)
+        );
+        store.shutdown().await.unwrap();
+        drop(store);
+
+        let mut db = Db::open(&path, Role::Server).unwrap();
+        {
+            let tx = db.write().unwrap();
+            let report = tx.compact().unwrap();
+            assert_eq!(report.epoch, 2);
+            assert_eq!(report.from_seq, 1);
+            // Dropping without a commit rolls the whole compaction back,
+            // exactly as a crash before the commit would. No client may see
+            // a new epoch or a fast-forward point.
+        }
+        let read = db.read().unwrap();
+        assert_eq!(read.meta_i64(keys::EPOCH).unwrap(), 1);
+        assert_eq!(read.meta_i64(keys::SEQ).unwrap(), 1);
+        assert!(read.get_meta(keys::COMPACTED_FROM_SEQ).unwrap().is_none());
+        assert!(read.get_meta(keys::COMPACTED_EPOCH).unwrap().is_none());
+        assert!(read.get_meta(keys::COMPACTED_SEQ).unwrap().is_none());
+        assert!(read.object_by_path("/f").unwrap().is_some());
     }
 
     #[tokio::test]

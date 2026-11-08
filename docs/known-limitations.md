@@ -133,9 +133,18 @@ replica and the outbox stay in `client.db`; the next start resends pending and
 previously sent operations.
 
 A reconnect above `applied_seq == 0` replays the server's event log from
-`applied_seq + 1`. A different epoch clears the replica tables, resets
-`applied_seq` to zero and replays the compacted log from the beginning;
+`applied_seq + 1`. A different epoch normally clears the replica tables,
+resets `applied_seq` to zero and replays the compacted log from the beginning;
 pending outbox rows survive the reset and are sent after the replay.
+
+The exception is a drained client whose durable epoch is the one before the
+compaction and whose `applied_seq` equals the pre-compaction sequence. Its
+tree already equals the state the compacted log describes, so it keeps the
+replica and adopts the new epoch with `applied_seq` set to the synthetic log's
+final sequence. Only events written after the compaction are replayed. The
+server makes the same decision from the reported watermark, so it does not
+resend the synthetic log. An empty replica, a watermark below the compaction
+point, or a client without the capability takes the full replay.
 
 A JOIN is a pure event-log replay; the v1 join and identity machinery has
 been removed.
@@ -177,7 +186,8 @@ healthy while its local tree is wrong; a full replay is the recovery path.
 
 The server can delay, drop, duplicate or reorder frames. A client detects its
 own sequence gap, reconnects from `applied_seq` and replays the hole; an epoch
-change clears the replica and replays from zero. Neither proves a cross-client
+change clears the replica and replays from zero, unless the client was drained
+at the compaction point and fast-forwards. Neither proves a cross-client
 reorder:
 the server can put B's operation before A's as long as each client's own
 stream stays monotonic.
@@ -195,7 +205,8 @@ stream stays monotonic.
    `replay_floor` to 1; emit a minimal replayable log for the live tree (one
    `create_*` per object in path order, a `write` carrying the current chunk
    list for non-empty files, a full `setattr`, and a `link` for every extra
-   hard-link name); refresh chunk refcounts and `meta.state_hash`. The object,
+   hard-link name); record `compacted_from_seq`, `compacted_epoch` and
+   `compacted_seq`; refresh chunk refcounts and `meta.state_hash`. The object,
    name and chunk tables are not rewritten, so the state digest is unchanged.
 3. **Kick.** Every session receives `EpochMismatch` and stops. Clients exit 10.
 
@@ -204,10 +215,20 @@ A crash skips compaction. The next start resumes `epoch` and `seq` from
 `applied_seq + 1`. Compaction is idempotent for the live tree: running it twice
 produces the same state digest.
 
+`WELCOME` carries the three compaction watermarks. A client at
+`(compacted_epoch - 1, compacted_from_seq)` adopts `compacted_epoch` and
+`compacted_seq` without replaying; the server starts that session after the
+synthetic log. The test uses only the epoch and the applied watermark: inode
+ids and mtimes differ between replicas of the same tree, so no state hash is
+compared. A rolled-back compaction leaves the metadata unchanged, and a
+client that already adopted a watermark it cannot prove falls back to a full
+replay.
+
 `replay_floor` is the oldest sequence still replayable. Compaction always
-leaves it at 1 because the synthetic log starts at 1. There is no incremental
-catch-up beyond the event log: a client that has been offline replays every
-event after its watermark.
+leaves it at 1 because the synthetic log starts at 1. There is no bulk tree
+transfer: a client that has been offline replays every event after its
+watermark, and a client that returns after a compaction either fast-forwards
+from the pre-compaction point or replays the synthetic log from the beginning.
 
 ### 1.8 State hashes are local diagnostics
 
@@ -488,8 +509,10 @@ These are scope exclusions, not bugs and not promises:
 > The server can delay, drop, duplicate or reorder frames; clients detect their
 > own gaps and epoch changes but cannot prove a cross-client reorder. A
 > graceful shutdown drains for at most 30 seconds, compacts the event log,
-> advances the epoch and kicks every client; a client then clears its replica
-> and replays from zero. A crash resumes the previous epoch and sequence.
+> advances the epoch and kicks every client; a drained client then adopts the
+> new epoch without replaying, while a lagging or new client clears its
+> replica and replays from zero. A crash resumes the previous epoch and
+> sequence.
 >
 > The client speaks plain HTTP/1.1 and rejects `https://`. Without a TLS
 > tunnel, the link metadata is visible to the network. The PSK hides paths and

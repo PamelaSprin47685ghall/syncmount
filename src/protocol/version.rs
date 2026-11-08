@@ -142,6 +142,9 @@ impl Caps {
     /// PSK handshake support. Mandatory in v3. Reuses bit 5, which carried
     /// `OP_SIGNATURE` in v1.
     pub const PSK_AUTH: Self = Self(1 << 5);
+    /// The client understands `WELCOME` compaction metadata and can adopt a
+    /// compacted epoch without replaying the synthetic log.
+    pub const COMPACTION_FASTFORWARD: Self = Self(1 << 6);
 
     /// Capabilities without which v3 cannot operate.
     pub const REQUIRED: Self = Self(Self::CHACHA8_POLY1305.0 | Self::PSK_AUTH.0);
@@ -227,11 +230,16 @@ impl fmt::Display for Caps {
             sep(f)?;
             f.write_str("PSK_AUTH")?;
         }
+        if self.contains(Self::COMPACTION_FASTFORWARD) {
+            sep(f)?;
+            f.write_str("COMPACTION_FASTFORWARD")?;
+        }
         let unknown = self
             .without(Self::REQUIRED)
             .without(Self::ZSTD)
             .without(Self::BATCH_BROADCAST)
-            .without(Self::SESSION_KEYS);
+            .without(Self::SESSION_KEYS)
+            .without(Self::COMPACTION_FASTFORWARD);
         if !unknown.is_empty() {
             sep(f)?;
             write!(f, "0x{:08x}", unknown.0)?;

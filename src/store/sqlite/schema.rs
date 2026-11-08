@@ -47,6 +47,14 @@ pub mod keys {
     pub const REPLAY_FLOOR: &str = "replay_floor";
     /// Server: Unix seconds of the last compaction.
     pub const COMPACTED_AT: &str = "compacted_at";
+    /// Server: `seq` immediately before the last compaction. A client whose
+    /// `applied_seq` equals this value already holds the compacted state.
+    pub const COMPACTED_FROM_SEQ: &str = "compacted_from_seq";
+    /// Server: epoch produced by the last compaction.
+    pub const COMPACTED_EPOCH: &str = "compacted_epoch";
+    /// Server: last sequence of the compacted replay log. A fast-forwarding
+    /// client adopts this as its new `applied_seq`.
+    pub const COMPACTED_SEQ: &str = "compacted_seq";
     /// Server: 1 once the initial snapshot has been imported.
     pub const BOOTSTRAP_DONE: &str = "bootstrap_done";
     /// BLAKE3 state digest, see [`super::hash::state_hash`].

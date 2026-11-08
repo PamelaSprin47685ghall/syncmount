@@ -33,11 +33,12 @@ use crate::protocol::handshake::{
     CLIENT_HANDSHAKE_TIMEOUT_MS, ClientHandshake, HandshakeError,
 };
 use crate::protocol::messages::{
-    Error as ErrorMessage, FieldMap, Kick, OpClass, Ping, Pong, SyncEnd, WcpWriter, Welcome, fid,
+    CompactionState, Error as ErrorMessage, FieldMap, Kick, OpClass, Ping, Pong, SyncEnd,
+    WcpWriter, Welcome, fid,
 };
 use crate::protocol::{
-    CtrlPrefix, Flags, FrameBuf, FrameDecoder, FrameEncoder, FrameHeader, FrameRef, Limits,
-    MsgType, OpId, Prefix, RoutePrefix, Seq, SessionId, StreamId,
+    Caps, CtrlPrefix, Flags, FrameBuf, FrameDecoder, FrameEncoder, FrameHeader, FrameRef,
+    Limits, MsgType, OpId, Prefix, RoutePrefix, Seq, SessionId, StreamId,
 };
 use crate::store::sqlite::{ChunkRef, EventKind, EventPayload, RejectState};
 use crate::transport::{DialOptions, Endpoint, EventsStream, HttpTransport, RpcStream, Transport};
@@ -168,6 +169,43 @@ impl ReplayProgress {
     }
 }
 
+/// The watermark a replica may adopt instead of replaying a compacted log.
+///
+/// The test is deliberately local: the durable epoch and applied watermark,
+/// plus the tree having content when the compaction point is non-zero. It
+/// never compares state hashes, because inode ids and mtimes differ between
+/// replicas of the same tree.
+fn fast_forward_target(
+    welcome: &Welcome,
+    local_epoch: i64,
+    local_applied: i64,
+    local_content: bool,
+) -> Option<u64> {
+    let compaction = CompactionState {
+        from_seq: welcome.compacted_from_seq,
+        epoch: welcome.compacted_epoch,
+        seq: welcome.compacted_seq,
+    };
+    if !welcome.caps.contains(Caps::COMPACTION_FASTFORWARD)
+        || compaction.epoch != welcome.epoch
+        || compaction.seq > welcome.current_seq.get()
+    {
+        return None;
+    }
+    if !compaction.admits(
+        u64::try_from(local_epoch).ok()?,
+        u64::try_from(local_applied).ok()?,
+    ) {
+        return None;
+    }
+    // An empty tree is only trustworthy when the compaction point was zero;
+    // any later watermark means the tree lost content, so replay repairs it.
+    if !local_content && compaction.from_seq != 0 {
+        return None;
+    }
+    Some(compaction.seq)
+}
+
 /// Run one session until it disconnects or `shutdown` resolves.
 pub async fn run(
     store: Arc<ClientDb>,
@@ -272,7 +310,39 @@ pub async fn run(
     // watermark. Only the former seeds.
     let never_synced = local_applied == 0 && local_epoch == 1;
     let seed = current_seq == 0 && local_content && never_synced;
-    if !seed && (local_epoch != epoch as i64 || local_applied > current_seq as i64) {
+    let fast_forward = if seed {
+        None
+    } else {
+        fast_forward_target(&welcome, local_epoch, local_applied, local_content)
+    };
+    let mut fast_forwarded = false;
+    if let Some(applied) = fast_forward {
+        if let (Ok(epoch), Ok(applied)) = (i64::try_from(epoch), i64::try_from(applied)) {
+            match store.fast_forward(epoch, applied) {
+                Ok(()) => {
+                    fast_forwarded = true;
+                    tracing::info!(
+                        event = "compaction_fast_forward",
+                        epoch,
+                        from_seq = welcome.compacted_from_seq,
+                        applied,
+                        "compaction fast-forward"
+                    );
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        event = "compaction_fast_forward",
+                        error = %error,
+                        "cannot adopt the compacted epoch; replaying instead"
+                    );
+                }
+            }
+        }
+    }
+    if !seed
+        && !fast_forwarded
+        && (local_epoch != epoch as i64 || local_applied > current_seq as i64)
+    {
         if let Err(error) = store.reset_epoch(epoch as i64) {
             tracing::error!(event = "epoch_reset", error = %error, "cannot reset the replica");
             return SessionExit {
@@ -280,6 +350,13 @@ pub async fn run(
                 reason: "epoch reset",
             };
         }
+        tracing::info!(
+            event = "epoch_reset",
+            epoch,
+            local_epoch,
+            local_applied,
+            "replaying the compacted log from zero"
+        );
     }
 
     if seed {
@@ -516,7 +593,8 @@ async fn handshake(
         crate::protocol::frame::ClientId::from_bytes(client_id),
         rand::random::<[u8; 32]>(),
         crate::protocol::version::ProtoVersion::CURRENT,
-        crate::protocol::version::Caps::REQUIRED,
+        crate::protocol::version::Caps::REQUIRED
+            .union(crate::protocol::version::Caps::COMPACTION_FASTFORWARD),
         now_ms,
     );
     let ctrl = CtrlPrefix::new(
@@ -2002,6 +2080,75 @@ mod tests {
         assert_eq!(decoded.applied_seq, Seq(42));
         assert_eq!(decoded.epoch_seen, 7);
         assert!(decoded.validate().is_ok());
+    }
+
+    fn compacted_welcome() -> Welcome {
+        Welcome {
+            proto: crate::protocol::version::ProtoVersion::CURRENT,
+            caps: Caps::REQUIRED.union(Caps::COMPACTION_FASTFORWARD),
+            epoch: 8,
+            current_seq: Seq(20),
+            compacted_from_seq: 300,
+            compacted_epoch: 8,
+            compacted_seq: 20,
+            client_id: crate::protocol::frame::ClientId::from_bytes([0; 16]),
+            resync: crate::protocol::ResyncMode::None,
+            limits: crate::protocol::WelcomeLimits {
+                max_frame: 131_072,
+                credit_bytes: 1 << 20,
+                session_ttl_s: 60,
+                max_sessions: 8,
+            },
+            server_time: 0,
+            server_nonce: [0; 32],
+            session_id: SessionId(1),
+        }
+    }
+
+    #[test]
+    fn fast_forward_adopts_the_compacted_watermark() {
+        assert_eq!(fast_forward_target(&compacted_welcome(), 7, 300, true), Some(20));
+    }
+
+    #[test]
+    fn fast_forward_rejects_a_watermark_off_the_compaction_point() {
+        // A lagging replica replays: the synthetic log starts at 1, so its
+        // watermark cannot be trusted as the pre-compaction state.
+        assert_eq!(fast_forward_target(&compacted_welcome(), 7, 299, true), None);
+        // A watermark past the compaction point names a state the compacted
+        // log cannot describe; this is corruption, not a fast-forward.
+        assert_eq!(fast_forward_target(&compacted_welcome(), 7, 301, true), None);
+    }
+
+    #[test]
+    fn fast_forward_requires_the_epoch_before_the_compaction() {
+        assert_eq!(fast_forward_target(&compacted_welcome(), 6, 300, true), None);
+        assert_eq!(fast_forward_target(&compacted_welcome(), 8, 300, true), None);
+    }
+
+    #[test]
+    fn fast_forward_rejects_an_empty_tree_after_content_existed() {
+        assert_eq!(fast_forward_target(&compacted_welcome(), 7, 300, false), None);
+
+        let mut empty = compacted_welcome();
+        empty.compacted_from_seq = 0;
+        empty.compacted_seq = 1;
+        empty.current_seq = Seq(1);
+        assert_eq!(fast_forward_target(&empty, 7, 0, false), Some(1));
+    }
+
+    #[test]
+    fn fast_forward_requires_the_client_capability() {
+        let mut welcome = compacted_welcome();
+        welcome.caps = Caps::REQUIRED;
+        assert_eq!(fast_forward_target(&welcome, 7, 300, true), None);
+    }
+
+    #[test]
+    fn fast_forward_rejects_a_watermark_beyond_the_current_sequence() {
+        let mut welcome = compacted_welcome();
+        welcome.compacted_seq = 21;
+        assert_eq!(fast_forward_target(&welcome, 7, 300, true), None);
     }
 
     #[test]

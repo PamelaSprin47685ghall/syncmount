@@ -20,7 +20,9 @@ use crate::protocol::{
 use crate::server::Server;
 use crate::server::config::ServeConfig;
 use crate::server::online::Outbox;
-use crate::server::sequencer::{AttachRequest, DetachCause, ReplayStep, Sequencer, now_secs};
+use crate::server::sequencer::{
+    AttachReply, AttachRequest, DetachCause, ReplayStep, Sequencer, now_secs,
+};
 use crate::server::store::{CommitRequest, StoreHandle};
 use crate::server::wire::WireOp;
 use crate::transport::{DialOptions, Endpoint, HttpTransport, PeerId};
@@ -75,6 +77,29 @@ impl Harness {
         nonce: u64,
         applied: Seq,
     ) -> (SessionId, u64, mpsc::Receiver<Bytes>, mpsc::Receiver<Bytes>) {
+        self.attach_as(nonce, applied, self.epoch, false).await
+    }
+
+    async fn attach_as(
+        &self,
+        nonce: u64,
+        applied: Seq,
+        epoch_seen: u64,
+        fast_forward: bool,
+    ) -> (SessionId, u64, mpsc::Receiver<Bytes>, mpsc::Receiver<Bytes>) {
+        let (session_id, reply, data, ctrl) = self
+            .attach_reply(nonce, applied, epoch_seen, fast_forward)
+            .await;
+        (session_id, reply.generation, data, ctrl)
+    }
+
+    async fn attach_reply(
+        &self,
+        nonce: u64,
+        applied: Seq,
+        epoch_seen: u64,
+        fast_forward: bool,
+    ) -> (SessionId, AttachReply, mpsc::Receiver<Bytes>, mpsc::Receiver<Bytes>) {
         let (outbox, data, ctrl) = Outbox::new(&self.config.outbox);
         let session_id = SessionId(rand::random::<u128>().max(1));
         let reply = self
@@ -84,12 +109,13 @@ impl Harness {
                 nonce,
                 peer: PeerId::from_serial(nonce),
                 outbox,
-                epoch_seen: self.epoch,
+                epoch_seen,
                 applied_seq: applied,
+                fast_forward,
             })
             .await
             .unwrap();
-        (session_id, reply.generation, data, ctrl)
+        (session_id, reply, data, ctrl)
     }
 
     async fn stop(self) -> tempfile::TempDir {
@@ -437,6 +463,100 @@ async fn compaction_bumps_epoch_and_keeps_the_state() {
     assert_eq!(read.meta_i64("epoch").unwrap(), report.epoch);
     drop(read);
     drop(db);
+
+    let _ = harness.stop().await;
+}
+
+#[tokio::test]
+async fn attach_fast_forwards_the_drained_replica() {
+    let harness = Harness::start().await;
+    let (author, _, mut data, _) = harness.attach(1, Seq::UNSEQUENCED).await;
+    harness
+        .sequencer
+        .ordered(author, request(create_op([1; 16], "/a")))
+        .await
+        .unwrap();
+    let _ = recv_seq(&mut data).await;
+
+    let report = harness.sequencer.compact().await.unwrap();
+    assert_eq!(report.from_seq, 1);
+    let compacted = Seq(report.compacted_seq as u64);
+
+    // The drained replica applied exactly the pre-compaction sequence. The
+    // server starts replay after the synthetic log it already represents.
+    let (_, reply, _, _) = harness
+        .attach_reply(2, Seq(1), harness.epoch, true)
+        .await;
+    assert_eq!(reply.replay_from, Seq(compacted.get() + 1));
+    assert_eq!(reply.current_seq, compacted);
+
+    // A lagging replica must replay the whole synthetic log.
+    let (_, reply, _, _) = harness
+        .attach_reply(3, Seq(0), harness.epoch, true)
+        .await;
+    assert_eq!(reply.replay_from, Seq(1));
+
+    // A client that did not negotiate the capability is never fast-forwarded,
+    // even when its watermark happens to match.
+    let (_, reply, _, _) = harness
+        .attach_reply(4, Seq(1), harness.epoch, false)
+        .await;
+    assert_eq!(reply.replay_from, Seq(1));
+
+    // A replica already at the compacted watermark in the new epoch catches
+    // up from its own sequence.
+    let (_, reply, _, _) = harness
+        .attach_reply(5, compacted, harness.epoch + 1, true)
+        .await;
+    assert_eq!(reply.replay_from, Seq(compacted.get() + 1));
+
+    // Events written after the compaction are still replayed: the
+    // fast-forward skips only the synthetic log, not newer history.
+    let (writer, _, mut writer_data, _) = harness
+        .attach_reply(6, compacted, harness.epoch + 1, true)
+        .await;
+    harness
+        .sequencer
+        .ordered(writer, request(create_op([2; 16], "/b")))
+        .await
+        .unwrap();
+    let _ = recv_seq(&mut writer_data).await;
+    let (_, reply, _, _) = harness
+        .attach_reply(7, Seq(1), harness.epoch, true)
+        .await;
+    assert!(reply.current_seq > compacted);
+    assert_eq!(reply.replay_from, Seq(compacted.get() + 1));
+
+    let _ = harness.stop().await;
+}
+
+#[tokio::test]
+async fn a_fast_forwarded_session_counts_as_drained() {
+    let harness = Harness::start().await;
+    let (author, _, mut data, _) = harness.attach(1, Seq::UNSEQUENCED).await;
+    harness
+        .sequencer
+        .ordered(author, request(create_op([1; 16], "/a")))
+        .await
+        .unwrap();
+    let _ = recv_seq(&mut data).await;
+
+    let report = harness.sequencer.compact().await.unwrap();
+    let compacted = Seq(report.compacted_seq as u64);
+    let (_, reply, _, _) = harness
+        .attach_reply(2, Seq(1), harness.epoch, true)
+        .await;
+    assert_eq!(reply.replay_from, Seq(compacted.get() + 1));
+
+    // The adopted watermark is the session's watermark, so drain sees a
+    // caught-up client instead of waiting for a replay that never starts.
+    let drain = harness
+        .sequencer
+        .drain(Duration::from_millis(200))
+        .await
+        .unwrap();
+    assert!(!drain.timed_out, "fast-forwarded session must not delay drain");
+    assert_eq!(drain.applied_min, compacted);
 
     let _ = harness.stop().await;
 }
