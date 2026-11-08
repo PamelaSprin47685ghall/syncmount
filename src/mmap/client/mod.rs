@@ -39,6 +39,7 @@ mod tests;
 use std::collections::HashMap;
 use std::fmt;
 use std::net::{SocketAddr, ToSocketAddrs};
+#[cfg(feature = "fuse")]
 use std::path::Path;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
