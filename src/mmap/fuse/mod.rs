@@ -5,7 +5,9 @@
 //!
 //! * `open`/`create` return `FOPEN_KEEP_CACHE`, never `FOPEN_DIRECT_IO`, so
 //!   the kernel page cache and `mmap(MAP_SHARED)` work.
-//! * `flush`/`release` never upload. Only `fsync`/`fsyncdir` commit a batch.
+//! * `flush` never uploads; it may run many times. The final `release` of a
+//!   dirty version commits the directory chain, and `fsync`/`fsyncdir` stay
+//!   the explicit checkin points.
 
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;

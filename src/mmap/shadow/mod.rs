@@ -10,16 +10,18 @@
 //!
 //! Checkout replaces one directory's direct entries; upload commits one
 //! directory's full manifest. Child directory contents are never recursive.
-//! `open` may fetch a directory's bodies once; `fsync` uploads the directory's
-//! frozen dirty files and never touches a clean file's bytes.
+//! `open` may fetch a directory's bodies once; the final close or an explicit
+//! `fsync` uploads the directory's frozen dirty files and never touches a
+//! clean file's bytes.
 //!
 //! # Versioned inodes
 //!
 //! A file inode has one or more content versions. A remote refresh creates a
 //! new version and a new kernel inode; old descriptors and mappings keep the
 //! old version. A local write stays on the current version and inode, so page
-//! cache and `mmap` remain coherent. `release` only drops a reference;
-//! `forget` and the current-version check decide when an object is collected.
+//! cache and `mmap` remain coherent. The final `release` drops the reference
+//! and commits a dirty close; `forget` and the current-version check decide
+//! when an object is collected.
 
 mod checkout;
 mod content;

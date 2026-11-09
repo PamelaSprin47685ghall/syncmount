@@ -684,8 +684,8 @@ impl ShadowDb {
         })
     }
 
-    /// Adjust a directory's open-handle count.
-    pub fn add_dir_handle(&self, ino: Ino, delta: i64) -> Result<(), ShadowError> {
+    /// Adjust a directory's open-handle count and return the new count.
+    pub fn add_dir_handle(&self, ino: Ino, delta: i64) -> Result<u64, ShadowError> {
         self.write(|tx| {
             tx.conn().execute(
                 "UPDATE shadow_dirs
@@ -693,7 +693,16 @@ impl ShadowDb {
                  WHERE dir_ino = ?2",
                 params![delta, ino.as_slice()],
             )?;
-            Ok(())
+            let handles: i64 = tx
+                .conn()
+                .query_row(
+                    "SELECT dir_handles FROM shadow_dirs WHERE dir_ino = ?1",
+                    params![ino.as_slice()],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .unwrap_or(0);
+            u64::try_from(handles).map_err(|_| ShadowError::Invalid("negative dir handles"))
         })
     }
 

@@ -46,7 +46,7 @@ and the next session resends them.
 
 ## Status
 
-v1.1.1, protocol 3.0, payload v3. The 1.0 wire protocol, schema and
+v1.1.2, protocol 3.0, payload v3. The 1.0 wire protocol, schema and
 `/private` and `/public` behaviour are unchanged; 1.1 adds the independent
 `--mmap` namespaces (`/private-mm`, `/public-mm`) served by `mm-server` and
 mounted by `mm-client` over a local shadow tree. 1.0 and 1.1 can share a host
@@ -276,8 +276,13 @@ entries of one directory. A write stays local. `fsync` acquires the
 per-directory upload lock, asks for rsync signatures, sends COPY/LITERAL
 instructions and commits the whole directory batch in one server transaction.
 A `409` (base changed) or `423` (lock held, lost or expired) maps to `EAGAIN`,
-keeps the dirty generations, and is retried on the next `fsync`; `flush` and
-`close` do not upload.
+keeps the dirty generations, and is retried on the next `fsync` or close.
+`flush` does not upload. The final `close` of a dirty inode commits its
+directory chain from the root down to the owning directory, and commits the
+owning directory last; a conflict or transport error there is logged and the
+dirty generations survive for the next close or `fsync`. With a live `mmap`,
+the kernel delays the final release until the last mapping is gone; an
+explicit `fsync` can commit new writes in between.
 
 Limitations specific to the mm path:
 
@@ -292,7 +297,8 @@ Limitations specific to the mm path:
   component and 4096-byte path limits of 1.0 still apply.
 - **No xattrs.** `setxattr` and `removexattr` return `EOPNOTSUPP`.
 - **Conflicts are retried later.** A `409` or `423` is not retried inside the
-  failing call. The dirty state survives and the next `fsync` retries it.
+  failing call. The dirty state survives and the next `fsync` or close
+  retries it.
 - **1.0 is untouched.** `/private`, `/public`, their units, databases and
   options keep their 1.0 behaviour; the mm path is opt-in by command name.
 
@@ -671,7 +677,7 @@ CI asserts a size below 15 MiB and no `NEEDED` entries. See
 
 ```bash
 ./install.sh                      # latest release into ~/.local/bin
-./install.sh --version 1.1.1 --prefix /usr/local
+./install.sh --version 1.1.2 --prefix /usr/local
 ```
 
 The script downloads the tarball, verifies its sha256, installs the binary and

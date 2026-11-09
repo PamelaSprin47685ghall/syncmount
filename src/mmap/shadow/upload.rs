@@ -41,23 +41,12 @@ struct SnapshotFile {
 impl Shadow {
     /// Flush one file's directory to the server.
     ///
-    /// `flush` and `release` never call this. A successful return means the
-    /// server committed the batch and the local base/uploaded generation was
-    /// durably recorded.
+    /// The final `release` calls the same body; `flush` never does. A
+    /// successful return means the server committed the batch and the local
+    /// base/uploaded generation was durably recorded.
     pub fn fsync(&self, fuse_ino: u64, fh: Option<u64>) -> Result<(), ShadowError> {
         let (dir_ino, _ino, _version) = self.resolve_handle(fuse_ino, fh)?;
-        self.ensure_dir(dir_ino, false)?;
-        let dir = self.db.shadow_dir(dir_ino)?.ok_or(ShadowError::NotFound)?;
-        if dir.clean() {
-            return Ok(());
-        }
-        let slot = self.slot(dir_ino);
-        let _upload = super::lock(&slot.upload);
-        let dir = self.db.shadow_dir(dir_ino)?.ok_or(ShadowError::NotFound)?;
-        if dir.clean() {
-            return Ok(());
-        }
-        self.flush_dir_locked(dir)
+        self.checkin_dir(dir_ino)
     }
 
     /// Flush one directory even when no individual file triggered it.
@@ -66,13 +55,20 @@ impl Shadow {
         if row.kind != EntryKind::Dir {
             return Err(ShadowError::NotDir);
         }
-        let dir = self.db.shadow_dir(row.ino)?.ok_or(ShadowError::NotFound)?;
+        self.checkin_dir(row.ino)
+    }
+
+    /// Commit one directory's current batch. This is the shared body of
+    /// `fsync`, `fsyncdir` and the final close.
+    pub(super) fn checkin_dir(&self, dir_ino: Ino) -> Result<(), ShadowError> {
+        self.ensure_dir(dir_ino, false)?;
+        let dir = self.db.shadow_dir(dir_ino)?.ok_or(ShadowError::NotFound)?;
         if dir.clean() {
             return Ok(());
         }
-        let slot = self.slot(row.ino);
+        let slot = self.slot(dir_ino);
         let _upload = super::lock(&slot.upload);
-        let dir = self.db.shadow_dir(row.ino)?.ok_or(ShadowError::NotFound)?;
+        let dir = self.db.shadow_dir(dir_ino)?.ok_or(ShadowError::NotFound)?;
         if dir.clean() {
             return Ok(());
         }

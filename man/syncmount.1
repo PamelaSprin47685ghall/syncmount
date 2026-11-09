@@ -1,4 +1,4 @@
-.TH SYNCMOUNT 1 "2026-11-08" "syncmount 1.1.1" "User Commands"
+.TH SYNCMOUNT 1 "2026-11-08" "syncmount 1.1.2" "User Commands"
 .SH NAME
 syncmount \- server-authoritative, eventually consistent FUSE filesystem
 .SH SYNOPSIS
@@ -899,9 +899,20 @@ with the dirty state intact; the next
 .B fsync
 retries it.
 .B flush
-and
+does not upload.
+The final
 .B close
-do not upload.
+of a dirty inode commits its directory chain, from the root down to the
+owning directory, and commits the owning directory last; a conflict or
+transport error is logged and the dirty generations survive for the next
+close or
+.BR fsync .
+With a live
+.BR mmap ,
+the kernel delays the final release until the last mapping is gone; an
+explicit
+.B fsync
+can commit new writes in between.
 Hard links are refused with
 .BR EOPNOTSUPP .
 A rename between directories returns

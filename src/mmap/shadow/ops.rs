@@ -181,10 +181,17 @@ impl Shadow {
     }
 
     /// `releasedir`.
+    ///
+    /// The last directory handle commits a dirty directory, the same way the
+    /// last file handle does. Errors are logged and leave the dirty
+    /// generations in place.
     pub fn releasedir(&self, fuse_ino: u64) -> Result<(), ShadowError> {
         let row = self.row(fuse_ino)?;
         if row.kind == EntryKind::Dir {
-            self.db.add_dir_handle(row.ino, -1)?;
+            let handles = self.db.add_dir_handle(row.ino, -1)?;
+            if handles == 0 && self.db.shadow_dir(row.ino)?.is_some_and(|dir| !dir.clean()) {
+                self.commit_close(row.ino);
+            }
         }
         Ok(())
     }
@@ -858,8 +865,8 @@ impl Shadow {
 
     /// `flush`: persist metadata and release this owner's POSIX locks.
     ///
-    /// No upload happens here. `close` must not publish a half-finished
-    /// directory.
+    /// The kernel may call this several times before the final `release`, so
+    /// no upload happens here. Only the last close commits.
     pub fn flush(&self, fh: u64, lock_owner: Option<u64>) -> Result<(), ShadowError> {
         let handle = self.handle(fh).ok_or(ShadowError::NotFound)?;
         if let Some(owner) = lock_owner {
@@ -869,13 +876,82 @@ impl Shadow {
         Ok(())
     }
 
-    /// `release`: drop one reference. Nothing is uploaded.
+    /// `release`: drop one reference, then commit the final dirty close.
+    ///
+    /// The last reference to a dirty version commits the directory chain from
+    /// the root down to the owning directory. A close reply is not a reliable
+    /// error channel: a conflict or a transport error is logged, the dirty
+    /// generations stay, and the next close or `fsync` retries.
     pub fn release(&self, fh: u64) -> Result<(), ShadowError> {
         let Some(handle) = self.remove_handle(fh) else {
             return Ok(());
         };
-        self.db.add_open_ref(handle.ino, handle.version, -1)?;
+        let refs = match self.db.add_open_ref(handle.ino, handle.version, -1) {
+            Ok(refs) => refs,
+            Err(error) => {
+                tracing::warn!(
+                    event = "close_checkin",
+                    %error,
+                    "cannot drop an open reference"
+                );
+                return Ok(());
+            }
+        };
+        if refs == 0 && self.version_dirty(handle.ino, handle.version) {
+            self.commit_close(handle.dir_ino);
+        }
         self.collect_garbage().ok();
+        Ok(())
+    }
+
+    /// True while one version has local bytes the server has not committed.
+    fn version_dirty(&self, ino: Ino, version: u64) -> bool {
+        self.db
+            .shadow_version(ino, version)
+            .ok()
+            .flatten()
+            .is_some_and(|version| {
+                version.dirty_gen > 0
+                    || matches!(version.state, VersionState::Dirty | VersionState::Uploading)
+            })
+    }
+
+    /// Commit the chain that owns one closing entry, from the root down.
+    ///
+    /// A locally created child directory has no server row until its parent
+    /// commits, so the ancestor batch must land before the child batch. Errors
+    /// stay local: the dirty generations survive for the next close or fsync.
+    fn commit_close(&self, dir_ino: Ino) {
+        if let Err(error) = self.commit_close_chain(dir_ino) {
+            tracing::warn!(
+                event = "close_checkin",
+                %error,
+                "close upload failed; dirty generations stay for the next fsync"
+            );
+        }
+    }
+
+    fn commit_close_chain(&self, dir_ino: Ino) -> Result<(), ShadowError> {
+        let mut chain = Vec::new();
+        let mut current = Some(dir_ino);
+        while let Some(ino) = current {
+            chain.push(ino);
+            if ino == ROOT_INO {
+                break;
+            }
+            let dir = self.db.shadow_dir(ino)?.ok_or(ShadowError::NotFound)?;
+            current = Some(self.parent_ino(&dir)?);
+        }
+        chain.reverse();
+        for ino in chain {
+            let Some(dir) = self.db.shadow_dir(ino)? else {
+                continue;
+            };
+            if dir.clean() {
+                continue;
+            }
+            self.checkin_dir(ino)?;
+        }
         Ok(())
     }
 

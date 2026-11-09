@@ -147,8 +147,8 @@ fn mmap_shared_write_visible_and_fsync_checks_in() {
 
 #[test]
 #[serial]
-fn munmap_and_close_do_not_checkin() {
-    if skip_without_fuse("munmap_and_close_do_not_checkin") {
+fn close_checks_in_without_fsync() {
+    if skip_without_fuse("close_checks_in_without_fsync") {
         return;
     }
     let env = MmapEnv::new();
@@ -157,40 +157,23 @@ fn munmap_and_close_do_not_checkin() {
     a.wait_mounted();
     a.wait_steady();
 
-    let baseline = a.status_u64(&["applied_seq"]);
     let payload = pattern(64 << 10, 0xc105e);
     let relative = "closed.bin";
-    // `fs::write` closes the file descriptor and every mapping is dropped
-    // when the call returns. No explicit fsync happens here.
+    // `fs::write` closes the file descriptor. No mapping stays alive, so the
+    // kernel delivers the final release and close commits the batch.
     let path = write_at(&a.mountpoint, relative, &payload);
     assert_eq!(fs::read(&path).unwrap(), payload);
-
-    // Give an accidental asynchronous checkin time to show up, and give the
-    // status writer (a 5 s interval) time to publish the unchanged counter.
-    thread::sleep(Duration::from_secs(6));
-    if let Some(base) = baseline {
-        assert_eq!(
-            a.status_u64(&["applied_seq"]),
-            Some(base),
-            "close without fsync must not advance applied_seq"
-        );
-    }
 
     let mut b = env.client("/private-mm", "close-b", true);
     b.wait_mounted();
     b.wait_steady();
-    thread::sleep(Duration::from_millis(1500));
-    assert!(
-        !b.mountpoint.join(relative).exists(),
-        "close without fsync must not check in: client B sees an empty tree"
-    );
-
-    // The explicit checkin is fsync: only now may the file cross the wire.
-    fsync_path(&path);
-    wait_until("client B sees the file only after fsync", READY, || {
+    wait_until("client B sees the file after close", READY, || {
         Ok(b.mountpoint.join(relative).exists())
     });
     assert_eq!(fs::read(b.mountpoint.join(relative)).unwrap(), payload);
+
+    // An explicit fsync after the close is idempotent.
+    fsync_path(&path);
 
     let _ = b.stop_graceful();
     let _ = a.stop_graceful();

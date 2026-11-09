@@ -308,18 +308,31 @@ impl Shadow {
         }
 
         // Removed clean entries must disappear from the shadow directory too.
+        // A locally created child directory has no `shadow_versions` row: its
+        // structure commits with this directory's batch, and only then does
+        // `publish_committed` clear `local_only`. Its version is always 0, so
+        // the dirty-version test alone would classify it as clean and tombstone
+        // the directory before the manifest is built.
         let mut removed = Vec::new();
         for (name, local) in &local_by_name {
             if server_inos.contains(&local.ino) {
                 continue;
             }
-            let is_dirty = self
-                .db
-                .shadow_version(local.ino, local.version)?
-                .is_some_and(|version| {
-                    version.dirty_gen > 0
-                        || matches!(version.state, VersionState::Dirty | VersionState::Uploading)
-                });
+            let is_dirty = if local.kind == EntryKind::Dir {
+                self.db
+                    .shadow_dir(local.ino)?
+                    .is_some_and(|dir| dir.local_only)
+            } else {
+                self.db
+                    .shadow_version(local.ino, local.version)?
+                    .is_some_and(|version| {
+                        version.dirty_gen > 0
+                            || matches!(
+                                version.state,
+                                VersionState::Dirty | VersionState::Uploading
+                            )
+                    })
+            };
             if !is_dirty {
                 let _ = self.layout.unlink_entry(&dir_ino, name);
                 removed.push((name.clone(), local.clone()));

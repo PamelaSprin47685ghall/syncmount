@@ -8,7 +8,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::io::Cursor;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier, Mutex};
 use std::time::Duration;
 
@@ -53,6 +53,9 @@ struct MockRemote {
     fail: Mutex<Option<(FailPoint, RemoteError)>>,
     checkouts: AtomicUsize,
     statuses: AtomicUsize,
+    /// Answer a stale `if_base` with a full snapshot instead of
+    /// `BaseChanged`, as the wire server does.
+    snapshot_when_stale: AtomicBool,
 }
 
 struct MockState {
@@ -102,7 +105,12 @@ impl MockRemote {
             fail: Mutex::new(None),
             checkouts: AtomicUsize::new(0),
             statuses: AtomicUsize::new(0),
+            snapshot_when_stale: AtomicBool::new(false),
         })
+    }
+
+    fn set_snapshot_when_stale(&self, enabled: bool) {
+        self.snapshot_when_stale.store(enabled, Ordering::Relaxed);
     }
 
     fn add_dir(&self, ino: Ino, parent: Ino, name: &str, attrs: DirAttrs) {
@@ -157,6 +165,16 @@ impl MockRemote {
         let dir = state.dirs.get(&dir)?;
         let entry = dir.entries.get(name)?;
         dir.bodies.get(&entry.ino).cloned()
+    }
+
+    /// Change one directory's attributes without touching its entries.
+    fn touch_dir(&self, ino: Ino) {
+        let mut state = self.state.lock().unwrap();
+        {
+            let dir = state.dirs.get_mut(&ino).unwrap();
+            dir.attrs.mtime_ns = dir.attrs.mtime_ns.saturating_add(1);
+        }
+        recompute(&mut state, ino);
     }
 
     fn base(&self, dir: Ino) -> MmBase {
@@ -250,15 +268,18 @@ impl MmRemote for MockRemote {
             .ok_or(RemoteError::NotFound)?;
         if let Some(if_base) = request.if_base {
             if if_base != dir.base {
-                return Err(RemoteError::BaseChanged {
-                    current: dir.base,
+                if !self.snapshot_when_stale.load(Ordering::Relaxed) {
+                    return Err(RemoteError::BaseChanged {
+                        current: dir.base,
+                        snapshot_seq: MmSeq::new(state.snapshot_seq),
+                    });
+                }
+            } else {
+                return Ok(CheckoutOutcome::NotModified {
+                    base: dir.base,
                     snapshot_seq: MmSeq::new(state.snapshot_seq),
                 });
             }
-            return Ok(CheckoutOutcome::NotModified {
-                base: dir.base,
-                snapshot_seq: MmSeq::new(state.snapshot_seq),
-            });
         }
         let entries: Vec<CheckoutEntry> = dir
             .entries
@@ -890,6 +911,88 @@ fn mkdir_rmdir_and_symlink_stay_local_until_fsync() {
 }
 
 #[test]
+fn fsync_parent_snapshot_keeps_a_local_only_child_directory() {
+    let mock = MockRemote::new();
+    // A long TTL skips the pre-check; the upload revalidation takes the
+    // snapshot, exactly where the production tombstone happened.
+    let (_dir, shadow) = mount_with_ttl(Arc::clone(&mock), Duration::from_secs(60));
+    shadow.ensure_dir(ROOT_INO, true).unwrap();
+
+    // Another client changes the directory after the local checkout. The
+    // empty snapshot this produces must not look like "every child removed".
+    mock.touch_dir(ROOT_INO);
+    mock.set_snapshot_when_stale(true);
+
+    let child = shadow.mkdir(1, "d", 0o755, 0, 1000, 1000).unwrap();
+    let (file, handle) = shadow
+        .create(child.fuse_ino, "f", 0o100644, 0, 1000, 1000, true)
+        .unwrap();
+    shadow.write(file.fuse_ino, handle.id, 0, b"x").unwrap();
+
+    // The snapshot must keep the local-only child, and the parent batch must
+    // carry exactly that child.
+    shadow.fsyncdir(1).unwrap();
+    assert_eq!(shadow.lookup(1, "d").unwrap().kind, EntryKind::Dir);
+    let entry = shadow.db().file_by_name(ROOT_INO, "d").unwrap().unwrap();
+    assert!(!entry.deleted, "a local-only child is not a removal");
+    assert!(
+        !shadow
+            .db()
+            .shadow_dir(child.ino)
+            .unwrap()
+            .unwrap()
+            .local_only,
+        "the committed parent clears local_only"
+    );
+    let commits = mock.commits();
+    assert_eq!(commits.len(), 1);
+    assert_eq!(commits[0].manifest.len(), 1);
+    assert_eq!(commits[0].manifest[0].name, "d");
+
+    // The child now uploads the file it holds.
+    shadow.ensure_dir(child.ino, false).unwrap();
+    shadow.fsyncdir(child.fuse_ino).unwrap();
+    assert_eq!(mock.commits().len(), 2);
+    assert_eq!(mock.body(child.ino, "f").unwrap(), b"x");
+
+    // Repeated fsync is idempotent.
+    shadow.fsyncdir(1).unwrap();
+    shadow.fsyncdir(child.fuse_ino).unwrap();
+    assert_eq!(mock.commits().len(), 2);
+    shadow.release(handle.id).unwrap();
+}
+
+#[test]
+fn fsync_parent_snapshot_keeps_a_local_only_file_and_symlink() {
+    let mock = MockRemote::new();
+    let (_dir, shadow) = mount_with_ttl(Arc::clone(&mock), Duration::from_secs(60));
+    shadow.ensure_dir(ROOT_INO, true).unwrap();
+
+    mock.touch_dir(ROOT_INO);
+    mock.set_snapshot_when_stale(true);
+
+    let (file, handle) = shadow
+        .create(1, "f", 0o100644, 0, 1000, 1000, true)
+        .unwrap();
+    shadow.write(file.fuse_ino, handle.id, 0, b"x").unwrap();
+    let link = shadow.symlink(1, "l", b"f", 1000, 1000).unwrap();
+
+    shadow.fsyncdir(1).unwrap();
+    assert_eq!(shadow.lookup(1, "f").unwrap().kind, EntryKind::File);
+    assert_eq!(shadow.lookup(1, "l").unwrap().kind, EntryKind::Symlink);
+    assert_eq!(shadow.readlink(link.fuse_ino).unwrap(), b"f");
+    let commits = mock.commits();
+    assert_eq!(commits.len(), 1);
+    let names: Vec<&str> = commits[0]
+        .manifest
+        .iter()
+        .map(|entry| entry.name.as_str())
+        .collect();
+    assert_eq!(names, ["f", "l"]);
+    shadow.release(handle.id).unwrap();
+}
+
+#[test]
 fn parent_commit_publishes_a_local_child_before_the_child_uploads() {
     let mock = MockRemote::new();
     let (_dir, shadow) = mount(Arc::clone(&mock));
@@ -916,6 +1019,173 @@ fn parent_commit_publishes_a_local_child_before_the_child_uploads() {
     assert_eq!(mock.body(child.ino, "inside").unwrap(), b"child");
     shadow.release(handle.id).unwrap();
     shadow.release(trigger_handle.id).unwrap();
+}
+
+#[test]
+fn close_uploads_the_last_dirty_reference_once() {
+    let mock = MockRemote::new();
+    let (_dir, shadow) = mount(Arc::clone(&mock));
+    shadow.ensure_dir(ROOT_INO, true).unwrap();
+
+    let (attr, handle) = shadow
+        .create(1, "f", 0o100644, 0, 1000, 1000, true)
+        .unwrap();
+    shadow.write(attr.fuse_ino, handle.id, 0, b"hello").unwrap();
+
+    // `flush` may run many times before the final close; none of them upload.
+    shadow.flush(handle.id, Some(7)).unwrap();
+    shadow.flush(handle.id, Some(7)).unwrap();
+    assert_eq!(mock.commits().len(), 0, "flush never uploads");
+
+    // One reference is not the last one: nothing uploads yet.
+    let second = shadow.open_file(attr.fuse_ino, false).unwrap();
+    shadow.release(handle.id).unwrap();
+    assert_eq!(mock.commits().len(), 0, "only the last close uploads");
+
+    shadow.release(second.id).unwrap();
+    let commits = mock.commits();
+    assert_eq!(commits.len(), 1, "the last close commits the batch");
+    assert!(
+        commits[0]
+            .manifest
+            .iter()
+            .any(|entry| entry.name == "f" && entry.op == EntryOp::Put)
+    );
+    assert_eq!(mock.body(ROOT_INO, "f").unwrap(), b"hello");
+
+    // A repeated close is a no-op.
+    shadow.release(handle.id).unwrap();
+    assert_eq!(mock.commits().len(), 1);
+}
+
+#[test]
+fn close_conflict_keeps_dirty_and_reports_success() {
+    let cases = [
+        (
+            FailPoint::Upload,
+            RemoteError::BaseChanged {
+                current: MmBase::new(1, crate::mmap::types::DirSeq::new(9), [9; 32]),
+                snapshot_seq: MmSeq::new(9),
+            },
+        ),
+        (
+            FailPoint::Lock,
+            RemoteError::LockHeld {
+                owner: "other".to_owned(),
+                expires_at_ms: 1,
+                retry_after_ms: 1,
+            },
+        ),
+    ];
+    for (point, error) in cases {
+        let mock = MockRemote::new();
+        let (_dir, shadow) = mount(Arc::clone(&mock));
+        shadow.ensure_dir(ROOT_INO, true).unwrap();
+        let (attr, handle) = shadow
+            .create(1, "f", 0o100644, 0, 1000, 1000, true)
+            .unwrap();
+        shadow.write(attr.fuse_ino, handle.id, 0, b"kept").unwrap();
+
+        mock.set_failure(point, error);
+        shadow.release(handle.id).unwrap();
+        let dir = shadow.db().shadow_dir(ROOT_INO).unwrap().unwrap();
+        assert!(!dir.clean(), "a failed close keeps the dirty generation");
+        assert_eq!(mock.commits().len(), 0);
+
+        // The next explicit fsync retries and succeeds.
+        mock.clear_failure();
+        shadow.fsyncdir(1).unwrap();
+        assert_eq!(mock.commits().len(), 1);
+        assert_eq!(mock.body(ROOT_INO, "f").unwrap(), b"kept");
+    }
+}
+
+#[test]
+fn write_after_close_uploads_new_content_on_fsync() {
+    let mock = MockRemote::new();
+    let (_dir, shadow) = mount(Arc::clone(&mock));
+    shadow.ensure_dir(ROOT_INO, true).unwrap();
+
+    let (attr, handle) = shadow
+        .create(1, "f", 0o100644, 0, 1000, 1000, true)
+        .unwrap();
+    shadow.write(attr.fuse_ino, handle.id, 0, b"one").unwrap();
+    shadow.release(handle.id).unwrap();
+    assert_eq!(mock.body(ROOT_INO, "f").unwrap(), b"one");
+    assert!(
+        shadow
+            .layout()
+            .object_path(&attr.ino, attr.version)
+            .exists(),
+        "close keeps the current object for a live mapping"
+    );
+
+    // The kernel may still hold the mapping and send writes with the old fh.
+    shadow.write(attr.fuse_ino, handle.id, 0, b"two").unwrap();
+    shadow.fsync(attr.fuse_ino, Some(handle.id)).unwrap();
+    assert_eq!(mock.body(ROOT_INO, "f").unwrap(), b"two");
+    assert_eq!(mock.commits().len(), 2);
+
+    // A write without a handle takes the same fallback path.
+    shadow.write(attr.fuse_ino, handle.id, 3, b"!").unwrap();
+    shadow.fsync(attr.fuse_ino, None).unwrap();
+    assert_eq!(mock.body(ROOT_INO, "f").unwrap(), b"two!");
+    assert_eq!(mock.commits().len(), 3);
+}
+
+#[test]
+fn close_commits_the_ancestor_chain_before_the_owning_directory() {
+    let mock = MockRemote::new();
+    let (_dir, shadow) = mount(Arc::clone(&mock));
+    shadow.ensure_dir(ROOT_INO, true).unwrap();
+
+    let a = shadow.mkdir(1, "a", 0o755, 0, 1000, 1000).unwrap();
+    let b = shadow.mkdir(a.fuse_ino, "b", 0o755, 0, 1000, 1000).unwrap();
+    let (file, handle) = shadow
+        .create(b.fuse_ino, "f", 0o100644, 0, 1000, 1000, true)
+        .unwrap();
+    shadow.write(file.fuse_ino, handle.id, 0, b"deep").unwrap();
+
+    shadow.release(handle.id).unwrap();
+    let commits = mock.commits();
+    assert_eq!(commits.len(), 3, "root, a, then b");
+    assert_eq!(commits[0].dir_path, "/");
+    assert!(
+        commits[0]
+            .manifest
+            .iter()
+            .any(|entry| entry.name == "a" && entry.op == EntryOp::DirAdd)
+    );
+    assert_eq!(commits[1].dir_path, "/a");
+    assert!(commits[1].manifest.iter().any(|entry| entry.name == "b"));
+    assert_eq!(commits[2].dir_path, "/a/b");
+    assert_eq!(mock.body(b.ino, "f").unwrap(), b"deep");
+    assert!(shadow.lookup(1, "a").is_ok());
+    assert!(shadow.lookup(a.fuse_ino, "b").is_ok());
+}
+
+#[test]
+fn last_releasedir_commits_a_dirty_directory_once() {
+    let mock = MockRemote::new();
+    let (_dir, shadow) = mount(Arc::clone(&mock));
+    shadow.ensure_dir(ROOT_INO, true).unwrap();
+
+    shadow.mkdir(1, "d", 0o755, 0, 1000, 1000).unwrap();
+    shadow.opendir(1).unwrap();
+    assert_eq!(mock.commits().len(), 0, "mkdir alone does not upload");
+
+    shadow.releasedir(1).unwrap();
+    let commits = mock.commits();
+    assert_eq!(commits.len(), 1);
+    assert!(
+        commits[0]
+            .manifest
+            .iter()
+            .any(|entry| entry.name == "d" && entry.op == EntryOp::DirAdd)
+    );
+
+    shadow.releasedir(1).unwrap();
+    assert_eq!(mock.commits().len(), 1, "a repeated close is a no-op");
 }
 
 #[test]

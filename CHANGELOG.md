@@ -1,5 +1,28 @@
 # Changelog
 
+## 1.1.2 — 2026-11-09
+
+The wire protocol, commands, the 1.0 path and the mmap schema are unchanged.
+
+### Fixed
+
+- **Close commits the final dirty state.** The last `close` of a dirty inode
+  now commits the directory chain from the root down to the owning directory
+  and commits the owning directory last, so `fsync` is no longer required to
+  publish a file. `flush` still never uploads.
+- **Parent snapshots keep local-only child directories.** A full snapshot
+  taken during an upload revalidation used to treat a locally created child
+  directory as a clean removal and tombstone it before the manifest was
+  built. Such a child is now dirty until its parent batch commits.
+- **Close keeps the dirty state on error.** A `409`, `423` or transport error
+  during the close-triggered checkin is logged; close still succeeds and
+  leaves the dirty generations and batch id for the next close or explicit
+  `fsync`.
+
+### Changed
+
+- Version string and man page report 1.1.2.
+
 ## 1.1.1 — 2026-11-09
 
 The wire protocol, commands and the 1.0 path are unchanged. The shadow schema

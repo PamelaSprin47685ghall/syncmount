@@ -556,11 +556,17 @@ once. Different directories can proceed in parallel, but the single SQLite
 writer serialises their commits. A directory rename or removal checks the lock
 prefixes of its subtree.
 
-`flush` and `close` do not upload. A `409` (base changed) or `423` (lock held,
-lost or expired) maps to `EAGAIN`; the dirty generations and batch id survive
-and the next `fsync` retries. There is no in-call retry and no automatic
-backoff. A committed batch is never replayed: a repeated `upload/begin`
-returns `409 BATCH_COMMITTED`, and the result comes from `GET batch/{id}`.
+`flush` does not upload. The final `close` of a dirty inode commits the same
+directory chain as an explicit `fsync`, from the root down to the owning
+directory, and commits the owning directory last. A `409` (base changed) or
+`423` (lock held, lost or expired) maps to `EAGAIN` for `fsync`; during
+`close` it is logged instead of returned, and the dirty generations and batch
+id survive so the next close or `fsync` retries. There is no in-call retry
+and no automatic backoff. A committed batch is never replayed: a repeated
+`upload/begin` returns `409 BATCH_COMMITTED`, and the result comes from
+`GET batch/{id}`. With a live `mmap`, the kernel delays the final release
+until the last mapping is gone; an explicit `fsync` can commit new writes in
+between.
 
 ### 7.2 POSIX surface
 
@@ -574,7 +580,7 @@ returns `409 BATCH_COMMITTED`, and the result comes from `GET batch/{id}`.
 - `setxattr` and `removexattr` return `EOPNOTSUPP`. POSIX record locks are
   served by the daemon; `flock` is local to one mount.
 - `mmap(MAP_SHARED)` is the supported path. Writeback goes through the shadow
-  objects and is uploaded by `fsync`.
+  objects and is uploaded by the final `close` or an explicit `fsync`.
 
 ### 7.3 Consistency and recovery
 
