@@ -1,4 +1,4 @@
-.TH SYNCMOUNT 1 "2026-11-08" "syncmount 1.1.2" "User Commands"
+.TH SYNCMOUNT 1 "2026-11-09" "syncmount 1.1.3" "User Commands"
 .SH NAME
 syncmount \- server-authoritative, eventually consistent FUSE filesystem
 .SH SYNOPSIS
@@ -913,6 +913,51 @@ the kernel delays the final release until the last mapping is gone; an
 explicit
 .B fsync
 can commit new writes in between.
+A checkin first proves that every dirty direct entry of the directory still
+equals the checkout baseline.
+The comparison is metadata first: size, mode, uid, gid and
+.B mtime_ns
+for a regular file, hashed with BLAKE3 only when those match and only for
+files that are dirty.
+A symlink compares its target and the same metadata; a directory compares
+existence and metadata, so clean children are never scanned.
+The
+.BR ino ,
+.B atime
+and
+.B ctime
+fields are ignored, while
+.B mtime
+is strict: a bare
+.BR touch
+is a real change and is uploaded.
+When the proof holds, nothing is uploaded: no batch, no checkout
+revalidation, no lock, signature,
+.B begin
+or
+.B commit
+request, and no
+.B snapshot_seq
+advance; only the local dirty state is cleared.
+A missing baseline content hash falls back to a normal upload.
+A
+.B rmdir
+of a server-known directory commits its pending local child deletions as an
+empty batch before the parent batch removes the directory; a
+.BR 409 ,
+.B 423
+or transport error there is returned, keeps the directory dirty and is
+retried by the next
+.B rmdir
+or
+.BR fsync ,
+and a
+.B DIR_NOT_EMPTY
+rejection surfaces as
+.BR ENOTEMPTY ,
+not as a batch conflict.
+Closing the last descriptor of an entry whose owning directory was removed
+locally still commits the surviving parent chain.
 Hard links are refused with
 .BR EOPNOTSUPP .
 A rename between directories returns

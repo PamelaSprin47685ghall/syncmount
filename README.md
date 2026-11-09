@@ -46,7 +46,7 @@ and the next session resends them.
 
 ## Status
 
-v1.1.2, protocol 3.0, payload v3. The 1.0 wire protocol, schema and
+v1.1.3, protocol 3.0, payload v3. The 1.0 wire protocol, schema and
 `/private` and `/public` behaviour are unchanged; 1.1 adds the independent
 `--mmap` namespaces (`/private-mm`, `/public-mm`) served by `mm-server` and
 mounted by `mm-client` over a local shadow tree. 1.0 and 1.1 can share a host
@@ -284,6 +284,24 @@ dirty generations survive for the next close or `fsync`. With a live `mmap`,
 the kernel delays the final release until the last mapping is gone; an
 explicit `fsync` can commit new writes in between.
 
+A checkin first proves that every dirty direct entry of the directory still
+equals the checkout baseline. The comparison is metadata first: size, mode,
+uid, gid and `mtime_ns` for a regular file, with a BLAKE3 hash of the bytes
+only when those match and only for files that are dirty. A symlink compares
+its target and the same metadata; a directory compares existence and metadata,
+so clean children are never scanned. `ino`, `atime` and `ctime` are ignored,
+but `mtime` is strict: a bare `touch` is a real change and is uploaded. When
+the proof holds, nothing is uploaded — no batch, no lock or signature
+exchange, no checkout revalidation, no `begin` or `commit`, no `snapshot_seq`
+advance — and only the local dirty state is cleared. A missing baseline
+content hash falls back to a normal upload.
+
+A local `unlink` followed by `rmdir` commits the child directory's pending
+deletions as an empty batch before the parent batch removes the directory. If
+that child checkin fails, `rmdir` returns the error and keeps the directory
+dirty for the next `rmdir` or `fsync`. A `DIR_NOT_EMPTY` rejection surfaces as
+`ENOTEMPTY`, not as a batch conflict.
+
 Limitations specific to the mm path:
 
 - **One uploader per directory.** Uploads of one canonical directory are
@@ -299,6 +317,14 @@ Limitations specific to the mm path:
 - **Conflicts are retried later.** A `409` or `423` is not retried inside the
   failing call. The dirty state survives and the next `fsync` or close
   retries it.
+- **Strict `mtime`, conservative without a baseline.** Changing only `mtime`
+  uploads. Without a baseline content hash, the client uploads instead of
+  suppressing the batch.
+- **`rmdir` commits children first.** Removing a server-known directory with
+  pending local deletions commits the child deletions before the parent
+  removal. A `409`, `423` or transport error there fails the `rmdir` and
+  keeps the directory dirty; entries exposed by a full snapshot make it
+  `ENOTEMPTY`.
 - **1.0 is untouched.** `/private`, `/public`, their units, databases and
   options keep their 1.0 behaviour; the mm path is opt-in by command name.
 
@@ -677,7 +703,7 @@ CI asserts a size below 15 MiB and no `NEEDED` entries. See
 
 ```bash
 ./install.sh                      # latest release into ~/.local/bin
-./install.sh --version 1.1.2 --prefix /usr/local
+./install.sh --version 1.1.3 --prefix /usr/local
 ```
 
 The script downloads the tarball, verifies its sha256, installs the binary and

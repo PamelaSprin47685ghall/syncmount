@@ -1,5 +1,63 @@
 # Changelog
 
+## 1.1.3 — 2026-11-09
+
+The wire protocol, the commands, the server and the 1.0 path are unchanged.
+The mmap schema is unchanged.
+
+### Fixed
+
+- **`rmdir` commits pending child deletions first.** When a directory known
+  to the server still holds locally deleted entries, `rmdir` commits the
+  child directory as an empty batch before the parent batch removes it; the
+  server refuses to remove a non-empty directory, so the child must go first.
+  If that child checkin fails with `409`, `423` or a transport error, `rmdir`
+  returns the error (`EAGAIN` for `409` and `423`), keeps the directory and
+  its dirty generations in place, and the next `rmdir` or `fsync` retries. A
+  full snapshot taken during the child checkin can expose new live entries;
+  `rmdir` then returns `ENOTEMPTY` instead of deleting them. A local-only
+  directory skips the child batch and is removed locally.
+- **`DIR_NOT_EMPTY` maps to `ENOTEMPTY`.** A `DIR_NOT_EMPTY` server rejection
+  no longer becomes the generic batch conflict. It maps to
+  `RemoteError::DirNotEmpty(detail)` and the FUSE errno `ENOTEMPTY`, is not
+  classified as a retryable conflict, and keeps the server detail in the error
+  text and in the `close_checkin` warning log.
+- **Close after a local `rmdir` still commits the parent chain.** Closing the
+  last descriptor of an entry whose owning directory was removed locally
+  commits the surviving parent chain, walking from the root and falling back
+  to the root when the owning directory is gone. A committed tombstone version
+  also has its dirty generation cleared, so it becomes collectable.
+
+### Changed
+
+- **A checkin that proves nothing changed uploads nothing.** `fsync`,
+  `fsyncdir` and the final `close` of a dirty inode first compare every dirty
+  direct entry of the directory with the clean checkout baseline: the base
+  kept in `mm_base` and the baseline content hash of each regular file. When
+  all of them match, the upload is suppressed. No batch is created, no lock,
+  checkout revalidation, signature, `begin` or `commit` request is sent, and
+  `snapshot_seq` does not advance; only the local dirty bookkeeping is
+  cleared. A `noop_checkin` tracing event at debug level records the
+  directory, the dirty count and the elapsed time.
+- **The comparison is metadata first.** A regular file is compared on size,
+  mode, uid, gid and `mtime_ns`; only a full metadata match hashes the bytes,
+  with BLAKE3, and only for files that are dirty. A differing hash is a real
+  change and is uploaded. A symlink compares its target and
+  mode/uid/gid/`mtime_ns`. A directory compares existence and
+  mode/uid/gid/`mtime_ns`; a child write never changes the parent `mtime`, so
+  clean children are not scanned. A deletion is a real change only when the
+  baseline contained the entry. The cost is one metadata comparison per direct
+  entry plus BLAKE3 over the dirty regular files; a clean file body is never
+  read, and a hash computed by the check is reused by a following upload of
+  the same checkin.
+- **`mtime` is strict.** Changing only `mtime` is a real change and is
+  uploaded. `ino`, `atime` and `ctime` are ignored. A missing baseline content
+  hash, from an older shadow database or a collected version, uploads
+  conservatively. A concurrent write that changes the directory dirty
+  generation during the check abandons the no-op and falls through to the
+  normal upload, so no write is lost. `flush` still never uploads, and a
+  conflict keeps the dirty state for the next `fsync` or close as before.
+
 ## 1.1.2 — 2026-11-09
 
 The wire protocol, commands, the 1.0 path and the mmap schema are unchanged.

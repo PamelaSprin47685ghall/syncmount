@@ -321,6 +321,9 @@ pub enum RemoteError {
     },
     /// `409 BATCH_CONFLICT`.
     BatchConflict,
+    /// `409 DIR_NOT_EMPTY`; the directory still has live entries on the
+    /// server. The detail names the directory.
+    DirNotEmpty(String),
     /// `423 LOCK_HELD`.
     LockHeld {
         owner: String,
@@ -390,6 +393,7 @@ impl fmt::Display for RemoteError {
                 write!(f, "content mismatch for {name} (retry full: {retry_full})")
             }
             Self::BatchConflict => f.write_str("batch id conflict"),
+            Self::DirNotEmpty(detail) => write!(f, "directory is not empty: {detail}"),
             Self::LockHeld {
                 owner,
                 expires_at_ms,

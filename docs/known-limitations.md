@@ -568,6 +568,54 @@ and no automatic backoff. A committed batch is never replayed: a repeated
 until the last mapping is gone; an explicit `fsync` can commit new writes in
 between.
 
+A checkin (`fsync`, `fsyncdir` or the final `close` of a dirty inode) first
+proves that every dirty direct entry of the directory still equals the clean
+checkout baseline: the base kept in `mm_base` plus the baseline content hash of
+each regular file. The proof is metadata first. A regular file compares size,
+mode, uid, gid and `mtime_ns`; only a full metadata match hashes the bytes,
+with BLAKE3, and only for files that are dirty. A differing hash is a real
+change and is uploaded. A symlink compares its target and
+mode/uid/gid/`mtime_ns`. A directory compares existence and
+mode/uid/gid/`mtime_ns`; a child write never changes the parent `mtime`, so
+clean children are not scanned. A deletion is a real change only when the
+baseline contained the entry, so a file created and removed locally, or the
+removal of a never-checked-out local item, uploads nothing. `ino`, `atime` and
+`ctime` are ignored; `mtime` is strict, so a bare `touch` is a real change and
+is uploaded. The cost is one metadata comparison per direct entry plus BLAKE3
+over the dirty regular files; a clean file body is never read.
+
+When the proof holds, the checkin suppresses the upload entirely: no batch, no
+checkout revalidation, no lock, signature, `begin` or `commit` request, and no
+`snapshot_seq` advance. Only the local dirty bookkeeping is cleared. A
+`noop_checkin` tracing event at debug level records the directory, the dirty
+count and the elapsed time. A hash computed by the check is reused by a
+following upload, so a file is hashed at most once per checkin. If the
+baseline content hash is absent — an older shadow database or a version whose
+bytes were collected — the client uploads conservatively. A concurrent write
+that changes the directory dirty generation during the check abandons the
+no-op and falls through to the normal upload. Conflicts are unchanged: a
+`409` or `423` keeps the dirty state and the next `fsync` or close retries.
+
+`rmdir` of a server-known directory commits the pending local deletions of
+its direct children as an empty child batch before the parent batch removes
+the directory; the server refuses to remove a non-empty directory, so the
+child must go first. If that child checkin returns `409`, `423` or a
+transport error, `rmdir` returns the error (`EAGAIN` for `409` and `423`),
+leaves the directory and its dirty generations in place, and the next `rmdir`
+or `fsync` retries. A full snapshot taken during the child checkin can expose
+new live entries; `rmdir` then returns `ENOTEMPTY` instead of deleting them.
+A local-only directory, never committed to the server, skips the child batch
+and is removed locally.
+
+A `DIR_NOT_EMPTY` server rejection maps to `RemoteError::DirNotEmpty(detail)`
+and the FUSE errno `ENOTEMPTY`; it is not classified as a retryable conflict,
+and the server detail is kept in the error text and in the `close_checkin`
+warning log. Closing the last descriptor of an entry whose owning directory
+was removed locally still commits the surviving parent chain, walking from
+the root and falling back to the root when the owning directory is gone. A
+committed tombstone version also has its dirty generation cleared, so it
+becomes collectable.
+
 ### 7.2 POSIX surface
 
 - Hard links are not supported. `link` returns `EOPNOTSUPP`; one inode has one

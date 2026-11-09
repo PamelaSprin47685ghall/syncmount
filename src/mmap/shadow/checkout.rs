@@ -482,10 +482,7 @@ impl Shadow {
                 rusqlite::params![self.namespace, dir_ino.as_slice()],
             )?;
             for entry in &snapshot.entries {
-                let mut base_entry = entry.manifest_entry(crate::mmap::types::EntryOp::Keep);
-                if base_entry.kind == EntryKind::File {
-                    base_entry.content_hash = None;
-                }
+                let base_entry = entry.manifest_entry(crate::mmap::types::EntryOp::Keep);
                 insert_base_tx(tx, &self.namespace, dir_ino, &base_entry)?;
             }
 

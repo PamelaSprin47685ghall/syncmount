@@ -595,7 +595,29 @@ impl Shadow {
         if child.dir_handles > 0 {
             return Err(ShadowError::Busy);
         }
+        // The server refuses to remove a non-empty directory. Pending local
+        // unlinks below this directory are already tombstoned, so commit the
+        // child's empty manifest before the parent batch removes the
+        // directory. A failure leaves the directory and its dirty
+        // generations intact; the caller sees EAGAIN or the remote error.
+        if !child.local_only && !child.clean() {
+            self.checkin_dir(file.ino)?;
+            // The checkin may have taken a full snapshot and exposed entries
+            // the local shadow did not know about. Never delete those.
+            if !self.db.files(file.ino)?.is_empty() {
+                return Err(ShadowError::NotEmpty);
+            }
+        }
         self.db.write(|tx| {
+            let live: i64 = tx.conn().query_row(
+                "SELECT COUNT(*) FROM mm_files
+                 WHERE namespace = ?1 AND dir_ino = ?2 AND deleted = 0",
+                rusqlite::params![self.namespace, file.ino.as_slice()],
+                |row| row.get(0),
+            )?;
+            if live != 0 {
+                return Err(ShadowError::NotEmpty);
+            }
             bump_dir_dirty_tx(tx.conn(), &self.namespace, parent_row.ino)?;
             tx.delete_file(file.ino)?;
             tx.delete_dir(file.ino)?;
@@ -878,8 +900,9 @@ impl Shadow {
 
     /// `release`: drop one reference, then commit the final dirty close.
     ///
-    /// The last reference to a dirty version commits the directory chain from
-    /// the root down to the owning directory. A close reply is not a reliable
+    /// The last reference to a dirty version, or to an entry whose owning
+    /// directory was removed locally, commits the directory chain from the
+    /// root down to the surviving ancestor. A close reply is not a reliable
     /// error channel: a conflict or a transport error is logged, the dirty
     /// generations stay, and the next close or `fsync` retries.
     pub fn release(&self, fh: u64) -> Result<(), ShadowError> {
@@ -897,7 +920,10 @@ impl Shadow {
                 return Ok(());
             }
         };
-        if refs == 0 && self.version_dirty(handle.ino, handle.version) {
+        if refs == 0
+            && (self.version_dirty(handle.ino, handle.version)
+                || self.directory_removed(handle.dir_ino))
+        {
             self.commit_close(handle.dir_ino);
         }
         self.collect_garbage().ok();
@@ -914,6 +940,13 @@ impl Shadow {
                 version.dirty_gen > 0
                     || matches!(version.state, VersionState::Dirty | VersionState::Uploading)
             })
+    }
+
+    /// True when the owning directory row no longer exists. An unlink plus
+    /// rmdir can leave an open descriptor naming a removed directory; its
+    /// close must still commit the surviving parent.
+    fn directory_removed(&self, dir_ino: Ino) -> bool {
+        matches!(self.db.shadow_dir(dir_ino), Ok(None))
     }
 
     /// Commit the chain that owns one closing entry, from the root down.
@@ -939,8 +972,13 @@ impl Shadow {
             if ino == ROOT_INO {
                 break;
             }
-            let dir = self.db.shadow_dir(ino)?.ok_or(ShadowError::NotFound)?;
-            current = Some(self.parent_ino(&dir)?);
+            match self.db.shadow_dir(ino)? {
+                Some(dir) => current = Some(self.parent_ino(&dir)?),
+                // The owning directory was removed locally after the handle
+                // opened. Its parent chain still needs the checkin, so
+                // commit from the root instead of dropping the close.
+                None => current = Some(ROOT_INO),
+            }
         }
         chain.reverse();
         for ino in chain {

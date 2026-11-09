@@ -115,8 +115,8 @@ pub(super) fn map_failure(failure: WireFailure) -> RemoteError {
             | ErrorCode::BatchCommitted
             | ErrorCode::BatchAborted
             | ErrorCode::InoConflict
-            | ErrorCode::NameConflict
-            | ErrorCode::DirNotEmpty => RemoteError::BatchConflict,
+            | ErrorCode::NameConflict => RemoteError::BatchConflict,
+            ErrorCode::DirNotEmpty => RemoteError::DirNotEmpty(detail(&body)),
             ErrorCode::LockHeld => RemoteError::LockHeld {
                 owner: body.owner_client.map(hex::encode).unwrap_or_default(),
                 expires_at_ms: body.expires_at_ms.unwrap_or(0),

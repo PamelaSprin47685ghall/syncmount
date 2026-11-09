@@ -218,6 +218,33 @@ pub struct ShadowVersion {
     pub state: VersionState,
 }
 
+/// One dirty item that a no-op check proved equal to its checkout baseline.
+#[derive(Clone, Debug)]
+pub(super) struct NoopClear {
+    pub ino: Ino,
+    pub version: u64,
+    /// The dirty generation observed by the check.
+    pub dirty_gen: u64,
+    /// Baseline values to restore; `None` for a tombstone whose entry never
+    /// existed in the baseline.
+    pub baseline: Option<NoopBaseline>,
+}
+
+/// The clean checkout values restored to an unchanged dirty item.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct NoopBaseline {
+    pub size: u64,
+    pub file_root: Hash,
+    /// Content hash stored in `mm_versions` and `shadow_versions`.
+    pub hash: Hash,
+    /// Content hash stored in `mm_files`; `None` for a symlink.
+    pub file_hash: Option<Hash>,
+    pub mtime_ns: i64,
+    pub mode: u32,
+    pub uid: u32,
+    pub gid: u32,
+}
+
 /// One `shadow_fuse` row.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FuseRow {
@@ -801,6 +828,68 @@ impl ShadowDb {
         self.read(|tx| shadow_version_tx(tx.conn(), ino, version))
     }
 
+    /// Every local version referenced by one directory's rows, including
+    /// tombstones. One query serves a whole no-op check.
+    pub fn versions_for_dir(&self, dir_ino: Ino) -> Result<Vec<ShadowVersion>, ShadowError> {
+        self.read(|tx| {
+            let mut stmt = tx.conn().prepare(
+                "SELECT v.ino, v.version, v.size, v.file_root, v.content_hash,
+                        v.mtime_ns, v.dirty_gen, v.synced_size, v.synced_mtime_ns,
+                        v.open_refs, v.state
+                 FROM shadow_versions v
+                 JOIN mm_files m
+                   ON m.namespace = ?1 AND m.dir_ino = ?2
+                  AND m.ino = v.ino AND m.version = v.version",
+            )?;
+            let rows = stmt.query_map(params![self.namespace, dir_ino.as_slice()], |row| {
+                Ok((
+                    blob16(row, 0)?,
+                    row_u64(row, 1)?,
+                    row_u64(row, 2)?,
+                    blob32(row, 3)?,
+                    blob32(row, 4)?,
+                    row.get::<_, i64>(5)?,
+                    row_u64(row, 6)?,
+                    row_u64(row, 7)?,
+                    row.get::<_, i64>(8)?,
+                    row_u64(row, 9)?,
+                    row.get::<_, String>(10)?,
+                ))
+            })?;
+            let mut versions = Vec::new();
+            for row in rows {
+                let (
+                    ino,
+                    version,
+                    size,
+                    file_root,
+                    content_hash,
+                    mtime_ns,
+                    dirty_gen,
+                    synced_size,
+                    synced_mtime_ns,
+                    open_refs,
+                    state,
+                ) = row?;
+                versions.push(ShadowVersion {
+                    ino,
+                    version,
+                    size,
+                    file_root,
+                    content_hash,
+                    mtime_ns,
+                    dirty_gen,
+                    synced_size,
+                    synced_mtime_ns,
+                    open_refs,
+                    state: VersionState::parse(&state)
+                        .ok_or(ShadowError::Invalid("unknown version state"))?,
+                });
+            }
+            Ok(versions)
+        })
+    }
+
     /// Insert or replace one local version.
     pub fn put_shadow_version(&self, version: &ShadowVersion) -> Result<(), ShadowError> {
         self.write(|tx| put_shadow_version_tx(tx.conn(), version))
@@ -995,7 +1084,7 @@ impl ShadowDb {
                    (namespace, dir_ino, name, ino, kind, mode, uid, gid, mtime_ns,
                     size, file_root, content_hash, target)
                  SELECT namespace, dir_ino, name, ino, kind, mode, uid, gid, mtime_ns,
-                        size, file_root, NULL, target
+                        size, file_root, content_hash, target
                  FROM mm_files
                  WHERE namespace = ?1 AND dir_ino = ?2 AND deleted = 0",
                 params![self.namespace, dir_ino.as_slice()],
@@ -1008,7 +1097,7 @@ impl ShadowDb {
                      synced_mtime_ns = mtime_ns
                  WHERE ino IN (
                    SELECT ino FROM mm_files
-                   WHERE namespace = ?1 AND dir_ino = ?2 AND deleted = 0
+                   WHERE namespace = ?1 AND dir_ino = ?2
                  ) AND dirty_gen > 0 AND dirty_gen <= ?3",
                 params![self.namespace, dir_ino.as_slice(), to_i64(snapshot_gen)?,],
             )?;
@@ -1049,6 +1138,177 @@ impl ShadowDb {
             if let Some(batch) = batch {
                 tx.put_batch(batch)?;
             }
+            Ok(true)
+        })
+    }
+
+    /// Clear the dirty state of a directory whose dirty items all match the
+    /// checkout baseline.
+    ///
+    /// The transaction re-checks the directory generation, the base triple
+    /// and every version generation it clears. Any concurrent write or
+    /// checkout makes it return `false` without changing a row; the caller
+    /// then runs the normal upload. `Snapshot_seq` never advances here.
+    pub(super) fn publish_noop(
+        &self,
+        dir_ino: Ino,
+        dirty_gen: u64,
+        base: &MmBase,
+        clears: &[NoopClear],
+    ) -> Result<bool, ShadowError> {
+        self.write(|tx| {
+            let conn = tx.conn();
+            let guard = conn
+                .query_row(
+                    "SELECT d.dirty_gen, m.base_epoch, m.base_seq, m.dir_version
+                     FROM shadow_dirs d
+                     JOIN mm_dirs m ON m.namespace = ?1 AND m.ino = d.dir_ino
+                     WHERE d.dir_ino = ?2",
+                    params![self.namespace, dir_ino.as_slice()],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, i64>(2)?,
+                            row.get::<_, Vec<u8>>(3)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            let Some((generation, base_epoch, base_seq, dir_version)) = guard else {
+                return Ok(false);
+            };
+            if u64::try_from(generation).ok() != Some(dirty_gen)
+                || u64::try_from(base_epoch).ok() != Some(base.epoch)
+                || u64::try_from(base_seq).ok() != Some(base.dir_seq.get())
+                || dir_version != base.dir_version
+            {
+                return Ok(false);
+            }
+
+            // Validate every item before the first write. A single writer
+            // serialises this transaction, so a zero count here means the
+            // caller's plan is stale; roll back and upload normally.
+            for clear in clears {
+                let found: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM shadow_versions
+                     WHERE ino = ?1 AND version = ?2 AND dirty_gen = ?3",
+                    params![
+                        clear.ino.as_slice(),
+                        to_i64(clear.version)?,
+                        to_i64(clear.dirty_gen)?,
+                    ],
+                    |row| row.get(0),
+                )?;
+                if found == 0 {
+                    return Err(ShadowError::Conflict);
+                }
+                if clear.baseline.is_some() {
+                    let found: i64 = conn.query_row(
+                        "SELECT COUNT(*) FROM mm_files
+                         WHERE namespace = ?1 AND ino = ?2 AND version = ?3
+                           AND deleted = 0",
+                        params![self.namespace, clear.ino.as_slice(), to_i64(clear.version)?,],
+                        |row| row.get(0),
+                    )?;
+                    if found == 0 {
+                        return Err(ShadowError::Conflict);
+                    }
+                }
+            }
+
+            for clear in clears {
+                let changed = match &clear.baseline {
+                    Some(baseline) => {
+                        let changed = conn.execute(
+                            "UPDATE mm_files
+                             SET size = ?1, file_root = ?2, content_hash = ?3,
+                                 mode = ?4, uid = ?5, gid = ?6, mtime_ns = ?7,
+                                 updated_at_ms = ?8
+                             WHERE namespace = ?9 AND ino = ?10 AND version = ?11
+                               AND deleted = 0",
+                            params![
+                                to_i64(baseline.size)?,
+                                baseline.file_root.as_slice(),
+                                baseline.file_hash.as_ref().map(|hash| hash.as_slice()),
+                                i64::from(baseline.mode),
+                                i64::from(baseline.uid),
+                                i64::from(baseline.gid),
+                                baseline.mtime_ns,
+                                now_ms(),
+                                self.namespace,
+                                clear.ino.as_slice(),
+                                to_i64(clear.version)?,
+                            ],
+                        )?;
+                        if changed == 0 {
+                            return Err(ShadowError::Conflict);
+                        }
+                        let chunk_count =
+                            u32::try_from(baseline.size.div_ceil(65_536)).unwrap_or(u32::MAX);
+                        conn.execute(
+                            "INSERT INTO mm_versions
+                               (namespace, ino, version, size, file_root,
+                                content_hash, chunk_count, created_at_ms)
+                             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                             ON CONFLICT(namespace, ino, version) DO UPDATE SET
+                               size = excluded.size,
+                               file_root = excluded.file_root,
+                               content_hash = excluded.content_hash,
+                               chunk_count = excluded.chunk_count",
+                            params![
+                                self.namespace,
+                                clear.ino.as_slice(),
+                                to_i64(clear.version)?,
+                                to_i64(baseline.size)?,
+                                baseline.file_root.as_slice(),
+                                baseline.hash.as_slice(),
+                                i64::from(chunk_count),
+                                now_ms(),
+                            ],
+                        )?;
+                        conn.execute(
+                            "UPDATE shadow_versions
+                             SET size = ?1, file_root = ?2, content_hash = ?3,
+                                 mtime_ns = ?4, dirty_gen = 0,
+                                 synced_size = ?1, synced_mtime_ns = ?4,
+                                 state = 'clean'
+                             WHERE ino = ?5 AND version = ?6 AND dirty_gen = ?7
+                               AND state <> 'deleted'",
+                            params![
+                                to_i64(baseline.size)?,
+                                baseline.file_root.as_slice(),
+                                baseline.hash.as_slice(),
+                                baseline.mtime_ns,
+                                clear.ino.as_slice(),
+                                to_i64(clear.version)?,
+                                to_i64(clear.dirty_gen)?,
+                            ],
+                        )?
+                    }
+                    None => conn.execute(
+                        "UPDATE shadow_versions SET dirty_gen = 0
+                         WHERE ino = ?1 AND version = ?2 AND dirty_gen = ?3
+                           AND state = 'deleted'",
+                        params![
+                            clear.ino.as_slice(),
+                            to_i64(clear.version)?,
+                            to_i64(clear.dirty_gen)?,
+                        ],
+                    )?,
+                };
+                if changed == 0 {
+                    return Err(ShadowError::Conflict);
+                }
+            }
+
+            conn.execute(
+                "UPDATE shadow_dirs
+                 SET uploaded_gen = MAX(uploaded_gen, ?1), upload_state = 'idle',
+                     batch_id = NULL, lock_id = NULL, snapshot_gen = 0
+                 WHERE dir_ino = ?2",
+                params![to_i64(dirty_gen)?, dir_ino.as_slice()],
+            )?;
             Ok(true)
         })
     }

@@ -10,7 +10,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::io::Cursor;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::mmap::base;
 use crate::mmap::db::MmTx;
@@ -196,6 +196,19 @@ impl MockRemote {
 
     fn batch_count(&self) -> usize {
         self.state.lock().unwrap().batches.len()
+    }
+
+    fn dir_exists(&self, ino: Ino) -> bool {
+        self.state.lock().unwrap().dirs.contains_key(&ino)
+    }
+
+    fn dir_entry_count(&self, ino: Ino) -> Option<usize> {
+        self.state
+            .lock()
+            .unwrap()
+            .dirs
+            .get(&ino)
+            .map(|dir| dir.entries.len())
     }
 
     fn statuses(&self) -> usize {
@@ -415,7 +428,25 @@ impl MmRemote for MockRemote {
                 for (index, entry) in commit.manifest.iter().enumerate() {
                     let mut entry = entry.clone();
                     match entry.op {
-                        EntryOp::Delete | EntryOp::DirRemove => continue,
+                        EntryOp::Delete => continue,
+                        EntryOp::DirRemove => {
+                            // The real server refuses to remove a directory
+                            // that still has live entries. Model that so a
+                            // client-side ordering bug cannot hide here.
+                            if state
+                                .dirs
+                                .get(&entry.ino)
+                                .is_some_and(|child| !child.entries.is_empty())
+                            {
+                                state.dirs.insert(commit.dir_ino, dir);
+                                return Err(RemoteError::DirNotEmpty(format!(
+                                    "directory {} is not empty",
+                                    entry.name
+                                )));
+                            }
+                            state.dirs.remove(&entry.ino);
+                            continue;
+                        }
                         EntryOp::Rename | EntryOp::DirRename => {
                             if let Some(from) = &entry.from_name {
                                 next.remove(from);
@@ -1227,6 +1258,512 @@ fn upload_manifest_reflects_delete_and_attrs() {
     assert!(mock.body(ROOT_INO, "drop").is_none());
     assert_eq!(mock.body(ROOT_INO, "keep").unwrap(), b"same");
     shadow.release(handle.id).unwrap();
+}
+
+fn test_ino(index: u32) -> Ino {
+    let mut ino = [0u8; 16];
+    ino[0..4].copy_from_slice(&(index + 1).to_le_bytes());
+    ino
+}
+
+/// Write `body` through a fresh writable handle and restore the checkout
+/// mtime, so only a content hash can distinguish the result from a clean
+/// checkout.
+fn rewrite_and_restore_mtime(shadow: &Shadow, fuse_ino: u64, body: &[u8], mtime_ns: i64) {
+    let handle = shadow.open_file(fuse_ino, true).unwrap();
+    shadow.write(fuse_ino, handle.id, 0, body).unwrap();
+    shadow
+        .setattr(
+            fuse_ino,
+            Some(handle.id),
+            super::AttrChange {
+                mtime_ns: Some(mtime_ns),
+                ..super::AttrChange::default()
+            },
+        )
+        .unwrap();
+    shadow.release(handle.id).unwrap();
+}
+
+#[test]
+fn noop_fsync_after_rewriting_same_bytes_and_mtime_uploads_nothing() {
+    let mock = MockRemote::new();
+    mock.put_file(ROOT_INO, "a", [0xb1; 16], b"hello", 0o644);
+    let (_dir, shadow) = mount(Arc::clone(&mock));
+    shadow.ensure_dir(ROOT_INO, true).unwrap();
+    let attr = shadow.lookup(1, "a").unwrap();
+    let handle = shadow.open_file(attr.fuse_ino, true).unwrap();
+    shadow.write(attr.fuse_ino, handle.id, 0, b"hello").unwrap();
+    shadow
+        .setattr(
+            attr.fuse_ino,
+            Some(handle.id),
+            super::AttrChange {
+                mtime_ns: Some(10),
+                ..super::AttrChange::default()
+            },
+        )
+        .unwrap();
+    let seq = mock.snapshot_seq();
+    let checkouts = mock.checkouts.load(Ordering::Relaxed);
+
+    shadow.fsync(attr.fuse_ino, Some(handle.id)).unwrap();
+
+    assert_eq!(mock.batch_count(), 0, "a no-op checkin opens no batch");
+    assert_eq!(mock.commits().len(), 0);
+    assert_eq!(
+        mock.checkouts.load(Ordering::Relaxed),
+        checkouts,
+        "a no-op checkin sends no network request at all"
+    );
+    assert_eq!(mock.snapshot_seq(), seq, "snapshot_seq must not advance");
+    let dir = shadow.db().shadow_dir(ROOT_INO).unwrap().unwrap();
+    assert!(dir.clean(), "the directory is clean after suppression");
+    let file = shadow.db().file_by_name(ROOT_INO, "a").unwrap().unwrap();
+    let version = shadow
+        .db()
+        .shadow_version(file.ino, file.version)
+        .unwrap()
+        .unwrap();
+    assert_eq!(version.dirty_gen, 0);
+    assert_eq!(version.state, VersionState::Clean);
+
+    // A second checkin is a plain no-op.
+    shadow.fsync(attr.fuse_ino, Some(handle.id)).unwrap();
+    assert_eq!(mock.batch_count(), 0);
+    shadow.release(handle.id).unwrap();
+    assert_eq!(mock.commits().len(), 0, "close must stay local too");
+}
+
+#[test]
+fn noop_close_after_rewriting_same_bytes_and_mtime_uploads_nothing() {
+    let mock = MockRemote::new();
+    mock.put_file(ROOT_INO, "a", [0xb2; 16], b"hello", 0o644);
+    let (_dir, shadow) = mount(Arc::clone(&mock));
+    shadow.ensure_dir(ROOT_INO, true).unwrap();
+    let attr = shadow.lookup(1, "a").unwrap();
+
+    rewrite_and_restore_mtime(&shadow, attr.fuse_ino, b"hello", 10);
+
+    assert_eq!(mock.batch_count(), 0);
+    assert_eq!(mock.commits().len(), 0);
+    assert!(shadow.db().shadow_dir(ROOT_INO).unwrap().unwrap().clean());
+}
+
+#[test]
+fn same_size_different_content_with_same_mtime_uploads() {
+    let mock = MockRemote::new();
+    mock.put_file(ROOT_INO, "a", [0xb3; 16], b"hello", 0o644);
+    let (_dir, shadow) = mount(Arc::clone(&mock));
+    shadow.ensure_dir(ROOT_INO, true).unwrap();
+    let attr = shadow.lookup(1, "a").unwrap();
+    let handle = shadow.open_file(attr.fuse_ino, true).unwrap();
+    shadow.write(attr.fuse_ino, handle.id, 0, b"world").unwrap();
+    shadow
+        .setattr(
+            attr.fuse_ino,
+            Some(handle.id),
+            super::AttrChange {
+                mtime_ns: Some(10),
+                ..super::AttrChange::default()
+            },
+        )
+        .unwrap();
+    let seq = mock.snapshot_seq();
+
+    shadow.fsync(attr.fuse_ino, Some(handle.id)).unwrap();
+
+    assert_eq!(mock.batch_count(), 1, "the hash must reveal the change");
+    assert_eq!(mock.body(ROOT_INO, "a").unwrap(), b"world");
+    assert!(mock.snapshot_seq() > seq);
+    shadow.release(handle.id).unwrap();
+}
+
+#[test]
+fn mtime_only_change_uploads() {
+    let mock = MockRemote::new();
+    mock.put_file(ROOT_INO, "a", [0xb4; 16], b"hello", 0o644);
+    let (_dir, shadow) = mount(Arc::clone(&mock));
+    shadow.ensure_dir(ROOT_INO, true).unwrap();
+    let attr = shadow.lookup(1, "a").unwrap();
+    let handle = shadow.open_file(attr.fuse_ino, true).unwrap();
+    shadow
+        .setattr(
+            attr.fuse_ino,
+            Some(handle.id),
+            super::AttrChange {
+                mtime_ns: Some(11),
+                ..super::AttrChange::default()
+            },
+        )
+        .unwrap();
+
+    shadow.fsync(attr.fuse_ino, Some(handle.id)).unwrap();
+
+    let commits = mock.commits();
+    assert_eq!(commits.len(), 1);
+    assert_eq!(commits[0].manifest[0].mtime_ns, 11);
+    assert_eq!(mock.body(ROOT_INO, "a").unwrap(), b"hello");
+    shadow.release(handle.id).unwrap();
+}
+
+#[test]
+fn create_then_unlink_after_restoring_directory_mtime_does_not_commit() {
+    let mock = MockRemote::new();
+    let (_dir, shadow) = mount(Arc::clone(&mock));
+    shadow.ensure_dir(ROOT_INO, true).unwrap();
+
+    let (attr, handle) = shadow
+        .create(1, "x", 0o100644, 0, 1000, 1000, true)
+        .unwrap();
+    shadow
+        .write(attr.fuse_ino, handle.id, 0, b"temporary")
+        .unwrap();
+    shadow.unlink(1, "x").unwrap();
+    shadow
+        .setattr(
+            1,
+            None,
+            super::AttrChange {
+                mtime_ns: Some(1),
+                ..super::AttrChange::default()
+            },
+        )
+        .unwrap();
+
+    shadow.release(handle.id).unwrap();
+
+    assert_eq!(mock.batch_count(), 0);
+    assert_eq!(mock.commits().len(), 0);
+    let dir = shadow.db().shadow_dir(ROOT_INO).unwrap().unwrap();
+    assert!(dir.clean());
+    if let Some(version) = shadow.db().shadow_version(attr.ino, attr.version).unwrap() {
+        assert_eq!(version.dirty_gen, 0, "the tombstone version is collected");
+    }
+}
+
+#[test]
+fn local_only_parent_skips_while_the_child_uploads() {
+    let mock = MockRemote::new();
+    let (_dir, shadow) = mount(Arc::clone(&mock));
+    shadow.ensure_dir(ROOT_INO, true).unwrap();
+
+    let child = shadow.mkdir(1, "d", 0o755, 0, 1000, 1000).unwrap();
+    shadow.fsyncdir(1).unwrap();
+    assert_eq!(mock.commits().len(), 1);
+
+    let (file, handle) = shadow
+        .create(child.fuse_ino, "x", 0o100644, 0, 1000, 1000, true)
+        .unwrap();
+    shadow.write(file.fuse_ino, handle.id, 0, b"x").unwrap();
+
+    // The parent has no direct change, so its checkin must not add a batch.
+    shadow.fsyncdir(1).unwrap();
+    assert_eq!(mock.commits().len(), 1);
+
+    shadow.fsync(file.fuse_ino, Some(handle.id)).unwrap();
+    assert_eq!(mock.commits().len(), 2, "only the child uploads");
+    assert_eq!(mock.body(child.ino, "x").unwrap(), b"x");
+    shadow.release(handle.id).unwrap();
+}
+
+#[test]
+fn noop_check_hashes_only_the_dirty_file_among_a_thousand() {
+    let mock = MockRemote::new();
+    for index in 0..1000u32 {
+        let name = format!("f{index:04}");
+        mock.put_file(ROOT_INO, &name, test_ino(index), b"x", 0o644);
+    }
+    let (_dir, shadow) = mount(Arc::clone(&mock));
+    shadow.ensure_dir(ROOT_INO, true).unwrap();
+
+    let attr = shadow.lookup(1, "f0500").unwrap();
+    let handle = shadow.open_file(attr.fuse_ino, true).unwrap();
+    shadow.write(attr.fuse_ino, handle.id, 0, b"x").unwrap();
+    shadow
+        .setattr(
+            attr.fuse_ino,
+            Some(handle.id),
+            super::AttrChange {
+                mtime_ns: Some(10),
+                ..super::AttrChange::default()
+            },
+        )
+        .unwrap();
+    let seq = mock.snapshot_seq();
+    super::noop::HASHED_FILES.with(|count| count.set(0));
+
+    shadow.fsync(attr.fuse_ino, Some(handle.id)).unwrap();
+
+    let hashed = super::noop::HASHED_FILES.with(std::cell::Cell::get);
+    assert_eq!(hashed, 1, "clean bodies are never hashed");
+    assert_eq!(mock.batch_count(), 0);
+    assert_eq!(mock.snapshot_seq(), seq);
+    shadow.release(handle.id).unwrap();
+}
+
+#[test]
+#[ignore = "perf: measures the no-op check over 1000 entries"]
+fn noop_checkin_cost_for_a_thousand_entries() {
+    let mock = MockRemote::new();
+    for index in 0..1000u32 {
+        let name = format!("f{index:04}");
+        mock.put_file(ROOT_INO, &name, test_ino(index), b"x", 0o644);
+    }
+    let (_dir, shadow) = mount(Arc::clone(&mock));
+    shadow.ensure_dir(ROOT_INO, true).unwrap();
+    let dir = shadow.db().shadow_dir(ROOT_INO).unwrap().unwrap();
+
+    const SAMPLES: u32 = 100;
+    let mut clean = Duration::ZERO;
+    for _ in 0..SAMPLES {
+        let started = Instant::now();
+        let check = shadow.check_noop(&dir).unwrap();
+        clean += started.elapsed();
+        assert!(check.suppressed());
+    }
+
+    let attr = shadow.lookup(1, "f0500").unwrap();
+    let handle = shadow.open_file(attr.fuse_ino, true).unwrap();
+    shadow.write(attr.fuse_ino, handle.id, 0, b"x").unwrap();
+    shadow
+        .setattr(
+            attr.fuse_ino,
+            Some(handle.id),
+            super::AttrChange {
+                mtime_ns: Some(10),
+                ..super::AttrChange::default()
+            },
+        )
+        .unwrap();
+    let mut dirty = Duration::ZERO;
+    for _ in 0..SAMPLES {
+        let started = Instant::now();
+        let check = shadow.check_noop(&dir).unwrap();
+        dirty += started.elapsed();
+        assert!(check.suppressed());
+    }
+    eprintln!(
+        "noop check, 1000 entries: clean {:?}/check, one dirty file {:?}/check",
+        clean / SAMPLES,
+        dirty / SAMPLES
+    );
+    shadow.release(handle.id).unwrap();
+}
+
+#[test]
+fn concurrent_write_after_a_noop_plan_is_not_lost() {
+    let mock = MockRemote::new();
+    mock.put_file(ROOT_INO, "a", [0xb5; 16], b"hello", 0o644);
+    let (_dir, shadow) = mount(Arc::clone(&mock));
+    shadow.ensure_dir(ROOT_INO, true).unwrap();
+    let attr = shadow.lookup(1, "a").unwrap();
+    let handle = shadow.open_file(attr.fuse_ino, true).unwrap();
+    shadow.write(attr.fuse_ino, handle.id, 0, b"hello").unwrap();
+    shadow
+        .setattr(
+            attr.fuse_ino,
+            Some(handle.id),
+            super::AttrChange {
+                mtime_ns: Some(10),
+                ..super::AttrChange::default()
+            },
+        )
+        .unwrap();
+
+    let dir = shadow.db().shadow_dir(ROOT_INO).unwrap().unwrap();
+    let check = shadow.check_noop(&dir).unwrap();
+    assert!(check.suppressed(), "the first state is a proved no-op");
+
+    // A write lands after the check but before the dirty state is cleared.
+    shadow.write(attr.fuse_ino, handle.id, 0, b"world").unwrap();
+    let published = shadow
+        .db()
+        .publish_noop(ROOT_INO, dir.dirty_gen, &dir.record.base, &check.clears)
+        .unwrap();
+    assert!(!published, "the generation guard rejects the stale plan");
+
+    shadow.fsync(attr.fuse_ino, Some(handle.id)).unwrap();
+    assert_eq!(mock.body(ROOT_INO, "a").unwrap(), b"world");
+    assert_eq!(mock.batch_count(), 1, "the concurrent write is uploaded");
+    shadow.release(handle.id).unwrap();
+}
+
+#[test]
+fn missing_baseline_hash_uploads_conservatively() {
+    let mock = MockRemote::new();
+    mock.put_file(ROOT_INO, "a", [0xb6; 16], b"hello", 0o644);
+    let (_dir, shadow) = mount(Arc::clone(&mock));
+    shadow.ensure_dir(ROOT_INO, true).unwrap();
+
+    let conn = rusqlite::Connection::open(shadow.db().path()).unwrap();
+    conn.execute(
+        "UPDATE mm_base SET content_hash = NULL
+         WHERE namespace = ?1 AND name = 'a'",
+        rusqlite::params![NS],
+    )
+    .unwrap();
+    drop(conn);
+
+    let attr = shadow.lookup(1, "a").unwrap();
+    let handle = shadow.open_file(attr.fuse_ino, true).unwrap();
+    shadow.write(attr.fuse_ino, handle.id, 0, b"hello").unwrap();
+    shadow
+        .setattr(
+            attr.fuse_ino,
+            Some(handle.id),
+            super::AttrChange {
+                mtime_ns: Some(10),
+                ..super::AttrChange::default()
+            },
+        )
+        .unwrap();
+
+    shadow.fsync(attr.fuse_ino, Some(handle.id)).unwrap();
+
+    assert_eq!(mock.batch_count(), 1, "no baseline hash means upload");
+    shadow.release(handle.id).unwrap();
+}
+
+#[test]
+fn rmdir_commits_pending_child_deletes_before_the_parent_batch() {
+    let mock = MockRemote::new();
+    let (_dir, shadow) = mount(Arc::clone(&mock));
+    shadow.ensure_dir(ROOT_INO, true).unwrap();
+
+    let child = shadow.mkdir(1, "d", 0o755, 0, 1000, 1000).unwrap();
+    let (file, handle) = shadow
+        .create(child.fuse_ino, "f", 0o100644, 0, 1000, 1000, true)
+        .unwrap();
+    shadow.write(file.fuse_ino, handle.id, 0, b"x").unwrap();
+    shadow.release(handle.id).unwrap();
+    assert_eq!(
+        mock.commits().len(),
+        2,
+        "root publishes d, then d publishes f"
+    );
+    assert_eq!(mock.body(child.ino, "f").unwrap(), b"x");
+
+    shadow.unlink(child.fuse_ino, "f").unwrap();
+    assert_eq!(mock.commits().len(), 2, "unlink alone stays local");
+
+    shadow.rmdir(1, "d").unwrap();
+    let commits = mock.commits();
+    assert_eq!(
+        commits.len(),
+        3,
+        "rmdir commits the child before deleting it"
+    );
+    assert_eq!(commits[2].dir_path, "/d");
+    assert!(
+        commits[2]
+            .manifest
+            .iter()
+            .any(|entry| entry.name == "f" && entry.op == EntryOp::Delete)
+    );
+    assert_eq!(
+        mock.dir_entry_count(child.ino),
+        Some(0),
+        "the server side child is empty before the parent batch"
+    );
+    assert!(mock.body(child.ino, "f").is_none());
+    assert_eq!(
+        shadow
+            .db()
+            .shadow_version(file.ino, file.version)
+            .unwrap()
+            .unwrap()
+            .dirty_gen,
+        0,
+        "the committed tombstone is no longer dirty"
+    );
+
+    shadow.fsyncdir(1).unwrap();
+    let commits = mock.commits();
+    assert_eq!(commits.len(), 4, "then the parent removes the empty child");
+    assert_eq!(commits[3].dir_path, "/");
+    assert!(
+        commits[3]
+            .manifest
+            .iter()
+            .any(|entry| entry.name == "d" && entry.op == EntryOp::DirRemove)
+    );
+    assert!(!mock.dir_exists(child.ino));
+    assert!(shadow.lookup(1, "d").is_err());
+}
+
+#[test]
+fn rmdir_failure_keeps_the_directory_and_its_pending_delete() {
+    let mock = MockRemote::new();
+    let (_dir, shadow) = mount(Arc::clone(&mock));
+    shadow.ensure_dir(ROOT_INO, true).unwrap();
+
+    let child = shadow.mkdir(1, "d", 0o755, 0, 1000, 1000).unwrap();
+    let (file, handle) = shadow
+        .create(child.fuse_ino, "f", 0o100644, 0, 1000, 1000, true)
+        .unwrap();
+    shadow.write(file.fuse_ino, handle.id, 0, b"x").unwrap();
+    shadow.release(handle.id).unwrap();
+    shadow.unlink(child.fuse_ino, "f").unwrap();
+
+    mock.set_failure(
+        FailPoint::Lock,
+        RemoteError::LockHeld {
+            owner: "other".to_owned(),
+            expires_at_ms: 1,
+            retry_after_ms: 1,
+        },
+    );
+    let error = shadow.rmdir(1, "d").unwrap_err();
+    assert_eq!(error.errno(), libc::EAGAIN);
+    assert_eq!(
+        mock.commits().len(),
+        2,
+        "the failed child batch did not commit"
+    );
+    assert!(shadow.lookup(1, "d").is_ok(), "the directory survives");
+    assert!(
+        !shadow.db().shadow_dir(child.ino).unwrap().unwrap().clean(),
+        "the child dirty generation survives"
+    );
+    let tombstone = shadow.db().file_by_name(child.ino, "f").unwrap().unwrap();
+    assert!(tombstone.deleted, "the pending unlink was not dropped");
+
+    mock.clear_failure();
+    shadow.rmdir(1, "d").unwrap();
+    shadow.fsyncdir(1).unwrap();
+    assert!(!mock.dir_exists(child.ino));
+    assert!(shadow.lookup(1, "d").is_err());
+}
+
+#[test]
+fn close_commits_the_parent_after_the_owning_directory_was_removed() {
+    let mock = MockRemote::new();
+    let (_dir, shadow) = mount(Arc::clone(&mock));
+    shadow.ensure_dir(ROOT_INO, true).unwrap();
+
+    let child = shadow.mkdir(1, "d", 0o755, 0, 1000, 1000).unwrap();
+    let (file, handle) = shadow
+        .create(child.fuse_ino, "f", 0o100644, 0, 1000, 1000, true)
+        .unwrap();
+    shadow.write(file.fuse_ino, handle.id, 0, b"x").unwrap();
+    shadow.release(handle.id).unwrap();
+    assert_eq!(mock.commits().len(), 2);
+    let handle = shadow.open_file(file.fuse_ino, true).unwrap();
+
+    // Remove the file and its directory while the file handle stays open.
+    shadow.unlink(child.fuse_ino, "f").unwrap();
+    shadow.rmdir(1, "d").unwrap();
+    assert_eq!(mock.commits().len(), 3);
+    assert!(shadow.db().shadow_dir(child.ino).unwrap().is_none());
+
+    // The close names a removed directory; it must still commit the root
+    // batch that drops that directory.
+    shadow.release(handle.id).unwrap();
+    assert_eq!(mock.commits().len(), 4);
+    assert!(!mock.dir_exists(child.ino));
+    assert!(shadow.lookup(1, "d").is_err());
+    assert!(shadow.db().shadow_dir(ROOT_INO).unwrap().unwrap().clean());
 }
 
 #[test]

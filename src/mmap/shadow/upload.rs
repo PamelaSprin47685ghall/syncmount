@@ -15,6 +15,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::Cursor;
 use std::path::PathBuf;
+use std::time::Instant;
 
 use crate::mmap::manifest::Manifest;
 use crate::mmap::rsync::{Instruction, decode_from, delta_to};
@@ -31,6 +32,17 @@ use super::remote::{
 };
 use super::{Shadow, ShadowError, now_ms};
 
+/// What one directory checkin did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum CheckinOutcome {
+    /// The directory had no dirty generation.
+    Clean,
+    /// Every dirty item equalled the checkout baseline; nothing was uploaded.
+    Suppressed,
+    /// A batch was built and committed.
+    Uploaded,
+}
+
 /// One frozen file used by one upload.
 #[derive(Clone, Debug)]
 struct SnapshotFile {
@@ -46,7 +58,7 @@ impl Shadow {
     /// base/uploaded generation was durably recorded.
     pub fn fsync(&self, fuse_ino: u64, fh: Option<u64>) -> Result<(), ShadowError> {
         let (dir_ino, _ino, _version) = self.resolve_handle(fuse_ino, fh)?;
-        self.checkin_dir(dir_ino)
+        self.checkin_dir(dir_ino).map(|_| ())
     }
 
     /// Flush one directory even when no individual file triggered it.
@@ -55,24 +67,61 @@ impl Shadow {
         if row.kind != EntryKind::Dir {
             return Err(ShadowError::NotDir);
         }
-        self.checkin_dir(row.ino)
+        self.checkin_dir(row.ino).map(|_| ())
     }
 
     /// Commit one directory's current batch. This is the shared body of
     /// `fsync`, `fsyncdir` and the final close.
-    pub(super) fn checkin_dir(&self, dir_ino: Ino) -> Result<(), ShadowError> {
-        self.ensure_dir(dir_ino, false)?;
+    pub(super) fn checkin_dir(&self, dir_ino: Ino) -> Result<CheckinOutcome, ShadowError> {
         let dir = self.db.shadow_dir(dir_ino)?.ok_or(ShadowError::NotFound)?;
         if dir.clean() {
-            return Ok(());
+            return Ok(CheckinOutcome::Clean);
         }
         let slot = self.slot(dir_ino);
         let _upload = super::lock(&slot.upload);
         let dir = self.db.shadow_dir(dir_ino)?.ok_or(ShadowError::NotFound)?;
         if dir.clean() {
-            return Ok(());
+            return Ok(CheckinOutcome::Clean);
         }
-        self.flush_dir_locked(dir)
+
+        let started = Instant::now();
+        let check = self.check_noop(&dir)?;
+        if check.suppressed() {
+            match self.db.publish_noop(
+                dir.record.ino,
+                dir.dirty_gen,
+                &dir.record.base,
+                &check.clears,
+            ) {
+                Ok(true) => {
+                    tracing::debug!(
+                        event = "noop_checkin",
+                        dir = %dir.record.path,
+                        dirty = check.dirty,
+                        elapsed_us =
+                            u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
+                        "dirty state matches the checkout baseline; no upload"
+                    );
+                    return Ok(CheckinOutcome::Suppressed);
+                }
+                Ok(false) | Err(ShadowError::Conflict) => {
+                    // A concurrent write or checkout invalidated the plan.
+                    // Upload the then-current state instead of suppressing.
+                }
+                Err(error) => return Err(error),
+            }
+        }
+
+        // Only a real difference needs the latest server base and a
+        // snapshot. A suppressed checkin never opens this path, so it sends
+        // no checkout, lock, signature, begin or commit request.
+        self.ensure_dir(dir_ino, false)?;
+        let dir = self.db.shadow_dir(dir_ino)?.ok_or(ShadowError::NotFound)?;
+        if dir.clean() {
+            return Ok(CheckinOutcome::Clean);
+        }
+        self.flush_dir_locked(dir, &check.hashes)?;
+        Ok(CheckinOutcome::Uploaded)
     }
 
     fn resolve_handle(
@@ -88,7 +137,11 @@ impl Shadow {
         Ok((file.dir_ino, row.ino, row.version))
     }
 
-    fn flush_dir_locked(&self, mut dir: super::ShadowDir) -> Result<(), ShadowError> {
+    fn flush_dir_locked(
+        &self,
+        mut dir: super::ShadowDir,
+        hashes: &HashMap<(Ino, u64, u64), ContentHashes>,
+    ) -> Result<(), ShadowError> {
         if dir.local_only {
             // A locally created child directory has no server row yet. Its
             // parent struct changes must commit first; the next fsync retries.
@@ -125,7 +178,7 @@ impl Shadow {
             None,
         )?;
 
-        let result = self.snapshot_and_upload(&dir, batch_id, snapshot_gen, &staging);
+        let result = self.snapshot_and_upload(&dir, batch_id, snapshot_gen, &staging, hashes);
         match &result {
             Ok(()) => {
                 let _ = std::fs::remove_dir_all(&staging);
@@ -161,6 +214,7 @@ impl Shadow {
         batch_id: BatchId,
         snapshot_gen: u64,
         staging: &std::path::Path,
+        known_hashes: &HashMap<(Ino, u64, u64), ContentHashes>,
     ) -> Result<(), ShadowError> {
         let mut snapshots: HashMap<Ino, SnapshotFile> = HashMap::new();
         let mut snapshotted_records: HashMap<Ino, FileRecord> = HashMap::new();
@@ -192,7 +246,13 @@ impl Shadow {
                 let _guard = super::lock(&lock);
                 let mut source = self.layout.open_object(&file.ino, file.version)?;
                 let path = staging.join(format!("{}.v{}", super::hex16(&file.ino), file.version));
-                let hashes = content::copy_and_hash(&mut source, &path)?;
+                let hashes = match known_hashes.get(&(file.ino, file.version, version.dirty_gen)) {
+                    Some(known) => match content::copy_with_hashes(&mut source, &path, *known) {
+                        Ok(()) => *known,
+                        Err(_) => content::copy_and_hash(&mut source, &path)?,
+                    },
+                    None => content::copy_and_hash(&mut source, &path)?,
+                };
                 let mut record = file.clone();
                 record.size = hashes.size;
                 record.file_root = hashes.file_root;

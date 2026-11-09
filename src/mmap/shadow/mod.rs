@@ -28,6 +28,7 @@ mod content;
 mod db;
 mod layout;
 mod locks;
+mod noop;
 mod ops;
 mod recover;
 mod upload;
@@ -120,6 +121,7 @@ impl ShadowError {
                 | RemoteError::LockHeld { .. }
                 | RemoteError::LockLost { .. }
                 | RemoteError::LockExpired => libc::EAGAIN,
+                RemoteError::DirNotEmpty(_) => libc::ENOTEMPTY,
                 RemoteError::Io(_) | RemoteError::Unauthenticated | RemoteError::Internal(_) => {
                     libc::EIO
                 }

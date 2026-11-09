@@ -129,6 +129,33 @@ pub fn copy_and_hash(source: &mut File, destination: &Path) -> io::Result<Conten
     })
 }
 
+/// Copy `source` into `destination` using hashes that were already computed
+/// for the same dirty generation.
+///
+/// The caller owns the generation check: when the generation is unchanged,
+/// the bytes cannot differ from the hashed snapshot. A size mismatch means
+/// that assumption failed, and the caller falls back to [`copy_and_hash`].
+pub fn copy_with_hashes(
+    source: &mut File,
+    destination: &Path,
+    hashes: ContentHashes,
+) -> io::Result<()> {
+    source.seek_to_start()?;
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut out = File::create(destination)?;
+    let copied = io::copy(source, &mut out)?;
+    out.sync_all()?;
+    if copied != hashes.size {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "cached hash size does not match the object",
+        ));
+    }
+    Ok(())
+}
+
 /// Write one body into a new staging file and return its hashes.
 pub fn write_staged(path: &Path, bytes: &[u8]) -> io::Result<ContentHashes> {
     if let Some(parent) = path.parent() {

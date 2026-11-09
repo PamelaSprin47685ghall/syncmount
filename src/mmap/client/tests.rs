@@ -1037,3 +1037,71 @@ fn unauthorized_response_triggers_one_hello_and_a_replay() {
     let snapshot = checkout_root(&reader);
     assert_eq!(snapshot.dir_ino, ROOT_INO);
 }
+
+#[test]
+fn dir_not_empty_keeps_its_detail_and_maps_to_enotempty() {
+    let mut body = ErrorBody::new(ErrorCode::DirNotEmpty);
+    body.detail = Some("directory /d is not empty".to_owned());
+    let error = super::remote::map_failure(super::http::WireFailure::Status {
+        status: 409,
+        body: Box::new(body),
+    });
+    assert_eq!(
+        error,
+        RemoteError::DirNotEmpty("directory /d is not empty".to_owned())
+    );
+    assert!(
+        !error.is_conflict(),
+        "not every 409 is a retryable conflict"
+    );
+    assert_eq!(
+        ShadowError::Remote(error).errno(),
+        libc::ENOTEMPTY,
+        "a non-empty directory is not a batch id conflict"
+    );
+}
+
+#[test]
+fn rmdir_deletes_the_real_server_child_entries_before_the_parent() {
+    let server = TestServer::start(MM_URL_PREFIX);
+    let shadow_dir = TempDir::new().unwrap();
+    let shadow = Shadow::open(
+        ShadowConfig::new(shadow_dir.path(), MM_URL_PREFIX),
+        Arc::new(client(&server, MASTER, None)),
+    )
+    .unwrap();
+
+    let child = shadow
+        .mkdir(Shadow::root_ino(), "d", 0o755, 0, 1000, 1000)
+        .unwrap();
+    let (file, handle) = shadow
+        .create(child.fuse_ino, "f", 0o644, 0, 1000, 1000, true)
+        .unwrap();
+    shadow.write(file.fuse_ino, handle.id, 0, b"x").unwrap();
+    shadow.release(handle.id).unwrap();
+
+    shadow.unlink(child.fuse_ino, "f").unwrap();
+    shadow.rmdir(Shadow::root_ino(), "d").unwrap();
+
+    // The real server must already see an empty child before it accepts the
+    // parent batch that removes it.
+    let reader = client(&server, MASTER, None);
+    let child_snapshot = match reader
+        .checkout(&CheckoutRequest {
+            dir_path: "/d".to_owned(),
+            dir_ino: child.ino,
+            if_base: None,
+            if_snapshot: None,
+            bodies: false,
+        })
+        .unwrap()
+    {
+        CheckoutOutcome::Snapshot(snapshot) => snapshot,
+        CheckoutOutcome::NotModified { .. } => panic!("a full checkout cannot be 304"),
+    };
+    assert!(child_snapshot.entries.is_empty());
+
+    shadow.fsyncdir(Shadow::root_ino()).unwrap();
+    let root = checkout_root(&reader);
+    assert!(!root.entries.iter().any(|entry| entry.name == "d"));
+}
