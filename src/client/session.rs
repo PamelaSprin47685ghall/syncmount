@@ -70,7 +70,11 @@ const REPLAY_BATCH_WINDOW: Duration = Duration::from_millis(2);
 /// `WELCOME` watermark. A quiet downlink in that state is a stall, not a
 /// slow replay: the durable cursor is the only safe way out, because a
 /// reconnect makes the server replay the missing events again.
-const REPLAY_STALL_TIMEOUT: Duration = Duration::from_secs(10);
+///
+/// The bound is well above one replay batch commit: a large batch may take
+/// seconds to materialise, and the server sends a keepalive PONG while it
+/// reads the next page, so only a genuinely silent downlink reaches it.
+const REPLAY_STALL_TIMEOUT: Duration = Duration::from_secs(45);
 
 /// How often the session checks replay progress.
 const REPLAY_STALL_CHECK: Duration = Duration::from_secs(1);
@@ -146,28 +150,34 @@ struct ReplayProgress {
 }
 
 impl ReplayProgress {
-    fn new(applied: u64, frames: u64) -> Self {
+    fn new(applied: u64, frames: u64, now: Instant) -> Self {
         Self {
             last_applied: applied,
             last_frames: frames,
-            last_advance: Instant::now(),
+            last_advance: now,
         }
     }
 
     /// Record the current watermark and frame count; true when either moved.
-    fn advanced(&mut self, applied: u64, frames: u64) -> bool {
+    ///
+    /// Any delivered frame counts: `frames` is the session-wide received
+    /// frame counter, so `STREAM_DATA` for a large file, a keepalive `PONG`
+    /// or an `ORDERED` that is still waiting for its batch to commit all
+    /// reset the timer. A batch that is committing while its frames have
+    /// already arrived is therefore not a stall.
+    fn advanced(&mut self, applied: u64, frames: u64, now: Instant) -> bool {
         if applied <= self.last_applied && frames <= self.last_frames {
             return false;
         }
         self.last_applied = applied.max(self.last_applied);
         self.last_frames = frames.max(self.last_frames);
-        self.last_advance = Instant::now();
+        self.last_advance = now;
         true
     }
 
     /// Time since the last observed progress.
-    fn idle(&self) -> Duration {
-        self.last_advance.elapsed()
+    fn idle(&self, now: Instant) -> Duration {
+        now.saturating_duration_since(self.last_advance)
     }
 }
 
@@ -438,7 +448,11 @@ pub async fn run(
             "replica is current at attach"
         );
     }
-    let mut progress = ReplayProgress::new(applied, counters.frames_in.load(Ordering::Relaxed));
+    let mut progress = ReplayProgress::new(
+        applied,
+        counters.frames_in.load(Ordering::Relaxed),
+        Instant::now(),
+    );
     let mut stall_check = tokio::time::interval(REPLAY_STALL_CHECK);
     stall_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut exit = SessionExit::ok();
@@ -495,7 +509,8 @@ pub async fn run(
                 if !caught_up {
                     let applied_now = watermark.load(Ordering::Acquire).max(0) as u64;
                     let frames_now = counters.frames_in.load(Ordering::Relaxed);
-                    if progress.advanced(applied_now, frames_now) {
+                    let now = Instant::now();
+                    if progress.advanced(applied_now, frames_now, now) {
                         tracing::debug!(
                             event = "replay_progress",
                             applied = applied_now,
@@ -503,12 +518,12 @@ pub async fn run(
                             current = current_seq,
                             "replay advanced"
                         );
-                    } else if progress.idle() >= REPLAY_STALL_TIMEOUT {
+                    } else if progress.idle(now) >= REPLAY_STALL_TIMEOUT {
                         tracing::error!(
                             event = "replay_stall",
                             applied = applied_now,
                             current = current_seq,
-                            idle_ms = progress.idle().as_millis() as u64,
+                            idle_ms = progress.idle(now).as_millis() as u64,
                             frames_in = frames_now,
                             "replay made no progress; reconnecting from applied_seq"
                         );
@@ -2196,6 +2211,46 @@ mod tests {
             fast_forward_target(&compacted_welcome(), 7, 301, true),
             None
         );
+    }
+
+    /// A slow batch delivers frames while `applied_seq` is still behind.
+    /// That is progress, not a stall.
+    #[test]
+    fn replay_progress_resets_on_frames_without_applied_movement() {
+        let start = Instant::now();
+        let mut progress = ReplayProgress::new(10, 100, start);
+
+        // 44 s without a frame, then a STREAM_DATA/ORDERED/PONG arrives.
+        let quiet = start + Duration::from_secs(44);
+        assert!(!progress.advanced(10, 100, quiet));
+        assert!(progress.idle(quiet) < REPLAY_STALL_TIMEOUT);
+
+        let frame = quiet + Duration::from_secs(1);
+        assert!(
+            progress.advanced(10, 101, frame),
+            "a delivered frame must reset the watchdog"
+        );
+        assert_eq!(progress.idle(frame), Duration::ZERO);
+
+        // Another frame 44 s later keeps the same batch alive.
+        let next = frame + Duration::from_secs(44);
+        assert!(progress.advanced(10, 102, next));
+        assert_eq!(progress.idle(next), Duration::ZERO);
+    }
+
+    /// Silence — no frame and no watermark movement — is the only stall.
+    #[test]
+    fn replay_progress_stalls_only_after_the_full_timeout() {
+        let start = Instant::now();
+        let mut progress = ReplayProgress::new(10, 100, start);
+
+        assert!(!progress.advanced(10, 100, start + Duration::from_secs(44)));
+        assert!(progress.idle(start + Duration::from_secs(44)) < REPLAY_STALL_TIMEOUT);
+        assert!(progress.idle(start + REPLAY_STALL_TIMEOUT) >= REPLAY_STALL_TIMEOUT);
+
+        // The applied watermark alone is also progress.
+        assert!(progress.advanced(11, 100, start + REPLAY_STALL_TIMEOUT));
+        assert_eq!(progress.idle(start + REPLAY_STALL_TIMEOUT), Duration::ZERO);
     }
 
     #[test]

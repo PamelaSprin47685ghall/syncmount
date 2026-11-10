@@ -911,7 +911,10 @@ async fn a_stalled_replay_resyncs_and_finishes_from_the_cursor() {
     let port = stall_proxy(
         server.local_addr().unwrap().port(),
         128 * 1024,
-        Duration::from_secs(12),
+        // Longer than the 45 s watchdog. The proxy pauses every downlink
+        // frame, including the keepalive PONG, so only the receive silence
+        // can trigger the resync.
+        Duration::from_secs(50),
     )
     .await;
     let endpoint = Endpoint::parse(&format!("http://127.0.0.1:{port}/")).unwrap();
@@ -950,7 +953,7 @@ async fn a_stalled_replay_resyncs_and_finishes_from_the_cursor() {
             break;
         }
         assert!(
-            started.elapsed() < Duration::from_secs(90),
+            started.elapsed() < Duration::from_secs(120),
             "replay did not recover after the stall: applied {applied} of {total}"
         );
         tokio::time::sleep(Duration::from_millis(10)).await;

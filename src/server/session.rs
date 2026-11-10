@@ -24,7 +24,7 @@ use hyper::body::Incoming;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::crypto::secret::MasterKey;
-use crate::protocol::crypto::{NonceMinter, Opener, PskSalt, Sealer};
+use crate::protocol::crypto::{NonceMinter, Opener, PskKeyRing, PskSalt, Sealer};
 use crate::protocol::handshake::{HelloInput, NonceReplayGuard, ServerHandshake};
 use crate::protocol::messages::{Message, Pong, WelcomeLimits, decode_plain, decode_sealed};
 use crate::protocol::{
@@ -514,7 +514,8 @@ async fn handle_frame(
                 at: Instant::now(),
             };
             let _ = context.sequencer.watermark(report).await;
-            if let Some(pong) = encode_pong(session, wall_clock_us()) {
+            let nonces = NonceMinter::new(&mut rand::rng());
+            if let Some(pong) = encode_pong(&session.ring, &nonces, wall_clock_us()) {
                 let _ = session.ctrl_tx.try_send(pong);
             }
             Ok(Flow::Continue)
@@ -671,11 +672,10 @@ fn open_steady(
         .map_err(|_| ())
 }
 
-fn encode_pong(session: &RpcSession, server_time: u64) -> Option<Bytes> {
+fn encode_pong(ring: &PskKeyRing, nonces: &NonceMinter, server_time: u64) -> Option<Bytes> {
     let body = (Pong { server_time }).encode().ok()?;
     let mut header = FrameHeader::new(MsgType::PONG, Flags::ENC, 0, Seq::UNSEQUENCED);
-    let nonces = NonceMinter::new(&mut rand::rng());
-    let sealed = Sealer::with_session_key(&session.ring.session_key(), &nonces)
+    let sealed = Sealer::with_session_key(&ring.session_key(), nonces)
         .seal(&mut header, &Prefix::None, &body)
         .ok()?;
     let bytes = encode_frame(&FrameRef::new(&header, &Prefix::None, sealed.as_bytes())).ok()?;
@@ -772,6 +772,21 @@ const REPLAY_CHUNK_BYTES: usize = 64 * 1024;
 /// that keeps the event log authoritative, because the client then reconnects
 /// and replays from its durable cursor.
 const REPLAY_SEND_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Replay events between two keepalive `PONG` frames.
+///
+/// A `PONG` carries no sequence number and no event, so it cannot advance or
+/// reorder the log. It exists only so a receiver that is still materialising
+/// a batch can distinguish "the server is reading the next page" from "the
+/// downlink is dead". The value matches the client's batch size, so a
+/// keepalive never splits a batch more finely than the receiver already does.
+const REPLAY_KEEPALIVE_EVENTS: u32 = 64;
+
+/// Wall-clock interval between two keepalive `PONG` frames during replay.
+///
+/// The client watchdog is 45 s; five seconds leaves ample room for a slow
+/// SQLite page read without ever approaching it.
+const REPLAY_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Why a replay stopped before it reached the live stream.
 #[derive(Debug, thiserror::Error)]
@@ -921,6 +936,8 @@ async fn replay_stream(
     let mut next = replay_from.get();
     let mut target = current_seq.get();
     let mut chunk = ReplayChunk::new(tx, queued);
+    let mut events_since_keepalive = 0u32;
+    let mut last_keepalive = Instant::now();
     loop {
         while next <= target {
             let page = store
@@ -938,6 +955,16 @@ async fn replay_stream(
                 let seq = event.seq.max(0) as u64;
                 if seq > target {
                     break;
+                }
+                events_since_keepalive = events_since_keepalive.saturating_add(1);
+                if events_since_keepalive >= REPLAY_KEEPALIVE_EVENTS
+                    || last_keepalive.elapsed() >= REPLAY_KEEPALIVE_INTERVAL
+                {
+                    let pong = encode_pong(&ring, &nonces, now_secs().max(0) as u64)
+                        .ok_or_else(|| ReplayError::Frame("keepalive PONG".to_owned()))?;
+                    chunk.push(&pong).await?;
+                    events_since_keepalive = 0;
+                    last_keepalive = Instant::now();
                 }
                 let content = replay_content(&store, &event).await?;
                 if let Some(data) = &content {
@@ -1060,5 +1087,30 @@ mod tests {
         let ordered = encode_control(MsgType::ORDERED, Prefix::None, &[0; 30], Seq(1)).unwrap();
         assert!(!is_kick(&ordered));
         assert!(!is_kick(&Bytes::from_static(b"short")));
+    }
+
+    /// The replay keepalive is a `PONG` with `Seq::UNSEQUENCED`: a receiver
+    /// can count it as traffic without advancing or reordering the log.
+    #[test]
+    fn replay_keepalive_is_an_unsequenced_control_frame() {
+        let ring = PskKeyRing::derive(&[7u8; 32], &PskSalt::DEFAULT).unwrap();
+        let nonces = NonceMinter::with_instance(0x0102_0304_0506_0708);
+        let bytes = encode_pong(&ring, &nonces, 42).unwrap();
+
+        let mut decoder = FrameDecoder::new(crate::protocol::Limits::default());
+        decoder.push(&bytes).unwrap();
+        let frame = decoder
+            .next_frame_owned()
+            .unwrap()
+            .expect("one complete keepalive frame");
+        assert_eq!(frame.header.msg_type, MsgType::PONG);
+        assert_eq!(frame.header.seq, Seq::UNSEQUENCED);
+        assert_eq!(frame.prefix.kind(), PrefixKind::None);
+
+        let opened = Opener::with_session_key(&ring.session_key())
+            .open(&frame.header, &frame.prefix, &frame.body)
+            .unwrap();
+        let pong = Pong::decode(opened.as_slice(), &crate::protocol::Limits::default()).unwrap();
+        assert_eq!(pong.server_time, 42);
     }
 }
