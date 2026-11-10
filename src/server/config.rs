@@ -7,6 +7,7 @@
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::str::FromStr;
 use std::time::Duration;
 
 use crate::protocol::Limits;
@@ -17,15 +18,16 @@ pub const COMMAND_CAPACITY: usize = 1024;
 
 /// Hard outbound budget per session, in bytes (42 §3.3 L2).
 ///
-/// Raised from 8 MiB: a joiner pulling a large view legitimately buffers
-/// several megabytes, and the cap is a memory bound, not a speed test.
-pub const OUTBOX_CAP_BYTES: u64 = 32 * 1024 * 1024;
+/// Six MiB still lets a joiner buffer a large view while keeping the
+/// per-session cost of a full replay bounded: the writer drains the queue
+/// continuously, so the cap is a memory bound, not a speed test.
+pub const OUTBOX_CAP_BYTES: u64 = 6 * 1024 * 1024;
 
 /// Hard outbound budget per session, in frames.
-pub const OUTBOX_CAP_FRAMES: u32 = 512;
+pub const OUTBOX_CAP_FRAMES: u32 = 128;
 
 /// Data frames buffered between the actor and one session's writer.
-pub const OUTBOX_DATA_FRAMES: usize = 512;
+pub const OUTBOX_DATA_FRAMES: usize = 128;
 
 /// Control frames buffered ahead of data (WELCOME/KICK/ERROR).
 pub const OUTBOX_CTRL_FRAMES: usize = 32;
@@ -46,7 +48,29 @@ pub const DEFAULT_DB_FILE: &str = "syncmount-server.db";
 pub const DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Events read per replay page.
-pub const REPLAY_BATCH: u32 = 256;
+pub const REPLAY_BATCH: u32 = 64;
+
+/// Bytes of outbound budget a deployment may override.
+pub const ENV_OUTBOX_CAP_BYTES: &str = "SYNCMOUNT_OUTBOX_CAP_BYTES";
+/// Frames of outbound budget a deployment may override.
+pub const ENV_OUTBOX_CAP_FRAMES: &str = "SYNCMOUNT_OUTBOX_CAP_FRAMES";
+/// Data-channel depth a deployment may override.
+pub const ENV_OUTBOX_DATA_FRAMES: &str = "SYNCMOUNT_OUTBOX_DATA_FRAMES";
+/// Replay page size a deployment may override.
+pub const ENV_REPLAY_BATCH: &str = "SYNCMOUNT_REPLAY_BATCH";
+
+/// Parse a positive number, falling back to `default`.
+///
+/// Empty, non-numeric, zero and negative values fall back: a zero budget
+/// would reject every frame, and a typo must not silently disable replay.
+pub(crate) fn positive_or<T>(raw: Option<String>, default: T) -> T
+where
+    T: FromStr + PartialOrd + From<u8>,
+{
+    raw.and_then(|value| value.parse().ok())
+        .filter(|value| *value > T::from(0))
+        .unwrap_or(default)
+}
 
 /// Per-session outbound queue budget.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -68,6 +92,25 @@ impl Default for OutboxConfig {
             cap_frames: OUTBOX_CAP_FRAMES,
             data_frames: OUTBOX_DATA_FRAMES,
             ctrl_frames: OUTBOX_CTRL_FRAMES,
+        }
+    }
+}
+
+impl OutboxConfig {
+    /// Production budget, with each field overridable by environment.
+    pub fn from_env() -> Self {
+        Self::from_lookup(|key| std::env::var(key).ok())
+    }
+
+    /// Same rules as [`Self::from_env`], with an injectable lookup so the
+    /// mapping is testable without mutating the process environment.
+    pub fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Self {
+        let defaults = Self::default();
+        Self {
+            cap_bytes: positive_or(lookup(ENV_OUTBOX_CAP_BYTES), defaults.cap_bytes),
+            cap_frames: positive_or(lookup(ENV_OUTBOX_CAP_FRAMES), defaults.cap_frames),
+            data_frames: positive_or(lookup(ENV_OUTBOX_DATA_FRAMES), defaults.data_frames),
+            ctrl_frames: defaults.ctrl_frames,
         }
     }
 }
@@ -129,7 +172,7 @@ impl ServeConfig {
             listen,
             namespace: "/".to_owned(),
             limits: Limits::default(),
-            outbox: OutboxConfig::default(),
+            outbox: OutboxConfig::from_env(),
             welcome: WelcomeConfig::default(),
             command_capacity: COMMAND_CAPACITY,
             tick_interval: TICK_INTERVAL,
@@ -137,7 +180,7 @@ impl ServeConfig {
             hello_timeout: HELLO_TIMEOUT,
             db_path: PathBuf::from(DEFAULT_DB_FILE),
             drain_timeout: DRAIN_TIMEOUT,
-            replay_batch: REPLAY_BATCH,
+            replay_batch: positive_or(std::env::var(ENV_REPLAY_BATCH).ok(), REPLAY_BATCH),
         }
     }
 
@@ -187,12 +230,53 @@ mod tests {
 
     #[test]
     fn server_config_defaults_are_the_frozen_numbers() {
-        let config = ServeConfig::default();
-        assert_eq!(config.outbox.cap_bytes, 32 * 1024 * 1024);
-        assert_eq!(config.outbox.cap_frames, 512);
+        let outbox = OutboxConfig::default();
+        assert_eq!(outbox.cap_bytes, 6 * 1024 * 1024);
+        assert_eq!(outbox.cap_frames, 128);
+        assert_eq!(outbox.data_frames, 128);
+        assert_eq!(outbox.ctrl_frames, 32);
+        assert_eq!(REPLAY_BATCH, 64);
+
+        let config = ServeConfig::new(SocketAddr::from(([127, 0, 0, 1], 0)));
         assert_eq!(config.command_capacity, 1024);
         assert_eq!(config.pair_timeout, Duration::from_secs(10));
         assert_eq!(config.welcome.max_sessions, 32);
+    }
+
+    #[test]
+    fn outbox_config_accepts_environment_overrides() {
+        let overridden = OutboxConfig::from_lookup(|key| match key {
+            ENV_OUTBOX_CAP_BYTES => Some((8 * 1024 * 1024).to_string()),
+            ENV_OUTBOX_CAP_FRAMES => Some("256".to_owned()),
+            ENV_OUTBOX_DATA_FRAMES => Some("200".to_owned()),
+            _ => None,
+        });
+        assert_eq!(overridden.cap_bytes, 8 * 1024 * 1024);
+        assert_eq!(overridden.cap_frames, 256);
+        assert_eq!(overridden.data_frames, 200);
+        assert_eq!(overridden.ctrl_frames, 32);
+    }
+
+    #[test]
+    fn outbox_config_invalid_environment_falls_back_to_defaults() {
+        for raw in ["", "not-a-number", "0", "-1"] {
+            let invalid = OutboxConfig::from_lookup(|_| Some(raw.to_owned()));
+            assert_eq!(
+                invalid,
+                OutboxConfig::default(),
+                "{raw:?} must not disable the outbound budget"
+            );
+        }
+    }
+
+    #[test]
+    fn replay_batch_environment_override_uses_the_same_fallback() {
+        assert_eq!(positive_or(Some("128".to_owned()), REPLAY_BATCH), 128u32);
+        assert_eq!(
+            positive_or(Some("0".to_owned()), REPLAY_BATCH),
+            REPLAY_BATCH
+        );
+        assert_eq!(positive_or(None, REPLAY_BATCH), REPLAY_BATCH);
     }
 
     #[test]
