@@ -1129,6 +1129,99 @@ mod tests {
     }
 
     #[test]
+    fn three_chmods_fold_into_one_pending_setattr() {
+        let (_dir, db) = open();
+        let object = file(&db, "f");
+        for mode in [0o600, 0o640, 0o644] {
+            db.setattr(
+                object.ino,
+                AttrChange {
+                    mode: Some(mode),
+                    ..AttrChange::default()
+                },
+            )
+            .unwrap();
+        }
+
+        let rows = db.outbox_page(10).unwrap();
+        let setattrs: Vec<_> = rows
+            .iter()
+            .filter(|row| matches!(row.decoded, EventPayload::Setattr { .. }))
+            .collect();
+        assert_eq!(setattrs.len(), 1, "one inode, one pending setattr");
+        match &setattrs[0].decoded {
+            EventPayload::Setattr { mode, .. } => {
+                assert_eq!(*mode, Some(0o644), "the last chmod wins");
+            }
+            other => panic!("expected setattr, got {:?}", other.kind()),
+        }
+        assert_eq!(db.getattr(object.ino).unwrap().mode, 0o644);
+    }
+
+    #[test]
+    fn a_setattr_without_a_change_writes_no_outbox_row() {
+        let (_dir, db) = open();
+        let object = file(&db, "f");
+        let before = db.outbox_count(OutboxState::Pending).unwrap();
+
+        db.setattr(
+            object.ino,
+            AttrChange {
+                mode: Some(object.mode),
+                uid: Some(object.uid),
+                gid: Some(object.gid),
+                mtime_ns: Some(object.mtime_ns),
+                size: Some(object.size),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            db.outbox_count(OutboxState::Pending).unwrap(),
+            before,
+            "an unchanged setattr must not reach the outbox"
+        );
+    }
+
+    #[test]
+    fn folding_a_setattr_keeps_create_write_setattr_order() {
+        let (_dir, db) = open();
+        let object = file(&db, "f");
+        db.write_at(object.ino, 0, b"payload").unwrap();
+        db.flush_all().unwrap();
+        db.setattr(
+            object.ino,
+            AttrChange {
+                mode: Some(0o600),
+                ..AttrChange::default()
+            },
+        )
+        .unwrap();
+        db.setattr(
+            object.ino,
+            AttrChange {
+                mode: Some(0o644),
+                ..AttrChange::default()
+            },
+        )
+        .unwrap();
+
+        let rows = db.outbox_page(10).unwrap();
+        let kinds: Vec<&str> = rows.iter().map(|row| row.decoded.kind().as_str()).collect();
+        assert_eq!(kinds, vec!["create_file", "write", "setattr"]);
+        let write_seq = rows[1].seq;
+        let setattr_seq = rows[2].seq;
+        assert!(
+            setattr_seq > write_seq,
+            "the folded row keeps its position after the write"
+        );
+        match &rows[2].decoded {
+            EventPayload::Setattr { mode, .. } => assert_eq!(*mode, Some(0o644)),
+            other => panic!("expected setattr, got {:?}", other.kind()),
+        }
+    }
+
+    #[test]
     fn an_old_own_echo_does_not_shrink_newer_local_writes() {
         let (_dir, db) = open();
         let object = file(&db, "f");

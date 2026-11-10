@@ -26,7 +26,9 @@ use super::db::{ApplyOutcome, ClientDb, DbError, OutboxOp};
 use super::lifecycle::{EXIT_AUTH, EXIT_DISCONNECTED, EXIT_OK, State, WriteGate};
 use super::replay::{MAX_BATCH_BYTES, MAX_BATCH_EVENTS, RemoteEvent};
 use super::status::{Conntrace, Counters, TraceEntry};
-use super::writer::{CoalesceTuning, Coalescer, LocalOp, LocalSeq, QueuedOp, Span, WireOp};
+use super::writer::{
+    CoalesceTuning, Coalescer, LocalOp, LocalSeq, OUTBOX_PAGE, QueuedOp, Span, WireOp,
+};
 use crate::protocol::crypto::{NonceMinter, Opener, PskKeyRing, Sealer, SessionKey};
 use crate::protocol::fragment::{CHUNK_PLAIN, Fragmenter};
 use crate::protocol::handshake::{CLIENT_HANDSHAKE_TIMEOUT_MS, ClientHandshake, HandshakeError};
@@ -72,9 +74,6 @@ const REPLAY_STALL_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How often the session checks replay progress.
 const REPLAY_STALL_CHECK: Duration = Duration::from_secs(1);
-
-/// Largest number of outbox rows one uplink page holds.
-const OUTBOX_PAGE: usize = 64;
 
 /// Largest aggregate the uplink builds.
 /// Why the session ended.

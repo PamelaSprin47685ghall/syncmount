@@ -436,7 +436,10 @@ impl ClientDb {
 
     /// Delete an outbox row (and any coalesced members stored in `undo`).
     /// Returns the chunk hashes whose refcount must be refreshed.
-    fn ack_outbox(tx: &WriteTx<'_>, op_id: [u8; 16]) -> Result<Option<Vec<[u8; 32]>>, DbError> {
+    pub(crate) fn ack_outbox(
+        tx: &WriteTx<'_>,
+        op_id: [u8; 16],
+    ) -> Result<Option<Vec<[u8; 32]>>, DbError> {
         let exists: bool = tx.conn().query_row(
             "SELECT EXISTS(SELECT 1 FROM outbox WHERE op_id = ?1)",
             [op_id.as_slice()],

@@ -26,8 +26,11 @@ use rusqlite::{OptionalExtension, params};
 
 use super::db::{CHUNK, ClientDb, DbError, Ino, join_path, now_ns};
 use super::writeback::InodeBuffer;
+use super::writer::{OUTBOX_PAGE, merge_setattr};
 use crate::store::Errno;
-use crate::store::sqlite::{self, ChunkRef, EventPayload, Object, ObjectKind, ROOT_INO, WriteTx};
+use crate::store::sqlite::{
+    self, ChunkRef, EventKind, EventPayload, Object, ObjectKind, ROOT_INO, WriteTx,
+};
 
 /// Attributes a create carries into the event.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -60,6 +63,14 @@ pub struct RenameFlags {
     pub noreplace: bool,
     /// Exchange two entries (`RENAME_EXCHANGE`); not supported.
     pub exchange: bool,
+}
+
+/// The last pending `setattr` row of one inode, when it can be folded.
+#[derive(Debug)]
+struct PendingSetattr {
+    op_id: [u8; 16],
+    seq: i64,
+    payload: EventPayload,
 }
 
 impl ClientDb {
@@ -814,10 +825,6 @@ impl ClientDb {
             if !changed {
                 return Ok(object);
             }
-            object.updated_seq = Self::current_local_seq(tx)?;
-            tx.put_object(&object)?;
-            let seq = Self::next_local_seq(tx)?;
-            let op_id = alloc_op_id();
             let path = Self::path_in(tx, ino)?;
             let payload = EventPayload::Setattr {
                 ino,
@@ -835,9 +842,93 @@ impl ClientDb {
                     None
                 },
             };
+            // Three chmods in one burst must not become three outbox rows.
+            // The pending row is still in the same uplink page, so its
+            // sequence and position are reused and only the payload changes.
+            // A row that already left the page (or any later operation on
+            // this inode) is left alone: rewriting across it would reorder
+            // the log.
+            if let Some(previous) = Self::pending_setattr_tail(tx, ino)? {
+                let merged = merge_setattr(&previous.payload, &payload);
+                let hashes = Self::ack_outbox(tx, previous.op_id)?.unwrap_or_default();
+                tx.conn().execute(
+                    "DELETE FROM outbox_chunks WHERE op_id = ?1",
+                    [previous.op_id.as_slice()],
+                )?;
+                object.updated_seq = previous.seq;
+                tx.put_object(&object)?;
+                let op_id = alloc_op_id();
+                Self::enqueue(
+                    tx,
+                    op_id,
+                    &merged,
+                    Some(&path),
+                    None,
+                    &touched,
+                    previous.seq,
+                )?;
+                Self::refresh_refcounts(tx, &hashes)?;
+                return Ok(object);
+            }
+            object.updated_seq = Self::current_local_seq(tx)?;
+            tx.put_object(&object)?;
+            let seq = Self::next_local_seq(tx)?;
+            let op_id = alloc_op_id();
             Self::enqueue(tx, op_id, &payload, Some(&path), None, &touched, seq)?;
             Ok(object)
         })
+    }
+
+    /// The pending `setattr` that a new one may replace, if any.
+    ///
+    /// Two conditions keep the fold faithful to the outbox order:
+    ///
+    /// * the row is the last pending operation of this inode, so no write,
+    ///   rename or unlink for the same object sits after it;
+    /// * the row is close enough to the send head that one uplink page would
+    ///   carry both, which is exactly the "same outbox page" rule.
+    fn pending_setattr_tail(tx: &WriteTx<'_>, ino: Ino) -> Result<Option<PendingSetattr>, DbError> {
+        let row: Option<(Vec<u8>, String, Vec<u8>, i64)> = tx
+            .conn()
+            .query_row(
+                "SELECT op_id, kind, payload, created_at
+                   FROM outbox
+                  WHERE ino = ?1 AND state = 'pending'
+                  ORDER BY created_at DESC
+                  LIMIT 1",
+                [ino.as_slice()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()?;
+        let Some((op_id, kind_text, payload, seq)) = row else {
+            return Ok(None);
+        };
+        let kind = EventKind::parse(&kind_text).ok_or(DbError::Corrupt("unknown outbox kind"))?;
+        if kind != EventKind::Setattr {
+            return Ok(None);
+        }
+        // The replacement reuses the row's sequence, so it keeps the row's
+        // position in the send order. That position must still be inside
+        // the first page; otherwise the uplink may already have handed the
+        // old row to the socket and the new value would travel separately.
+        let rank: i64 = tx.conn().query_row(
+            "SELECT COUNT(*) FROM outbox
+              WHERE state = 'pending' AND created_at < ?1",
+            [seq],
+            |row| row.get(0),
+        )?;
+        if rank >= OUTBOX_PAGE as i64 {
+            return Ok(None);
+        }
+        let op_id: [u8; 16] = op_id
+            .try_into()
+            .map_err(|_| DbError::Corrupt("outbox.op_id is not 16 bytes"))?;
+        let payload = EventPayload::decode(kind, &payload)?;
+        Ok(Some(PendingSetattr {
+            op_id,
+            seq,
+            payload,
+        }))
     }
 
     /// `fsync`: commit buffered writes, sync the WAL and return.

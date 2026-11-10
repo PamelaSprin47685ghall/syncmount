@@ -31,6 +31,13 @@ use crate::protocol::frame::OpId;
 use crate::protocol::messages::OpClass;
 use crate::store::AttrDelta;
 use crate::store::node_table::InodeId;
+use crate::store::sqlite::EventPayload;
+
+/// Largest number of pending rows one uplink page holds.
+///
+/// Shared by the uplink (which reads one page per scan) and the setattr
+/// merge (which may only fold two rows that the same page can carry).
+pub(crate) const OUTBOX_PAGE: usize = 64;
 
 /// A client-local operation number; the right half of an `op_id`.
 ///
@@ -193,6 +200,48 @@ impl QueuedOp {
     /// Build a queued operation.
     pub const fn new(seq: LocalSeq, op_id: OpId, op: LocalOp) -> Self {
         Self { seq, op_id, op }
+    }
+}
+
+/// Fold a newer `setattr` into the pending one for the same inode.
+///
+/// The newer request wins field by field; a field the newer request does not
+/// mention keeps the older value, so `chmod` followed by `chown` still sends
+/// both changes as one event. `size` follows the same rule: a later attribute
+/// change must not silently drop an earlier truncation.
+///
+/// The caller guarantees both payloads name the same inode and that the
+/// older row is still the last pending operation for it. Nothing here looks
+/// at the clock or at the database.
+pub(crate) fn merge_setattr(previous: &EventPayload, next: &EventPayload) -> EventPayload {
+    let (
+        EventPayload::Setattr {
+            mode: old_mode,
+            uid: old_uid,
+            gid: old_gid,
+            mtime_ns: old_mtime,
+            size: old_size,
+            ..
+        },
+        EventPayload::Setattr {
+            ino,
+            mode,
+            uid,
+            gid,
+            mtime_ns,
+            size,
+        },
+    ) = (previous, next)
+    else {
+        return next.clone();
+    };
+    EventPayload::Setattr {
+        ino: *ino,
+        mode: mode.or(*old_mode),
+        uid: uid.or(*old_uid),
+        gid: gid.or(*old_gid),
+        mtime_ns: mtime_ns.or(*old_mtime),
+        size: size.or(*old_size),
     }
 }
 
@@ -821,6 +870,65 @@ mod tests {
 
     fn queued(seq: u64, ino: u128, off: u64, data: &[u8]) -> QueuedOp {
         QueuedOp::new(LocalSeq(seq), op_id(seq as u8), write(ino, off, data))
+    }
+
+    fn setattr(
+        mode: Option<u32>,
+        uid: Option<u32>,
+        mtime_ns: Option<i64>,
+        size: Option<u64>,
+    ) -> EventPayload {
+        EventPayload::Setattr {
+            ino: [3; 16],
+            mode,
+            uid,
+            gid: None,
+            mtime_ns,
+            size,
+        }
+    }
+
+    #[test]
+    fn u_writer_merge_setattr_keeps_the_newest_value_per_field() {
+        let previous = setattr(Some(0o600), None, None, Some(4));
+        let next = setattr(Some(0o644), Some(1000), Some(7), None);
+        let EventPayload::Setattr {
+            mode,
+            uid,
+            gid,
+            mtime_ns,
+            size,
+            ..
+        } = merge_setattr(&previous, &next)
+        else {
+            panic!("merged payload must stay a setattr");
+        };
+        assert_eq!(mode, Some(0o644), "the later mode wins");
+        assert_eq!(
+            uid,
+            Some(1000),
+            "a field only the later request sets is kept"
+        );
+        assert_eq!(gid, None);
+        assert_eq!(mtime_ns, Some(7));
+        assert_eq!(size, Some(4), "an earlier truncation is not lost");
+    }
+
+    #[test]
+    fn u_writer_merge_setattr_ignores_non_setattr_payloads() {
+        let write = EventPayload::Write {
+            ino: [3; 16],
+            offset: 0,
+            len: 1,
+            size: 1,
+            file_root: [0; 32],
+            mtime_ns: 1,
+            chunks: Vec::new(),
+        };
+        assert_eq!(
+            merge_setattr(&setattr(Some(0o600), None, None, None), &write),
+            write
+        );
     }
 
     /// 41 §2.4, INV-04: capacity precedes the disk write.
