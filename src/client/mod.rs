@@ -48,7 +48,14 @@ use crate::store::runtime_dir::RuntimeDir;
 const RECONNECT_ATTEMPTS: u32 = 6;
 /// First reconnect delay; doubles per attempt up to 32x.
 #[cfg(feature = "fuse")]
-const RECONNECT_BASE: Duration = Duration::from_millis(100);
+const RECONNECT_BASE: Duration = Duration::from_secs(1);
+/// Ceiling for the reconnect delay.
+///
+/// An endpoint that is down for minutes must not turn every client into a
+/// tight reconnect loop; the in-process budget still ends after a handful of
+/// attempts and systemd restarts the process.
+#[cfg(feature = "fuse")]
+const RECONNECT_MAX: Duration = Duration::from_secs(30);
 /// A session that lived this long resets the reconnect budget.
 #[cfg(feature = "fuse")]
 const HEALTHY_SESSION: Duration = Duration::from_secs(10);
@@ -197,12 +204,14 @@ impl Client {
                 &mut shutdown_rx,
             )
             .await;
-            // A rejection, a transport end, or a failed redial keeps the
-            // mount up: the next handshake advertises the durable applied_seq
-            // and the server replays the missing events. The first dial is
-            // not a retry: a misconfigured endpoint still fails fast.
-            let retryable = exit.reason == "resync"
-                || (attempts > 0 && matches!(exit.reason, "dial" | "dial timeout" | "handshake"));
+            // A rejection, a transport end, or a failed dial keeps the mount
+            // up: the next handshake advertises the durable applied_seq and
+            // the server replays the missing events. A first dial gets the
+            // same bounded backoff, because a proxy in front of a restarting
+            // origin answers 502/503/504 and a socket timeout is equally
+            // transient. Authentication (4) and local failures keep their
+            // fail-fast exits and are not retried here.
+            let retryable = retryable_session_exit(&exit);
             if retryable {
                 // A slow client may be kicked repeatedly while it is still
                 // applying events. Progress (or a long healthy session) is
@@ -221,7 +230,7 @@ impl Client {
                         reason: "reconnect budget",
                     };
                 }
-                let backoff = RECONNECT_BASE.saturating_mul(1u32 << (attempts - 1).min(5));
+                let backoff = reconnect_delay(attempts);
                 tracing::warn!(
                     event = "reconnect",
                     attempt = attempts,
@@ -305,6 +314,31 @@ impl Client {
             }
         }))
     }
+}
+
+#[cfg(feature = "fuse")]
+fn reconnect_delay(attempt: u32) -> Duration {
+    let shift = attempt.saturating_sub(1).min(5);
+    RECONNECT_BASE
+        .saturating_mul(1u32 << shift)
+        .min(RECONNECT_MAX)
+}
+
+/// Whether the driver may reconnect after this session outcome.
+///
+/// Only transient transport outcomes are retried. A KICK, an authentication
+/// rejection and every local failure stay terminal for this process, so a
+/// persistent protocol or credential error is not hidden behind a restart
+/// loop. The dial and handshake variants are marked retryable only when the
+/// session mapped them to [`lifecycle::EXIT_DISCONNECTED`]; the same reason
+/// with [`lifecycle::EXIT_STARTUP`] is permanent.
+#[cfg(feature = "fuse")]
+fn retryable_session_exit(exit: &session::SessionExit) -> bool {
+    exit.code == lifecycle::EXIT_DISCONNECTED
+        && matches!(
+            exit.reason,
+            "resync" | "dial" | "dial timeout" | "handshake"
+        )
 }
 
 #[cfg(feature = "fuse")]
@@ -490,3 +524,63 @@ pub enum ClientError {
 
 /// Status refresh interval used by tests.
 pub const STATUS_INTERVAL: Duration = Duration::from_secs(5);
+
+#[cfg(all(test, feature = "fuse"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reconnect_delay_is_bounded_exponential_backoff() {
+        let delays: Vec<Duration> = (1..=7).map(reconnect_delay).collect();
+        assert_eq!(
+            delays,
+            [
+                Duration::from_secs(1),
+                Duration::from_secs(2),
+                Duration::from_secs(4),
+                Duration::from_secs(8),
+                Duration::from_secs(16),
+                Duration::from_secs(30),
+                Duration::from_secs(30),
+            ]
+            .to_vec()
+        );
+        assert_eq!(reconnect_delay(0), Duration::from_secs(1));
+    }
+
+    #[test]
+    fn only_transient_session_exits_are_retried() {
+        let retryable = |code, reason| session::SessionExit { code, reason };
+        assert!(retryable_session_exit(&retryable(
+            lifecycle::EXIT_DISCONNECTED,
+            "dial"
+        )));
+        assert!(retryable_session_exit(&retryable(
+            lifecycle::EXIT_DISCONNECTED,
+            "handshake"
+        )));
+        assert!(retryable_session_exit(&retryable(
+            lifecycle::EXIT_DISCONNECTED,
+            "resync"
+        )));
+        assert!(retryable_session_exit(&retryable(
+            lifecycle::EXIT_DISCONNECTED,
+            "dial timeout"
+        )));
+
+        // A permanent dial failure keeps EXIT_STARTUP.
+        assert!(!retryable_session_exit(&retryable(
+            lifecycle::EXIT_STARTUP,
+            "dial"
+        )));
+        assert!(!retryable_session_exit(&retryable(
+            lifecycle::EXIT_AUTH,
+            "authentication"
+        )));
+        // A KICK is a deliberate server decision, not a transient end.
+        assert!(!retryable_session_exit(&retryable(
+            lifecycle::EXIT_DISCONNECTED,
+            "disconnected"
+        )));
+    }
+}

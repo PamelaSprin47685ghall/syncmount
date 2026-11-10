@@ -21,8 +21,11 @@ RuntimeDirectoryPreserve=yes
 ExecStartPre=-/usr/bin/fusermount3 -uz /home/user/%i
 ExecStart=/usr/local/bin/syncmount --log-format json --log-level info client http://sync.example.com/%i /home/user/%i --key-file /home/user/.config/syncmount/master.pass --db /home/user/.local/state/syncmount-%i/client.db
 Restart=always
-RestartPreventExitStatus=2 4
-RestartSec=2s
+# Exit 4 is a rejected credential: restarting only repeats the failure.
+# Exit 2 (bad configuration) and 10 (disconnect) restart, because the next
+# start can recover once the endpoint or the operator fixes the cause.
+RestartPreventExitStatus=4
+RestartSec=5s
 TimeoutStopSec=30s
 PrivateDevices=no
 NoNewPrivileges=no

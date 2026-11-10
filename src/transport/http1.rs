@@ -30,6 +30,7 @@ use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -142,11 +143,23 @@ impl Body for EmptyBody {
 pub struct RpcStream {
     body: MpscSender,
     state: Arc<ConnState>,
+    /// HTTP status the peer answered with, once the response headers exist.
+    ///
+    /// A POST session normally gets its answer only when the session ends.
+    /// A proxy that refuses the request (502/503/504) answers immediately;
+    /// the handshake reads this value to tell "origin unavailable" apart
+    /// from "credential rejected", which are both a closed body.
+    status: Arc<OnceLock<StatusCode>>,
     response: Option<JoinHandle<()>>,
     connection: Option<JoinHandle<()>>,
 }
 
 impl RpcStream {
+    /// Status of the HTTP response, when the peer sent one.
+    pub fn response_status(&self) -> Option<StatusCode> {
+        self.status.get().copied()
+    }
+
     fn shutdown(&mut self) {
         self.state.mark(CloseReason::Local);
         self.body.close();
@@ -321,6 +334,14 @@ impl HttpTransport {
     pub fn split(self) -> (RpcStream, EventsStream) {
         (self.rpc, self.events)
     }
+
+    /// Status of the uplink HTTP response, when the peer sent one.
+    ///
+    /// The handshake uses this after the first read closes: a proxy that
+    /// answers 502/503/504 must stay retryable, not look like a bad PSK.
+    pub fn response_status(&self) -> Option<StatusCode> {
+        self.rpc.response_status()
+    }
 }
 
 /// Stateless dialer for one stream at a time.
@@ -414,18 +435,28 @@ async fn dial_rpc(
     }
 
     let task_state = Arc::clone(&state);
+    let status = Arc::new(OnceLock::new());
+    let task_status = Arc::clone(&status);
     let response_task = tokio::spawn(async move {
         match sender.send_request(request).await {
             Ok(response) if response.status().is_success() => {
+                let _ = task_status.set(response.status());
                 task_state.mark(CloseReason::Remote);
             }
-            Ok(_) | Err(_) => task_state.mark(CloseReason::Failed),
+            Ok(response) => {
+                let _ = task_status.set(response.status());
+                task_state.mark(CloseReason::Failed);
+            }
+            Err(_) => {
+                task_state.mark(CloseReason::Failed);
+            }
         }
     });
 
     Ok(RpcStream {
         body: body_tx,
         state,
+        status,
         response: Some(response_task),
         connection: Some(connection_task),
     })

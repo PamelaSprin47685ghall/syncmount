@@ -23,6 +23,7 @@ use bytes::Bytes;
 use tokio::sync::mpsc;
 
 use super::db::{ApplyOutcome, ClientDb, DbError, OutboxOp};
+use super::lifecycle::EXIT_STARTUP;
 use super::lifecycle::{EXIT_AUTH, EXIT_DISCONNECTED, EXIT_OK, State, WriteGate};
 use super::replay::{MAX_BATCH_BYTES, MAX_BATCH_EVENTS, RemoteEvent};
 use super::status::{Conntrace, Counters, TraceEntry};
@@ -41,6 +42,7 @@ use crate::protocol::{
     MsgType, OpId, Prefix, RoutePrefix, Seq, SessionId, StreamId,
 };
 use crate::store::sqlite::{ChunkRef, EventKind, EventPayload, RejectState};
+use crate::transport::TransportError;
 use crate::transport::{DialOptions, Endpoint, EventsStream, HttpTransport, RpcStream, Transport};
 
 /// How long the whole handshake may take.
@@ -107,6 +109,79 @@ impl SessionExit {
         Self {
             code: EXIT_DISCONNECTED,
             reason: "resync",
+        }
+    }
+}
+
+/// Whether a dial failure is a transient condition worth another attempt.
+///
+/// A reverse proxy in front of a restarting origin answers 502/503/504 while
+/// the endpoint itself is healthy. Socket timeouts and resets behave the same
+/// way. Authentication and request construction failures are permanent: a
+/// retry cannot repair them and would only hide a misconfiguration.
+fn retryable_dial_error(error: &TransportError) -> bool {
+    match error {
+        TransportError::Status(status) => matches!(status.as_u16(), 502..=504),
+        TransportError::Io(error) => matches!(
+            error.kind(),
+            std::io::ErrorKind::TimedOut
+                | std::io::ErrorKind::ConnectionRefused
+                | std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::ConnectionAborted
+                | std::io::ErrorKind::NotConnected
+                | std::io::ErrorKind::WouldBlock
+        ),
+        TransportError::Hyper(_) | TransportError::Body(_) | TransportError::Disconnected => true,
+        TransportError::Http(_)
+        | TransportError::Endpoint(_)
+        | TransportError::WrongDirection(..)
+        | TransportError::TlsUnsupported
+        | TransportError::Closed => false,
+    }
+}
+
+/// Map a dial failure to the exit the reconnect driver understands.
+///
+/// Retryable failures use [`EXIT_DISCONNECTED`], the same code a lost session
+/// uses; systemd must restart the process after the in-process budget ends.
+/// A rejected credential keeps its own code so the unit can be stopped.
+fn dial_exit(error: &TransportError) -> SessionExit {
+    match error {
+        TransportError::Status(status) if matches!(status.as_u16(), 401 | 403) => SessionExit {
+            code: EXIT_AUTH,
+            reason: "authentication",
+        },
+        _ if retryable_dial_error(error) => SessionExit {
+            code: EXIT_DISCONNECTED,
+            reason: "dial",
+        },
+        _ => SessionExit {
+            code: EXIT_STARTUP,
+            reason: "dial",
+        },
+    }
+}
+
+/// Map a handshake failure to the exit the reconnect driver understands.
+///
+/// A closed transport and a handshake deadline are transient: the peer may
+/// have restarted between the dial and the first read. Protocol, encoding
+/// and local failures are not, because a retry would replay the same bytes.
+fn handshake_exit(error: &SessionError) -> SessionExit {
+    let retryable = match error {
+        SessionError::Transport(transport) => retryable_dial_error(transport),
+        SessionError::Handshake(HandshakeError::Timeout) => true,
+        _ => false,
+    };
+    if retryable {
+        SessionExit {
+            code: EXIT_DISCONNECTED,
+            reason: "handshake",
+        }
+    } else {
+        SessionExit {
+            code: EXIT_STARTUP,
+            reason: "handshake",
         }
     }
 }
@@ -265,15 +340,12 @@ pub async fn run(
         Ok(Ok(transport)) => transport,
         Ok(Err(error)) => {
             tracing::error!(event = "dial", error = %error, "cannot open the session");
-            return SessionExit {
-                code: 2,
-                reason: "dial",
-            };
+            return dial_exit(&error);
         }
         Err(_) => {
             tracing::error!(event = "dial", "session dial timed out");
             return SessionExit {
-                code: 2,
+                code: EXIT_DISCONNECTED,
                 reason: "dial timeout",
             };
         }
@@ -300,10 +372,7 @@ pub async fn run(
         }
         Err(error) => {
             tracing::error!(event = "handshake", error = %error, "handshake failed");
-            return SessionExit {
-                code: 2,
-                reason: "handshake",
-            };
+            return handshake_exit(&error);
         }
     };
 
@@ -647,8 +716,26 @@ async fn handshake(
         // The server verifies the sealed AUTH before it sends WELCOME. A
         // wrong PSK, a tampered AUTH and a version rejection all close the
         // connection without a distinguishable reply, so a close before
-        // WELCOME is the client's only authentication-failure signal.
-        Ok(Err(SessionError::Closed)) => return Err(SessionError::Auth),
+        // WELCOME is normally the client's only authentication-failure
+        // signal. A proxy refusal is different: it carries a status, and
+        // 502/503/504 must stay retryable instead of masquerading as a bad
+        // password.
+        Ok(Err(SessionError::Closed)) => {
+            return match transport.response_status() {
+                Some(status) if retryable_dial_error(&TransportError::Status(status)) => {
+                    Err(SessionError::Transport(TransportError::Status(status)))
+                }
+                Some(status) if matches!(status.as_u16(), 401 | 403) => Err(SessionError::Auth),
+                // A successful response with a closed body before WELCOME is
+                // the server's normal way to reject the handshake; the
+                // server answers the RPC request with 204 when it drops the
+                // session. That is a credential/version failure, not a
+                // transport status.
+                Some(status) if status.is_success() => Err(SessionError::Auth),
+                Some(status) => Err(SessionError::Transport(TransportError::Status(status))),
+                _ => Err(SessionError::Auth),
+            };
+        }
         Ok(Err(error)) => return Err(error),
         Err(_) => return Err(SessionError::Handshake(HandshakeError::Timeout)),
     };
@@ -2138,6 +2225,46 @@ mod tests {
 
     use super::*;
 
+    /// A slow batch delivers frames while `applied_seq` is still behind.
+    /// That is progress, not a stall.
+    #[test]
+    fn replay_progress_resets_on_frames_without_applied_movement() {
+        let start = Instant::now();
+        let mut progress = ReplayProgress::new(10, 100, start);
+
+        // 44 s without a frame, then a STREAM_DATA/ORDERED/PONG arrives.
+        let quiet = start + Duration::from_secs(44);
+        assert!(!progress.advanced(10, 100, quiet));
+        assert!(progress.idle(quiet) < REPLAY_STALL_TIMEOUT);
+
+        let frame = quiet + Duration::from_secs(1);
+        assert!(
+            progress.advanced(10, 101, frame),
+            "a delivered frame must reset the watchdog"
+        );
+        assert_eq!(progress.idle(frame), Duration::ZERO);
+
+        // Another frame 44 s later keeps the same batch alive.
+        let next = frame + Duration::from_secs(44);
+        assert!(progress.advanced(10, 102, next));
+        assert_eq!(progress.idle(next), Duration::ZERO);
+    }
+
+    /// Silence — no frame and no watermark movement — is the only stall.
+    #[test]
+    fn replay_progress_stalls_only_after_the_full_timeout() {
+        let start = Instant::now();
+        let mut progress = ReplayProgress::new(10, 100, start);
+
+        assert!(!progress.advanced(10, 100, start + Duration::from_secs(44)));
+        assert!(progress.idle(start + Duration::from_secs(44)) < REPLAY_STALL_TIMEOUT);
+        assert!(progress.idle(start + REPLAY_STALL_TIMEOUT) >= REPLAY_STALL_TIMEOUT);
+
+        // The applied watermark alone is also progress.
+        assert!(progress.advanced(11, 100, start + REPLAY_STALL_TIMEOUT));
+        assert_eq!(progress.idle(start + REPLAY_STALL_TIMEOUT), Duration::ZERO);
+    }
+
     #[test]
     fn a_transport_end_is_a_resync_not_a_fatal_exit() {
         // The downlink already reports a closed stream as Disconnected. The
@@ -2154,6 +2281,58 @@ mod tests {
             uplink_signal(SessionError::Fatal("encode".to_owned())),
             Signal::Fatal("encode".to_owned())
         );
+    }
+
+    #[test]
+    fn gateway_statuses_are_retryable_dial_failures() {
+        for code in [502u16, 503, 504] {
+            let status = http::StatusCode::from_u16(code).unwrap();
+            let error = TransportError::Status(status);
+            assert!(retryable_dial_error(&error), "{code} must be retried");
+            let exit = dial_exit(&error);
+            assert_eq!(exit.code, EXIT_DISCONNECTED);
+            assert_eq!(exit.reason, "dial");
+        }
+    }
+
+    #[test]
+    fn rejected_credentials_are_not_retried() {
+        for code in [401u16, 403] {
+            let status = http::StatusCode::from_u16(code).unwrap();
+            let error = TransportError::Status(status);
+            assert!(!retryable_dial_error(&error), "{code} must not be retried");
+            let exit = dial_exit(&error);
+            assert_eq!(exit.code, EXIT_AUTH, "{code} names a credential failure");
+            assert_ne!(exit.code, EXIT_DISCONNECTED);
+        }
+    }
+
+    #[test]
+    fn socket_timeouts_are_retryable_and_configuration_errors_are_not() {
+        let timeout = TransportError::Io(std::io::Error::from(std::io::ErrorKind::TimedOut));
+        assert!(retryable_dial_error(&timeout));
+        assert_eq!(dial_exit(&timeout).code, EXIT_DISCONNECTED);
+
+        let refused =
+            TransportError::Io(std::io::Error::from(std::io::ErrorKind::ConnectionRefused));
+        assert!(retryable_dial_error(&refused));
+
+        let tls = TransportError::TlsUnsupported;
+        assert!(!retryable_dial_error(&tls));
+        assert_eq!(dial_exit(&tls).code, EXIT_STARTUP);
+    }
+
+    #[test]
+    fn handshake_deadline_is_retryable_but_protocol_failure_is_not() {
+        let timeout = SessionError::Handshake(HandshakeError::Timeout);
+        assert_eq!(handshake_exit(&timeout).code, EXIT_DISCONNECTED);
+        assert_eq!(handshake_exit(&timeout).reason, "handshake");
+
+        let closed = SessionError::Transport(TransportError::Disconnected);
+        assert_eq!(handshake_exit(&closed).code, EXIT_DISCONNECTED);
+
+        let fatal = SessionError::Fatal("encode".to_owned());
+        assert_eq!(handshake_exit(&fatal).code, EXIT_STARTUP);
     }
 
     #[test]
@@ -2211,46 +2390,6 @@ mod tests {
             fast_forward_target(&compacted_welcome(), 7, 301, true),
             None
         );
-    }
-
-    /// A slow batch delivers frames while `applied_seq` is still behind.
-    /// That is progress, not a stall.
-    #[test]
-    fn replay_progress_resets_on_frames_without_applied_movement() {
-        let start = Instant::now();
-        let mut progress = ReplayProgress::new(10, 100, start);
-
-        // 44 s without a frame, then a STREAM_DATA/ORDERED/PONG arrives.
-        let quiet = start + Duration::from_secs(44);
-        assert!(!progress.advanced(10, 100, quiet));
-        assert!(progress.idle(quiet) < REPLAY_STALL_TIMEOUT);
-
-        let frame = quiet + Duration::from_secs(1);
-        assert!(
-            progress.advanced(10, 101, frame),
-            "a delivered frame must reset the watchdog"
-        );
-        assert_eq!(progress.idle(frame), Duration::ZERO);
-
-        // Another frame 44 s later keeps the same batch alive.
-        let next = frame + Duration::from_secs(44);
-        assert!(progress.advanced(10, 102, next));
-        assert_eq!(progress.idle(next), Duration::ZERO);
-    }
-
-    /// Silence — no frame and no watermark movement — is the only stall.
-    #[test]
-    fn replay_progress_stalls_only_after_the_full_timeout() {
-        let start = Instant::now();
-        let mut progress = ReplayProgress::new(10, 100, start);
-
-        assert!(!progress.advanced(10, 100, start + Duration::from_secs(44)));
-        assert!(progress.idle(start + Duration::from_secs(44)) < REPLAY_STALL_TIMEOUT);
-        assert!(progress.idle(start + REPLAY_STALL_TIMEOUT) >= REPLAY_STALL_TIMEOUT);
-
-        // The applied watermark alone is also progress.
-        assert!(progress.advanced(11, 100, start + REPLAY_STALL_TIMEOUT));
-        assert_eq!(progress.idle(start + REPLAY_STALL_TIMEOUT), Duration::ZERO);
     }
 
     #[test]
