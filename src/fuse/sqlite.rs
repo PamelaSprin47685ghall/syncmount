@@ -199,7 +199,7 @@ impl Filesystem for SqliteFs {
 
     fn mknod(
         &self,
-        _req: &Request,
+        req: &Request,
         parent: INodeNo,
         name: &OsStr,
         mode: u32,
@@ -213,7 +213,7 @@ impl Filesystem for SqliteFs {
                 return Err(fuser::Errno::EPERM);
             }
             let parent = self.ino(parent)?;
-            let attrs = CreateAttrs::new(mode & !umask & 0o7777, 0, 0);
+            let attrs = CreateAttrs::new(mode & !umask & 0o7777, req.uid(), req.gid());
             let object = self
                 .store
                 .create_file(parent, name, attrs)
@@ -228,7 +228,7 @@ impl Filesystem for SqliteFs {
 
     fn mkdir(
         &self,
-        _req: &Request,
+        req: &Request,
         parent: INodeNo,
         name: &OsStr,
         mode: u32,
@@ -238,7 +238,7 @@ impl Filesystem for SqliteFs {
         let result = (|| {
             self.gate()?;
             let parent = self.ino(parent)?;
-            let attrs = CreateAttrs::new(mode & !umask & 0o7777, 0, 0);
+            let attrs = CreateAttrs::new(mode & !umask & 0o7777, req.uid(), req.gid());
             let object = self
                 .store
                 .create_dir(parent, name, attrs)
@@ -277,7 +277,7 @@ impl Filesystem for SqliteFs {
 
     fn symlink(
         &self,
-        _req: &Request,
+        req: &Request,
         parent: INodeNo,
         link_name: &OsStr,
         target: &Path,
@@ -286,7 +286,7 @@ impl Filesystem for SqliteFs {
         let result = (|| {
             self.gate()?;
             let parent = self.ino(parent)?;
-            let attrs = CreateAttrs::new(0o777, 0, 0);
+            let attrs = CreateAttrs::new(0o777, req.uid(), req.gid());
             let object = self
                 .store
                 .create_symlink(parent, link_name, target.as_os_str(), attrs)
@@ -602,7 +602,7 @@ impl Filesystem for SqliteFs {
 
     fn create(
         &self,
-        _req: &Request,
+        req: &Request,
         parent: INodeNo,
         name: &OsStr,
         mode: u32,
@@ -613,7 +613,7 @@ impl Filesystem for SqliteFs {
         let result = (|| {
             self.gate()?;
             let parent = self.ino(parent)?;
-            let attrs = CreateAttrs::new(mode & !umask & 0o7777, 0, 0);
+            let attrs = CreateAttrs::new(mode & !umask & 0o7777, req.uid(), req.gid());
             let object = self
                 .store
                 .create_file(parent, name, attrs)
